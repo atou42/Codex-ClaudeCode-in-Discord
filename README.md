@@ -9,13 +9,17 @@ A tiny Discord bot that bridges **Codex CLI** (`codex exec --json`) into Discord
 - Slash commands (no `!` required)
 - Thread-level session persistence (restart-safe)
 - Per-thread workspace directory (keeps file ops isolated)
+- Self-healing runtime: auto relogin with backoff after transient Discord/runtime failures
 - Two modes:
   - `safe` → `codex exec --full-auto` (sandboxed)
   - `dangerous` → `--dangerously-bypass-approvals-and-sandbox` (full access)
 - Optional proxies (Clash / corp proxy): REST via `HTTP_PROXY`, Gateway WS via `SOCKS_PROXY`
 - Lightweight UX:
-  - reacts `⚡` when starting, `✅` on success, `❌` on failure
+  - reacts `⚡` when starting, `✅` on success, `❌` on failure, `🛑` when cancelled
   - `/name` to label a session
+  - per-channel prompt queue (messages are queued instead of rejected)
+  - `/cancel` / `!abort` to interrupt the current run and clear queued prompts
+  - long-run live progress updates (phase/elapsed/latest step), plus `/progress` / `!progress`
 
 ## Prerequisites
 
@@ -45,6 +49,9 @@ Then in your Discord server, invite the bot, and use these slash commands:
 - `/cx_reset` — clear current thread session
 - `/cx_resume <session_id>` — bind an existing Codex session id
 - `/cx_sessions` — list recent local Codex sessions
+- `/cx_queue` — show running/queued task count in current channel
+- `/cx_progress` — show latest progress snapshot for the running task
+- `/cx_cancel` — interrupt current run and clear queued prompts
 
 ## Configuration (.env)
 
@@ -57,6 +64,62 @@ Important knobs:
 - `DEFAULT_MODE`: `safe` or `dangerous`
 - `WORKSPACE_ROOT`: where per-thread folders are created
 - `CODEX_BIN`: codex command/path (default `codex`)
+- `CODEX_TIMEOUT_MS`: hard timeout per codex run (ms). `0` disables timeout.
+- `PROGRESS_UPDATES_ENABLED`: enable/disable live progress updates in channel (default `true`)
+- `PROGRESS_UPDATE_INTERVAL_MS`: heartbeat refresh interval for progress message
+- `PROGRESS_EVENT_FLUSH_MS`: min interval for event-triggered progress edits
+- `PROGRESS_TEXT_PREVIEW_CHARS`: truncation length for “latest step” preview
+- `PROGRESS_INCLUDE_STDERR`: include raw stderr lines in progress preview (noisy; default `false`)
+- `SELF_HEAL_ENABLED`: enable runtime self-healing (default `true`)
+- `SELF_HEAL_RESTART_DELAY_MS`: delay before self-heal restart (default `5000`)
+- `SELF_HEAL_MAX_LOGIN_BACKOFF_MS`: max retry backoff for Discord login (default `60000`)
+- `MAX_INPUT_TOKENS_BEFORE_COMPACT`: compact threshold
+- `COMPACT_STRATEGY`: `hard | native | off`
+  - `hard`: bot summarizes then switches to a new session
+  - `native`: pass `model_auto_compact_token_limit` to Codex CLI and continue same session
+  - `off`: disable compact behavior
+- `COMPACT_ON_THRESHOLD`: enable/disable threshold-triggered compact logic
+
+## Auto-upgrade Codex CLI (launchd)
+
+This repo includes a launchd-based updater for `codex` (Homebrew Cask) that can:
+
+- check for updates on a schedule
+- auto-upgrade `codex`
+- restart your bot service after a successful upgrade
+
+Install (default schedule: every day at `05:15`):
+
+```bash
+bash scripts/install-codex-auto-upgrade-launchd.sh
+```
+
+Custom schedule (example: every day at `03:40`):
+
+```bash
+SCHEDULE_HOUR=3 SCHEDULE_MINUTE=40 bash scripts/install-codex-auto-upgrade-launchd.sh
+```
+
+Manual run (for smoke test):
+
+```bash
+bash scripts/codex-auto-upgrade.sh
+```
+
+Check service and logs:
+
+```bash
+launchctl print gui/$(id -u)/com.atou.codex-cli-auto-upgrade
+tail -n 100 logs/codex-auto-upgrade.log
+tail -n 100 logs/codex-auto-upgrade.err.log
+```
+
+Remove service:
+
+```bash
+launchctl bootout gui/$(id -u)/com.atou.codex-cli-auto-upgrade
+rm -f ~/Library/LaunchAgents/com.atou.codex-cli-auto-upgrade.plist
+```
 
 ## Troubleshooting
 

@@ -6,6 +6,21 @@ import path from 'node:path';
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ROOT = path.resolve(__dirname, '..');
+const DATA_DIR = path.join(ROOT, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'sessions.json');
+const LOCK_FILE = path.join(DATA_DIR, 'bot.lock');
+const ENV_FILE = path.join(ROOT, '.env');
+
+const proxyRepair = autoRepairProxyEnv(ENV_FILE);
+if (proxyRepair.logs.length) {
+  for (const line of proxyRepair.logs) {
+    console.log(line);
+  }
+}
+
 // Optional proxy setup
 //
 // If you're behind a corporate / Clash / MITM HTTP proxy:
@@ -19,10 +34,12 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 const HTTP_PROXY = process.env.HTTP_PROXY || null;
 const SOCKS_PROXY = process.env.SOCKS_PROXY || null;
 const INSECURE_TLS = String(process.env.INSECURE_TLS || '0') === '1';
+let restProxyAgent = null;
 
 if (HTTP_PROXY) {
   if (INSECURE_TLS) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  setGlobalDispatcher(new ProxyAgent({ uri: HTTP_PROXY }));
+  restProxyAgent = new ProxyAgent({ uri: HTTP_PROXY });
+  setGlobalDispatcher(restProxyAgent);
 }
 
 if (SOCKS_PROXY) {
@@ -34,13 +51,14 @@ if (HTTP_PROXY || SOCKS_PROXY) {
   console.log(`🌐 Proxy: REST=${HTTP_PROXY || '(none)'} | WS=${SOCKS_PROXY || '(none)'} | INSECURE_TLS=${INSECURE_TLS}`);
 }
 
-const { Client, GatewayIntentBits, Partials, SlashCommandBuilder, REST, Routes } = await import('discord.js');
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const ROOT = path.resolve(__dirname, '..');
-const DATA_DIR = path.join(ROOT, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'sessions.json');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+} = await import('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
@@ -54,10 +72,29 @@ const ALLOWED_USER_IDS = parseCsvSet(process.env.ALLOWED_USER_IDS);
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.join(ROOT, 'workspaces');
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || null;
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || 'safe').toLowerCase() === 'dangerous' ? 'dangerous' : 'safe';
-const CODEX_TIMEOUT_MS = toInt(process.env.CODEX_TIMEOUT_MS, 30 * 60 * 1000);
+const CODEX_TIMEOUT_MS = normalizeTimeoutMs(process.env.CODEX_TIMEOUT_MS, 0);
 const CODEX_BIN = (process.env.CODEX_BIN || 'codex').trim() || 'codex';
 const SHOW_REASONING = String(process.env.SHOW_REASONING || 'false').toLowerCase() === 'true';
 const DEBUG_EVENTS = String(process.env.DEBUG_EVENTS || 'false').toLowerCase() === 'true';
+const PROGRESS_UPDATES_ENABLED = String(process.env.PROGRESS_UPDATES_ENABLED || 'true').toLowerCase() !== 'false';
+const PROGRESS_UPDATE_INTERVAL_MS = normalizeIntervalMs(process.env.PROGRESS_UPDATE_INTERVAL_MS, 15000, 3000);
+const PROGRESS_EVENT_FLUSH_MS = normalizeIntervalMs(process.env.PROGRESS_EVENT_FLUSH_MS, 5000, 1000);
+const PROGRESS_TEXT_PREVIEW_CHARS = Math.max(60, toInt(process.env.PROGRESS_TEXT_PREVIEW_CHARS, 140));
+const PROGRESS_INCLUDE_STDERR = String(process.env.PROGRESS_INCLUDE_STDERR || 'false').toLowerCase() === 'true';
+const SELF_HEAL_ENABLED = String(process.env.SELF_HEAL_ENABLED || 'true').toLowerCase() !== 'false';
+const SELF_HEAL_RESTART_DELAY_MS = toInt(process.env.SELF_HEAL_RESTART_DELAY_MS, 5000);
+const SELF_HEAL_MAX_LOGIN_BACKOFF_MS = toInt(process.env.SELF_HEAL_MAX_LOGIN_BACKOFF_MS, 60000);
+const LEGACY_MAX_INPUT_TOKENS_BEFORE_RESET = toOptionalInt(process.env.MAX_INPUT_TOKENS_BEFORE_RESET);
+const MAX_INPUT_TOKENS_BEFORE_COMPACT = toInt(
+  process.env.MAX_INPUT_TOKENS_BEFORE_COMPACT,
+  Number.isFinite(LEGACY_MAX_INPUT_TOKENS_BEFORE_RESET) ? LEGACY_MAX_INPUT_TOKENS_BEFORE_RESET : 250000,
+);
+const COMPACT_STRATEGY = normalizeCompactStrategy(process.env.COMPACT_STRATEGY || 'hard');
+const COMPACT_ON_THRESHOLD = String(process.env.COMPACT_ON_THRESHOLD || 'true').toLowerCase() !== 'false';
+const MODEL_AUTO_COMPACT_TOKEN_LIMIT = toInt(
+  process.env.MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+  MAX_INPUT_TOKENS_BEFORE_COMPACT,
+);
 const SLASH_PREFIX = normalizeSlashPrefix(process.env.SLASH_PREFIX || 'cx');
 const SPAWN_ENV = buildSpawnEnv(process.env);
 
@@ -94,92 +131,121 @@ function getCodexDefaults() {
 }
 
 const db = loadDb();
-const running = new Set();
+const channelStates = new Map();
+let client = null;
+let selfHealTimer = null;
+let selfHealInFlight = false;
+let lockFd = null;
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Channel, Partials.Message],
-});
+function createClient() {
+  const bot = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+    partials: [Partials.Channel, Partials.Message],
+  });
 
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  await registerSlashCommands(client);
-});
-
-// Auto-join threads so we receive messageCreate events in them
-client.on('threadCreate', async (thread) => {
-  try {
-    if (!thread.joined) await thread.join();
-    console.log(`🧵 Joined thread: ${thread.name} (${thread.id})`);
-  } catch (err) {
-    console.error(`Failed to join thread ${thread.id}:`, err.message);
+  if (restProxyAgent) {
+    bot.rest.setAgent(restProxyAgent);
   }
-});
 
-// Also join existing threads on startup
-client.on('threadListSync', (threads) => {
-  for (const thread of threads.values()) {
-    if (!thread.joined) {
-      thread.join().then(() => console.log(`🧵 Synced into thread: ${thread.name}`)).catch(() => {});
-    }
-  }
-});
+  return bot;
+}
 
-client.on('messageCreate', async (message) => {
-  try {
-    if (message.author.bot) return;
-    if (!isAllowedUser(message.author.id)) return;
+function bindClientHandlers(bot) {
+  bot.once('ready', async () => {
+    console.log(`✅ Logged in as ${bot.user.tag}`);
+    await registerSlashCommands(bot);
+  });
 
-    // Debug: log all incoming messages
-    const chId = message.channel.id;
-    const parentId = message.channel.isThread?.() ? message.channel.parentId : null;
-    console.log(`[msg] ch=${chId} parent=${parentId} author=${message.author.tag} allowed=${isAllowedChannel(message.channel)}`);
-
-    if (!isAllowedChannel(message.channel)) return;
-
-    // Strip bot mention if present, otherwise use raw content
-    const content = message.content
-      .replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '')
-      .trim();
-    if (!content) return;
-
-    const key = message.channel.id;
-
-    if (content.startsWith('!')) {
-      await handleCommand(message, key, content);
-      return;
-    }
-
-    if (running.has(key)) {
-      await message.reply('⏳ 我还在处理上一条，等我先跑完再喂下一条。');
-      return;
-    }
-
-    running.add(key);
+  // Auto-join threads so we receive messageCreate events in them
+  bot.on('threadCreate', async (thread) => {
     try {
-      await message.react('⚡').catch(() => {});
-      await handlePrompt(message, key, content);
-      // swap ⚡ → ✅ on success
-      await message.reactions.cache.get('⚡')?.users.remove(client.user.id).catch(() => {});
-      await message.react('✅').catch(() => {});
-    } finally {
-      running.delete(key);
+      if (!thread.joined) await thread.join();
+      console.log(`🧵 Joined thread: ${thread.name} (${thread.id})`);
+    } catch (err) {
+      console.error(`Failed to join thread ${thread.id}:`, err.message);
     }
-  } catch (err) {
-    console.error('messageCreate handler error:', err);
+  });
+
+  // Also join existing threads on startup
+  bot.on('threadListSync', (threads) => {
+    for (const thread of threads.values()) {
+      if (!thread.joined) {
+        thread.join().then(() => console.log(`🧵 Synced into thread: ${thread.name}`)).catch(() => {});
+      }
+    }
+  });
+
+  bot.on('messageCreate', async (message) => {
     try {
-      await message.reactions.cache.get('⚡')?.users.remove(client.user.id).catch(() => {});
-      await message.react('❌').catch(() => {});
-      await message.reply(`❌ 处理失败：${safeError(err)}`);
-    } catch {
-      // ignore
+      if (message.author.bot) return;
+      if (message.system) return;
+      if (!isAllowedUser(message.author.id)) return;
+
+      // Debug: log all incoming messages
+      const chId = message.channel.id;
+      const parentId = message.channel.isThread?.() ? message.channel.parentId : null;
+      const attachmentCount = message.attachments?.size || 0;
+      console.log(`[msg] ch=${chId} parent=${parentId} author=${message.author.tag} allowed=${isAllowedChannel(message.channel)} contentLen=${message.content.length} attachments=${attachmentCount} system=${message.system}`);
+
+      if (!isAllowedChannel(message.channel)) return;
+
+      // Strip bot mention if present, otherwise use raw content
+      const rawContent = message.content
+        .replace(new RegExp(`<@!?${bot.user.id}>`, 'g'), '')
+        .trim();
+      const content = buildPromptFromMessage(rawContent, message.attachments);
+      if (!content) return;
+
+      const key = message.channel.id;
+
+      if (rawContent.startsWith('!')) {
+        await handleCommand(message, key, rawContent);
+        return;
+      }
+
+      await enqueuePrompt(message, key, content);
+    } catch (err) {
+      console.error('messageCreate handler error:', err);
+      try {
+        await message.reactions.cache.get('⚡')?.users.remove(bot.user?.id).catch(() => {});
+        await message.react('❌').catch(() => {});
+        await safeReply(message, `❌ 处理失败：${safeError(err)}`);
+      } catch {
+        // ignore
+      }
     }
-  }
-});
+  });
+
+  bot.on('interactionCreate', handleInteractionCreate);
+
+  bot.on('error', (err) => {
+    console.error('Discord client error:', err);
+    scheduleSelfHeal('client_error', err);
+  });
+
+  bot.on('shardError', (err, shardId) => {
+    console.error(`Discord shard error (shard=${shardId}):`, err);
+    scheduleSelfHeal(`shard_error:${shardId}`, err);
+  });
+
+  bot.on('shardDisconnect', (event, shardId) => {
+    const code = event?.code ?? 'unknown';
+    const recoverable = isRecoverableGatewayCloseCode(code);
+    console.warn(`Discord shard disconnected (shard=${shardId}, code=${code}, recoverable=${recoverable})`);
+    if (recoverable) {
+      scheduleSelfHeal(`shard_disconnect:${shardId}:code=${code}`);
+    }
+  });
+
+  bot.on('invalidated', () => {
+    console.error('Discord session invalidated.');
+    scheduleSelfHeal('session_invalidated');
+  });
+}
 
 // ── Slash Commands ──────────────────────────────────────────────
 
@@ -221,11 +287,23 @@ const slashCommands = [
     .setName(slashName('resume'))
     .setDescription('继承一个已有的 Codex session')
     .addStringOption(o => o.setName('session_id').setDescription('Codex session UUID').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName(slashName('queue'))
+    .setDescription('查看当前频道的任务队列状态'),
+  new SlashCommandBuilder()
+    .setName(slashName('progress'))
+    .setDescription('查看当前任务的最新执行进度'),
+  new SlashCommandBuilder()
+    .setName(slashName('cancel'))
+    .setDescription('中断当前任务并清空排队消息'),
 ];
 
 async function registerSlashCommands(client) {
   try {
     const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+    if (restProxyAgent) {
+      rest.setAgent(restProxyAgent);
+    }
     const body = slashCommands.map(c => c.toJSON());
 
     // Register to all guilds the bot is in (guild commands appear instantly)
@@ -238,7 +316,7 @@ async function registerSlashCommands(client) {
   }
 }
 
-client.on('interactionCreate', async (interaction) => {
+async function handleInteractionCreate(interaction) {
   if (!interaction.isChatInputCommand()) return;
   if (!isAllowedUser(interaction.user.id)) {
     await interaction.reply({ content: '⛔ 没有权限。', flags: 64 });
@@ -264,6 +342,7 @@ client.on('interactionCreate', async (interaction) => {
         const wd = ensureWorkspace(session, key);
         const defaults = getCodexDefaults();
         const codexHealth = getCodexCliHealth();
+        const runtime = getRuntimeSnapshot(key);
         const modeDesc = session.mode === 'dangerous'
           ? 'dangerous (无沙盒, 全权限)'
           : 'safe (沙盒隔离, 无网络)';
@@ -279,7 +358,18 @@ client.on('interactionCreate', async (interaction) => {
             `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
             `• codex-cli: ${formatCodexHealth(codexHealth)}`,
             `• session: ${sessionLabel}`,
-          ].join('\n'),
+            `• last input tokens: ${formatTokenValue(session.lastInputTokens)}`,
+            `• runtime: ${formatRuntimeLabel(runtime)}`,
+            `• queued prompts: ${runtime.queued}`,
+            runtime.progressText ? `• latest progress: ${runtime.progressText}` : null,
+            `• codex timeout: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}`,
+            `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
+            `• compact trigger: ${COMPACT_ON_THRESHOLD ? 'on' : 'off'}`,
+            `• compact threshold: ${MAX_INPUT_TOKENS_BEFORE_COMPACT}`,
+            COMPACT_STRATEGY === 'native' && COMPACT_ON_THRESHOLD
+              ? `• native auto compact limit: ${MODEL_AUTO_COMPACT_TOKEN_LIMIT} (model_auto_compact_token_limit)`
+              : null,
+          ].filter(Boolean).join('\n'),
           flags: 64,
         });
         break;
@@ -366,6 +456,31 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply(`✅ session 命名为: **${label}**`);
         break;
       }
+
+      case 'queue': {
+        await interaction.reply({
+          content: formatQueueReport(key),
+          flags: 64,
+        });
+        break;
+      }
+
+      case 'progress': {
+        await interaction.reply({
+          content: formatProgressReport(key),
+          flags: 64,
+        });
+        break;
+      }
+
+      case 'cancel': {
+        const outcome = cancelChannelWork(key, 'slash_cancel');
+        await interaction.reply({
+          content: formatCancelReport(outcome),
+          flags: 64,
+        });
+        break;
+      }
     }
   } catch (err) {
     const reply = interaction.replied || interaction.deferred
@@ -373,11 +488,235 @@ client.on('interactionCreate', async (interaction) => {
       : interaction.reply.bind(interaction);
     await reply({ content: `❌ ${safeError(err)}`, flags: 64 });
   }
-});
+}
+
+async function bootClient(reason) {
+  if (!client) {
+    client = createClient();
+    bindClientHandlers(client);
+  }
+  await loginClientWithRetry(client, reason);
+}
+
+async function loginClientWithRetry(bot, reason) {
+  if (!SELF_HEAL_ENABLED) {
+    await bot.login(DISCORD_TOKEN);
+    return;
+  }
+
+  let attempt = 0;
+  const baseDelay = Math.max(1000, SELF_HEAL_RESTART_DELAY_MS);
+  const maxDelay = Math.max(baseDelay, SELF_HEAL_MAX_LOGIN_BACKOFF_MS);
+
+  while (true) {
+    attempt += 1;
+    try {
+      await bot.login(DISCORD_TOKEN);
+      if (attempt > 1) {
+        console.log(`✅ Discord reconnect success after ${attempt} attempts (reason=${reason}).`);
+      }
+      return;
+    } catch (err) {
+      if (isInvalidTokenError(err)) {
+        throw err;
+      }
+
+      const delay = Math.min(maxDelay, baseDelay * (2 ** Math.min(10, attempt - 1)));
+      console.error(`Discord login failed (reason=${reason}, attempt=${attempt}): ${safeError(err)}; retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+}
+
+function scheduleSelfHeal(reason, err = null) {
+  if (!SELF_HEAL_ENABLED) return;
+  if (err && isInvalidTokenError(err)) {
+    console.error('❌ Discord token invalid. Self-heal skipped; please fix DISCORD_TOKEN.');
+    return;
+  }
+  if (selfHealInFlight || selfHealTimer) return;
+
+  if (err) {
+    console.error(`♻️ Self-heal triggered by ${reason}:`, safeError(err));
+  } else {
+    console.error(`♻️ Self-heal triggered by ${reason}.`);
+  }
+
+  const delay = Math.max(1000, SELF_HEAL_RESTART_DELAY_MS);
+  selfHealTimer = setTimeout(() => {
+    selfHealTimer = null;
+    restartClient(reason).catch((restartErr) => {
+      console.error('Self-heal restart failed:', restartErr);
+      scheduleSelfHeal('restart_failed', restartErr);
+    });
+  }, delay);
+  selfHealTimer.unref?.();
+}
+
+async function restartClient(reason) {
+  if (!SELF_HEAL_ENABLED) return;
+  if (selfHealInFlight) return;
+
+  selfHealInFlight = true;
+  cancelAllChannelWork(`self_heal:${reason}`);
+
+  try {
+    if (client) {
+      client.removeAllListeners();
+      client.destroy();
+    }
+  } catch (err) {
+    console.error('Failed to destroy previous Discord client:', safeError(err));
+  }
+
+  client = createClient();
+  bindClientHandlers(client);
+
+  try {
+    await loginClientWithRetry(client, `self_heal:${reason}`);
+    console.log(`✅ Self-heal recovered (reason=${reason}).`);
+  } finally {
+    selfHealInFlight = false;
+  }
+}
+
+function setupProcessSelfHeal() {
+  if (!SELF_HEAL_ENABLED) return;
+
+  process.on('unhandledRejection', (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    console.error('Unhandled rejection:', err);
+    if (isInvalidTokenError(err)) return;
+    scheduleSelfHeal('unhandled_rejection', err);
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err);
+    if (isInvalidTokenError(err)) return;
+    scheduleSelfHeal('uncaught_exception', err);
+  });
+}
+
+function isRecoverableGatewayCloseCode(code) {
+  const n = Number(code);
+  if (!Number.isFinite(n)) return true;
+
+  // 4004/4010+/4014 are usually configuration/token/intents issues.
+  if ([4004, 4010, 4011, 4012, 4013, 4014].includes(n)) return false;
+  return true;
+}
+
+function isInvalidTokenError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return msg.includes('invalid token');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function acquireSingleInstanceLock() {
+  ensureDir(DATA_DIR);
+  const lockBody = JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    root: ROOT,
+  }, null, 2);
+
+  try {
+    lockFd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeFileSync(lockFd, `${lockBody}\n`, 'utf8');
+    console.log(`🔒 Single-instance lock acquired: ${LOCK_FILE} (pid=${process.pid})`);
+    return;
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+  }
+
+  const existing = readLockFile();
+  if (existing?.pid && isProcessAlive(existing.pid)) {
+    console.error(`⛔ Another bot instance is running (pid=${existing.pid}). Exit without takeover.`);
+    process.exit(0);
+  }
+
+  // stale lock
+  try {
+    fs.unlinkSync(LOCK_FILE);
+    lockFd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeFileSync(lockFd, `${lockBody}\n`, 'utf8');
+    console.warn(`♻️ Removed stale lock and acquired new lock: ${LOCK_FILE} (pid=${process.pid})`);
+  } catch (err) {
+    console.error(`❌ Failed to acquire lock ${LOCK_FILE}: ${safeError(err)}`);
+    process.exit(1);
+  }
+}
+
+function setupLockCleanupHandlers() {
+  process.on('exit', () => {
+    releaseSingleInstanceLock();
+  });
+
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+    process.on(signal, () => {
+      releaseSingleInstanceLock();
+      process.exit(0);
+    });
+  }
+}
+
+function releaseSingleInstanceLock() {
+  if (lockFd !== null) {
+    try {
+      fs.closeSync(lockFd);
+    } catch {
+      // ignore
+    }
+    lockFd = null;
+  }
+
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      console.warn(`Failed to remove lock file ${LOCK_FILE}: ${safeError(err)}`);
+    }
+  }
+}
+
+function readLockFile() {
+  try {
+    if (!fs.existsSync(LOCK_FILE)) return null;
+    const raw = fs.readFileSync(LOCK_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      pid: toOptionalInt(parsed?.pid),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
 
 // ── Message handler (prompts → Codex) ──────────────────────────
 
-await client.login(DISCORD_TOKEN);
+acquireSingleInstanceLock();
+setupLockCleanupHandlers();
+setupProcessSelfHeal();
+try {
+  await bootClient('startup');
+} catch (err) {
+  console.error(`❌ Failed to boot Discord client: ${safeError(err)}`);
+  process.exit(1);
+}
 
 async function handleCommand(message, key, content) {
   const [cmd, ...rest] = content.split(/\s+/);
@@ -386,11 +725,14 @@ async function handleCommand(message, key, content) {
 
   switch (cmd.toLowerCase()) {
     case '!help': {
-      await message.reply([
+      await safeReply(message, [
         '**📋 命令列表**',
         '',
         '**会话管理**',
         '• `!status` — 当前配置一览',
+        '• `!queue` — 查看当前频道队列（运行中/排队数）',
+        '• `!progress` — 查看当前任务的最新进度',
+        '• `!abort` / `!cancel` / `!stop` — 中断当前任务并清空队列',
         '• `!reset` — 清空会话，下条消息新开上下文',
         '• `!resume <session_id>` — 继承一个已有的 Codex session',
         '• `!sessions` — 列出最近的 Codex sessions（从 ~/.codex/sessions/）',
@@ -414,10 +756,11 @@ async function handleCommand(message, key, content) {
       const workspaceDir = ensureWorkspace(session, key);
       const defaults = getCodexDefaults();
       const codexHealth = getCodexCliHealth();
+      const runtime = getRuntimeSnapshot(key);
       const modeDesc = session.mode === 'dangerous'
         ? 'dangerous (无沙盒, 全权限)'
         : 'safe (沙盒隔离, 无网络)';
-      await message.reply([
+      await safeReply(message, [
         '🧭 **当前配置**',
         `• workspace: \`${workspaceDir}\``,
         `• mode: ${modeDesc}`,
@@ -425,38 +768,67 @@ async function handleCommand(message, key, content) {
         `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
         `• codex-cli: ${formatCodexHealth(codexHealth)}`,
         `• codex session: \`${session.codexThreadId || '(none)'}\``,
+        `• last input tokens: ${formatTokenValue(session.lastInputTokens)}`,
+        `• runtime: ${formatRuntimeLabel(runtime)}`,
+        `• queued prompts: ${runtime.queued}`,
+        runtime.progressText ? `• latest progress: ${runtime.progressText}` : null,
+        `• codex timeout: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}`,
+        `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
+        `• compact trigger: ${COMPACT_ON_THRESHOLD ? 'on' : 'off'}`,
+        `• compact threshold: ${MAX_INPUT_TOKENS_BEFORE_COMPACT}`,
+        COMPACT_STRATEGY === 'native' && COMPACT_ON_THRESHOLD
+          ? `• native auto compact limit: ${MODEL_AUTO_COMPACT_TOKEN_LIMIT} (model_auto_compact_token_limit)`
+          : null,
         session.configOverrides?.length ? `• extra config: ${session.configOverrides.join(', ')}` : null,
       ].filter(Boolean).join('\n'));
+      break;
+    }
+
+    case '!queue': {
+      await safeReply(message, formatQueueReport(key));
+      break;
+    }
+
+    case '!progress': {
+      await safeReply(message, formatProgressReport(key));
+      break;
+    }
+
+    case '!abort':
+    case '!cancel':
+    case '!stop': {
+      const outcome = cancelChannelWork(key, `text_command:${cmd.toLowerCase()}`);
+      await safeReply(message, formatCancelReport(outcome));
       break;
     }
 
     case '!cd':
     case '!setdir': {
       if (!arg) {
-        await message.reply('用法：`!setdir <path>`\n例：`!setdir ~/GitHub/my-project`');
+        await safeReply(message, '用法：`!setdir <path>`\n例：`!setdir ~/GitHub/my-project`');
         return;
       }
       const resolved = resolvePath(arg);
       if (!fs.existsSync(resolved)) {
-        await message.reply(`❌ 目录不存在：\`${resolved}\`\n要新建的话先 mkdir。`);
+        await safeReply(message, `❌ 目录不存在：\`${resolved}\`\n要新建的话先 mkdir。`);
         return;
       }
       ensureGitRepo(resolved);
       session.workspaceDir = resolved;
       session.codexThreadId = null;
       saveDb();
-      await message.reply(`✅ workspace → \`${resolved}\`\n会话已重置（新目录 = 新上下文）。`);
+      await safeReply(message, `✅ workspace → \`${resolved}\`\n会话已重置（新目录 = 新上下文）。`);
       break;
     }
 
     case '!resume': {
       if (!arg) {
-        await message.reply('用法：`!resume <codex-session-id>`\n用 `!sessions` 查看可用的 session。');
+        await safeReply(message, '用法：`!resume <codex-session-id>`\n用 `!sessions` 查看可用的 session。');
         return;
       }
       session.codexThreadId = arg.trim();
       saveDb();
-      await message.reply(`✅ 已绑定 Codex session: \`${session.codexThreadId}\`\n下条消息会 resume 这个上下文。`);
+      await safeReply(message, `✅ 已绑定 Codex session: \`${session.codexThreadId}\`\n下条消息会 resume 这个上下文。`);
       break;
     }
 
@@ -464,7 +836,7 @@ async function handleCommand(message, key, content) {
       try {
         const sessions = listRecentCodexSessions(10);
         if (!sessions.length) {
-          await message.reply('没有找到任何 Codex session。');
+          await safeReply(message, '没有找到任何 Codex session。');
           break;
         }
 
@@ -473,19 +845,19 @@ async function handleCommand(message, key, content) {
           return `${i + 1}. \`${s.id}\` (${ago} ago)`;
         });
 
-        await message.reply([
+        await safeReply(message, [
           '**最近 Codex Sessions**（用 `!resume <id>` 继承）',
           ...lines,
         ].join('\n'));
       } catch (err) {
-        await message.reply(`❌ 读取 sessions 失败：${safeError(err)}`);
+        await safeReply(message, `❌ 读取 sessions 失败：${safeError(err)}`);
       }
       break;
     }
 
     case '!model': {
       if (!arg) {
-        await message.reply('用法：`!model <name|default>`\n例：`!model o3` / `!model gpt-5.3-codex` / `!model default`');
+        await safeReply(message, '用法：`!model <name|default>`\n例：`!model o3` / `!model gpt-5.3-codex` / `!model default`');
         return;
       }
       if (arg.toLowerCase() === 'default') {
@@ -494,14 +866,14 @@ async function handleCommand(message, key, content) {
         session.model = arg;
       }
       saveDb();
-      await message.reply(`✅ model = ${session.model || '(default from config.toml)'}`);
+      await safeReply(message, `✅ model = ${session.model || '(default from config.toml)'}`);
       break;
     }
 
     case '!effort': {
       const valid = ['high', 'medium', 'low', 'default'];
       if (!arg || !valid.includes(arg.toLowerCase())) {
-        await message.reply('用法：`!effort <high|medium|low|default>`');
+        await safeReply(message, '用法：`!effort <high|medium|low|default>`');
         return;
       }
       if (arg.toLowerCase() === 'default') {
@@ -510,30 +882,30 @@ async function handleCommand(message, key, content) {
         session.effort = arg.toLowerCase();
       }
       saveDb();
-      await message.reply(`✅ reasoning effort = ${session.effort || '(default from config.toml)'}`);
+      await safeReply(message, `✅ reasoning effort = ${session.effort || '(default from config.toml)'}`);
       break;
     }
 
     case '!config': {
       if (!arg) {
-        await message.reply('用法：`!config <key=value>`\n例：`!config personality="concise"` / `!config sandbox_permissions=["disk-full-read-access"]`');
+        await safeReply(message, '用法：`!config <key=value>`\n例：`!config personality="concise"` / `!config sandbox_permissions=["disk-full-read-access"]`');
         return;
       }
       session.configOverrides = session.configOverrides || [];
       session.configOverrides.push(arg);
       saveDb();
-      await message.reply(`✅ 已添加配置：\`${arg}\`\n当前额外配置：${session.configOverrides.map(c => `\`${c}\``).join(', ')}`);
+      await safeReply(message, `✅ 已添加配置：\`${arg}\`\n当前额外配置：${session.configOverrides.map(c => `\`${c}\``).join(', ')}`);
       break;
     }
 
     case '!mode': {
       if (!arg || !['safe', 'dangerous'].includes(arg.toLowerCase())) {
-        await message.reply('用法：`!mode <safe|dangerous>`');
+        await safeReply(message, '用法：`!mode <safe|dangerous>`');
         return;
       }
       session.mode = arg.toLowerCase();
       saveDb();
-      await message.reply(`✅ mode = ${session.mode}`);
+      await safeReply(message, `✅ mode = ${session.mode}`);
       break;
     }
 
@@ -541,16 +913,445 @@ async function handleCommand(message, key, content) {
       session.codexThreadId = null;
       session.configOverrides = [];
       saveDb();
-      await message.reply('♻️ 已清空会话 + 额外配置。下条消息新开上下文。');
+      await safeReply(message, '♻️ 已清空会话 + 额外配置。下条消息新开上下文。');
       break;
     }
 
     default:
-      await message.reply('未知命令。发 `!help` 看命令列表。');
+      await safeReply(message, '未知命令。发 `!help` 看命令列表。');
   }
 }
 
-async function handlePrompt(message, key, prompt) {
+function getChannelState(key) {
+  let state = channelStates.get(key);
+  if (!state) {
+    state = {
+      running: false,
+      queue: [],
+      activeRun: null,
+      cancelRequested: false,
+    };
+    channelStates.set(key, state);
+  }
+  return state;
+}
+
+async function enqueuePrompt(message, key, content) {
+  const state = getChannelState(key);
+  const queuedAhead = (state.running ? 1 : 0) + state.queue.length;
+
+  state.queue.push({
+    message,
+    key,
+    content,
+    enqueuedAt: Date.now(),
+  });
+
+  if (queuedAhead > 0) {
+    await safeReply(
+      message,
+      `⏳ 已加入队列，前面还有 ${queuedAhead} 条。可用 \`!queue\` 查看状态，\`!abort\` 中断当前任务。`,
+    );
+  }
+
+  void processPromptQueue(key);
+}
+
+async function processPromptQueue(key) {
+  const state = getChannelState(key);
+  if (state.running) return;
+
+  state.running = true;
+  try {
+    while (state.queue.length) {
+      const job = state.queue.shift();
+      if (!job) continue;
+      await runPromptJob(state, job);
+    }
+  } finally {
+    state.running = false;
+    state.activeRun = null;
+    state.cancelRequested = false;
+  }
+}
+
+async function runPromptJob(channelState, job) {
+  const { message, key, content } = job;
+  channelState.cancelRequested = false;
+
+  try {
+    await message.react('⚡').catch(() => {});
+    const outcome = await handlePrompt(message, key, content, channelState);
+    await message.reactions.cache.get('⚡')?.users.remove(client?.user?.id).catch(() => {});
+    if (outcome.ok) {
+      await message.react('✅').catch(() => {});
+    } else if (outcome.cancelled) {
+      await message.react('🛑').catch(() => {});
+    } else {
+      await message.react('❌').catch(() => {});
+    }
+  } catch (err) {
+    console.error('runPromptJob error:', err);
+    try {
+      await message.reactions.cache.get('⚡')?.users.remove(client?.user?.id).catch(() => {});
+      await message.react('❌').catch(() => {});
+      await safeReply(message, `❌ 处理失败：${safeError(err)}`);
+    } catch {
+      // ignore
+    }
+  } finally {
+    channelState.activeRun = null;
+  }
+}
+
+function setActiveRun(channelState, message, prompt, child, phase = 'exec') {
+  const prev = channelState.activeRun;
+  channelState.activeRun = {
+    child,
+    startedAt: Date.now(),
+    messageId: message.id,
+    phase,
+    promptPreview: truncate(String(prompt || '').replace(/\s+/g, ' '), 120),
+    cancelRequested: Boolean(channelState.cancelRequested),
+    progressEvents: prev?.progressEvents || 0,
+    lastProgressText: prev?.lastProgressText || null,
+    lastProgressAt: prev?.lastProgressAt || null,
+    progressMessageId: prev?.progressMessageId || null,
+  };
+}
+
+function stopChildProcess(child) {
+  if (!child || child.killed) return;
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    return;
+  }
+  setTimeout(() => {
+    try {
+      if (!child.killed) child.kill('SIGKILL');
+    } catch {
+      // ignore
+    }
+  }, 3000).unref?.();
+}
+
+function cancelChannelWork(key, reason = 'manual') {
+  const state = getChannelState(key);
+  const queued = state.queue.length;
+  state.queue.length = 0;
+  state.cancelRequested = true;
+
+  let cancelledRunning = false;
+  let pid = null;
+  if (state.activeRun?.child) {
+    state.activeRun.cancelRequested = true;
+    cancelledRunning = true;
+    pid = state.activeRun.child.pid ?? null;
+    stopChildProcess(state.activeRun.child);
+  }
+
+  return {
+    key,
+    reason,
+    cancelledRunning,
+    pid,
+    clearedQueued: queued,
+  };
+}
+
+function cancelAllChannelWork(reason = 'system') {
+  for (const key of channelStates.keys()) {
+    cancelChannelWork(key, reason);
+  }
+}
+
+function getRuntimeSnapshot(key) {
+  const state = getChannelState(key);
+  const active = state.activeRun;
+  return {
+    running: Boolean(state.running || active),
+    queued: state.queue.length,
+    activeSinceMs: active ? Math.max(0, Date.now() - active.startedAt) : null,
+    phase: active?.phase || null,
+    pid: active?.child?.pid ?? null,
+    messageId: active?.messageId || null,
+    progressEvents: active?.progressEvents || 0,
+    progressText: active?.lastProgressText || null,
+    progressAgoMs: active?.lastProgressAt ? Math.max(0, Date.now() - active.lastProgressAt) : null,
+    progressMessageId: active?.progressMessageId || null,
+  };
+}
+
+function formatRuntimeLabel(runtime) {
+  if (!runtime.running) return 'idle';
+  const age = runtime.activeSinceMs === null ? 'just-now' : humanAge(runtime.activeSinceMs);
+  const phase = runtime.phase ? `, phase=${runtime.phase}` : '';
+  const pid = runtime.pid ? `, pid=${runtime.pid}` : '';
+  return `running (${age}${phase}${pid})`;
+}
+
+function formatTimeoutLabel(timeoutMs) {
+  const n = Number(timeoutMs);
+  if (!Number.isFinite(n) || n <= 0) return 'off (no hard timeout)';
+  return `${n}ms (~${humanAge(n)})`;
+}
+
+function formatQueueReport(key) {
+  const runtime = getRuntimeSnapshot(key);
+  return [
+    '📮 **任务队列状态**',
+    `• runtime: ${formatRuntimeLabel(runtime)}`,
+    `• queued prompts: ${runtime.queued}`,
+    runtime.progressText ? `• latest step: ${runtime.progressText}` : null,
+    runtime.progressAgoMs !== null ? `• progress updated: ${humanAge(runtime.progressAgoMs)} ago` : null,
+    runtime.messageId ? `• active message id: \`${runtime.messageId}\`` : null,
+    runtime.progressMessageId ? `• progress message id: \`${runtime.progressMessageId}\`` : null,
+  ].filter(Boolean).join('\n');
+}
+
+function formatProgressReport(key) {
+  const runtime = getRuntimeSnapshot(key);
+  if (!runtime.running) {
+    return 'ℹ️ 当前没有运行中的任务。';
+  }
+  return [
+    '🧵 **任务进度**',
+    `• runtime: ${formatRuntimeLabel(runtime)}`,
+    `• event count: ${runtime.progressEvents}`,
+    runtime.progressText ? `• latest step: ${runtime.progressText}` : null,
+    runtime.progressAgoMs !== null ? `• last update: ${humanAge(runtime.progressAgoMs)} ago` : null,
+    runtime.progressMessageId ? `• progress message id: \`${runtime.progressMessageId}\`` : null,
+    `• queued prompts: ${runtime.queued}`,
+    `• hint: 可用 \`!abort\` / \`${slashRef('cancel')}\` 中断当前任务并清空队列。`,
+  ].filter(Boolean).join('\n');
+}
+
+function formatCancelReport(outcome) {
+  if (!outcome.cancelledRunning && outcome.clearedQueued === 0) {
+    return 'ℹ️ 当前没有运行中或排队任务。';
+  }
+  return [
+    '🛑 已处理取消请求',
+    `• running task interrupted: ${outcome.cancelledRunning ? 'yes' : 'no'}`,
+    outcome.pid ? `• pid: ${outcome.pid}` : null,
+    `• cleared queued prompts: ${outcome.clearedQueued}`,
+  ].filter(Boolean).join('\n');
+}
+
+function createProgressReporter({ message, channelState }) {
+  if (!PROGRESS_UPDATES_ENABLED) return null;
+
+  const startedAt = Date.now();
+  let progressMessage = null;
+  let timer = null;
+  let stopped = false;
+  let lastEmitAt = 0;
+  let lastRendered = '';
+  let events = 0;
+  let latestStep = '任务已开始，等待 Codex 首个事件...';
+  let isEmitting = false;
+  let rerunEmit = false;
+
+  const syncActiveRun = () => {
+    if (!channelState.activeRun) return;
+    channelState.activeRun.progressEvents = events;
+    channelState.activeRun.lastProgressText = latestStep;
+    channelState.activeRun.lastProgressAt = Date.now();
+    if (progressMessage?.id) {
+      channelState.activeRun.progressMessageId = progressMessage.id;
+    }
+  };
+
+  const render = (status = 'running') => {
+    const elapsed = humanAge(Math.max(0, Date.now() - startedAt));
+    const phase = channelState.activeRun?.phase || 'starting';
+    const hint = status === 'running'
+      ? `可用 \`!abort\` / \`${slashRef('cancel')}\` 中断，\`!progress\` 查看详情。`
+      : '可继续发送新消息，或用 `!queue` 查看是否还有排队任务。';
+    return [
+      status === 'running' ? '⏳ **任务进行中**' : status,
+      `• elapsed: ${elapsed}`,
+      `• phase: ${phase}`,
+      `• event count: ${events}`,
+      `• latest step: ${latestStep}`,
+      `• queued prompts: ${channelState.queue.length}`,
+      `• hint: ${hint}`,
+    ].join('\n');
+  };
+
+  const emit = async (force = false) => {
+    if (!progressMessage || stopped) return;
+    if (isEmitting) {
+      rerunEmit = true;
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && now - lastEmitAt < PROGRESS_EVENT_FLUSH_MS) return;
+    const body = render('running');
+    if (!force && body === lastRendered) return;
+
+    isEmitting = true;
+    try {
+      await progressMessage.edit(body);
+      lastEmitAt = Date.now();
+      lastRendered = body;
+      syncActiveRun();
+    } catch {
+      // ignore edit failures
+    } finally {
+      isEmitting = false;
+      if (rerunEmit && !stopped) {
+        rerunEmit = false;
+        void emit(false);
+      }
+    }
+  };
+
+  const start = async () => {
+    try {
+      const body = render('running');
+      progressMessage = await safeReply(message, body);
+      lastEmitAt = Date.now();
+      lastRendered = body;
+      syncActiveRun();
+      timer = setInterval(() => {
+        void emit(true);
+      }, PROGRESS_UPDATE_INTERVAL_MS);
+      timer.unref?.();
+    } catch {
+      progressMessage = null;
+    }
+  };
+
+  const onEvent = (ev) => {
+    if (stopped) return;
+    events += 1;
+    latestStep = summarizeCodexEvent(ev);
+    syncActiveRun();
+    void emit(false);
+  };
+
+  const onLog = (line, source) => {
+    if (stopped) return;
+    if (!PROGRESS_INCLUDE_STDERR || source !== 'stderr') return;
+    events += 1;
+    latestStep = `stderr: ${truncate(String(line || '').replace(/\s+/g, ' ').trim(), PROGRESS_TEXT_PREVIEW_CHARS)}`;
+    syncActiveRun();
+    void emit(false);
+  };
+
+  const finish = async ({ ok = false, cancelled = false, timedOut = false, error = '' } = {}) => {
+    if (stopped) return;
+    stopped = true;
+    if (timer) clearInterval(timer);
+    syncActiveRun();
+    if (!progressMessage) return;
+
+    const elapsed = humanAge(Math.max(0, Date.now() - startedAt));
+    const status = cancelled
+      ? '🛑 **任务已中断**'
+      : ok
+        ? '✅ **任务已完成**'
+        : timedOut
+          ? '⏱️ **任务超时**'
+          : '❌ **任务失败**';
+    const body = [
+      status,
+      `• elapsed: ${elapsed}`,
+      `• phase: ${channelState.activeRun?.phase || 'done'}`,
+      `• event count: ${events}`,
+      `• latest step: ${latestStep}`,
+      !ok && !cancelled && error ? `• error: ${truncate(String(error), 260)}` : null,
+    ].filter(Boolean).join('\n');
+
+    try {
+      await progressMessage.edit(body);
+    } catch {
+      // ignore
+    }
+  };
+
+  return {
+    start,
+    onEvent,
+    onLog,
+    finish,
+  };
+}
+
+function summarizeCodexEvent(ev) {
+  if (!ev || typeof ev !== 'object') return '收到执行事件';
+
+  const type = String(ev.type || '').trim();
+  if (!type) return '收到执行事件';
+
+  switch (type) {
+    case 'thread.started':
+      return ev.thread_id ? `session started: ${ev.thread_id}` : 'session started';
+    case 'turn.started':
+      return 'turn started';
+    case 'turn.completed': {
+      const input = extractInputTokensFromUsage(ev.usage);
+      return input === null ? 'turn completed' : `turn completed (input tokens: ${input})`;
+    }
+    case 'error': {
+      let detail = '';
+      if (typeof ev.error === 'string') {
+        detail = ev.error;
+      } else {
+        try {
+          detail = JSON.stringify(ev.error);
+        } catch {
+          detail = String(ev.error || 'unknown');
+        }
+      }
+      return `error: ${truncate(String(detail || 'unknown'), PROGRESS_TEXT_PREVIEW_CHARS)}`;
+    }
+    case 'item.started':
+    case 'item.completed': {
+      const item = ev.item || {};
+      const itemType = String(item.type || 'item');
+      const action = type === 'item.started' ? 'started' : 'completed';
+
+      if (itemType === 'agent_message') {
+        const preview = extractEventTextPreview(item);
+        return preview ? `agent message ${action}: ${preview}` : `agent message ${action}`;
+      }
+
+      if (itemType === 'reasoning') {
+        if (!SHOW_REASONING) return `reasoning ${action}`;
+        const preview = extractEventTextPreview(item);
+        return preview ? `reasoning ${action}: ${preview}` : `reasoning ${action}`;
+      }
+
+      const toolName = item.tool_name || item.name || item.call?.name || item.tool?.name || null;
+      if (toolName) return `tool ${toolName} ${action}`;
+      if (itemType.includes('tool')) return `${itemType} ${action}`;
+      return `${itemType} ${action}`;
+    }
+    default:
+      return type;
+  }
+}
+
+function extractEventTextPreview(item) {
+  const raw = typeof item?.text === 'string'
+    ? item.text
+    : Array.isArray(item?.content)
+      ? item.content.map((x) => (typeof x?.text === 'string' ? x.text : '')).join(' ')
+      : '';
+  const normalized = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return truncate(normalized, PROGRESS_TEXT_PREVIEW_CHARS);
+}
+
+async function handlePrompt(message, key, prompt, channelState) {
+  if (channelState.cancelRequested) {
+    return { ok: false, cancelled: true };
+  }
+
   const session = getSession(key);
   const workspaceDir = ensureWorkspace(session, key);
 
@@ -559,63 +1360,211 @@ async function handlePrompt(message, key, prompt) {
   const typingInterval = setInterval(() => {
     message.channel.sendTyping().catch(() => {});
   }, 8000);
+  const progress = createProgressReporter({ message, channelState });
+  await progress?.start();
+  let progressOutcome = { ok: false, cancelled: false, timedOut: false, error: '' };
 
   try {
-    let result = await runCodex({ session, workspaceDir, prompt });
+    let promptToRun = prompt;
+    const preNotes = [];
+    if (shouldCompactSession(session)) {
+      const previousThreadId = session.codexThreadId;
+      const compacted = await compactSessionContext({
+        session,
+        workspaceDir,
+        onSpawn: (child) => {
+          setActiveRun(channelState, message, 'auto-compact summary request', child, 'compact');
+          if (channelState.cancelRequested) stopChildProcess(child);
+        },
+        wasCancelled: () => Boolean(channelState.cancelRequested || channelState.activeRun?.cancelRequested),
+        onEvent: progress?.onEvent,
+        onLog: progress?.onLog,
+      });
+      if (compacted.ok && compacted.summary) {
+        session.codexThreadId = null;
+        saveDb();
+        promptToRun = buildPromptFromCompactedContext(compacted.summary, prompt);
+        preNotes.push(`上下文输入 token=${session.lastInputTokens}，已自动压缩并切换新会话（旧 session: ${previousThreadId}）。`);
+      } else {
+        session.codexThreadId = null;
+        saveDb();
+        preNotes.push(`上下文输入 token=${session.lastInputTokens}，自动压缩失败，已回退 reset（旧 session: ${previousThreadId}）。`);
+        if (compacted.error) preNotes.push(`压缩失败原因：${compacted.error}`);
+      }
+    }
+
+    if (channelState.cancelRequested) {
+      progressOutcome = { ok: false, cancelled: true, timedOut: false, error: 'cancelled by user' };
+      return { ok: false, cancelled: true };
+    }
+
+    let result = await runCodex({
+      session,
+      workspaceDir,
+      prompt: promptToRun,
+      onSpawn: (child) => {
+        setActiveRun(channelState, message, promptToRun, child, 'exec');
+        if (channelState.cancelRequested) stopChildProcess(child);
+      },
+      wasCancelled: () => Boolean(channelState.cancelRequested || channelState.activeRun?.cancelRequested),
+      onEvent: progress?.onEvent,
+      onLog: progress?.onLog,
+    });
+    if (preNotes.length) {
+      result.notes.unshift(...preNotes);
+    }
 
     // If resume failed, auto-reset once and retry fresh session.
-    if (!result.ok && session.codexThreadId) {
+    if (!result.ok && session.codexThreadId && !result.cancelled && !result.timedOut) {
       const previous = session.codexThreadId;
       session.codexThreadId = null;
       saveDb();
-      result = await runCodex({ session, workspaceDir, prompt });
+      result = await runCodex({
+        session,
+        workspaceDir,
+        prompt,
+        onSpawn: (child) => {
+          setActiveRun(channelState, message, prompt, child, 'retry');
+          if (channelState.cancelRequested) stopChildProcess(child);
+        },
+        wasCancelled: () => Boolean(channelState.cancelRequested || channelState.activeRun?.cancelRequested),
+        onEvent: progress?.onEvent,
+        onLog: progress?.onLog,
+      });
       if (result.ok) {
         result.notes.push(`已自动重置旧会话：${previous}`);
       }
     }
 
+    const inputTokens = extractInputTokensFromUsage(result.usage);
+    let sessionDirty = false;
     if (result.threadId) {
       session.codexThreadId = result.threadId;
+      sessionDirty = true;
+    }
+    if (inputTokens !== null) {
+      session.lastInputTokens = inputTokens;
+      sessionDirty = true;
+    }
+    if (sessionDirty) {
       saveDb();
     }
 
-    clearInterval(typingInterval);
-
     if (!result.ok) {
+      if (result.cancelled) {
+        progressOutcome = { ok: false, cancelled: true, timedOut: false, error: result.error || 'cancelled' };
+        await safeReply(message, '🛑 当前任务已中断。');
+        return { ok: false, cancelled: true };
+      }
+
       const codexMissing = isCodexNotFound(result.error);
       const failText = [
-        '❌ Codex 执行失败',
+        result.timedOut ? '❌ Codex 执行超时' : '❌ Codex 执行失败',
         result.error ? `• error: ${result.error}` : null,
         result.logs.length ? `• logs: ${truncate(result.logs.join('\n'), 1200)}` : null,
+        result.timedOut ? `• 处理: 可在 .env 调大 CODEX_TIMEOUT_MS，或设为 0 关闭硬超时。当前: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}` : null,
         codexMissing ? '• 诊断: 当前环境找不到 Codex CLI 可执行文件。' : null,
         codexMissing ? '• 处理: 在该设备安装 codex，或在 .env 配置 `CODEX_BIN=/绝对路径/codex`，然后重启 bot。' : null,
         codexMissing ? `• 自检: 用 \`${slashRef('status')}\` 或 \`!status\` 查看 codex-cli 状态。` : null,
         '',
         `可以先 \`${slashRef('reset')}\` 再重试，或 \`${slashRef('status')}\` 看状态。`,
       ].filter(Boolean).join('\n');
-      await message.reply(failText);
-      return;
+      progressOutcome = {
+        ok: false,
+        cancelled: false,
+        timedOut: Boolean(result.timedOut),
+        error: result.error || 'codex run failed',
+      };
+      await safeReply(message, failText);
+      return { ok: false, cancelled: false };
     }
 
     const body = composeResultText(result, session);
     const parts = splitForDiscord(body, 1900);
 
     if (parts.length === 0) {
-      await message.reply('✅ 完成（无可展示文本输出）。');
-      return;
+      await safeReply(message, '✅ 完成（无可展示文本输出）。');
+      progressOutcome = { ok: true, cancelled: false, timedOut: false, error: '' };
+      return { ok: true, cancelled: false };
     }
 
-    await message.reply(parts[0]);
+    await safeReply(message, parts[0]);
     for (let i = 1; i < parts.length; i++) {
       await message.channel.send(parts[i]);
     }
+
+    progressOutcome = { ok: true, cancelled: false, timedOut: false, error: '' };
+    return { ok: true, cancelled: false };
   } catch (err) {
-    clearInterval(typingInterval);
+    progressOutcome = { ok: false, cancelled: false, timedOut: false, error: safeError(err) };
     throw err;
+  } finally {
+    clearInterval(typingInterval);
+    await progress?.finish(progressOutcome);
   }
 }
 
-async function runCodex({ session, workspaceDir, prompt }) {
+function shouldCompactSession(session) {
+  if (!COMPACT_ON_THRESHOLD) return false;
+  if (COMPACT_STRATEGY !== 'hard') return false;
+  if (!session?.codexThreadId) return false;
+  const last = toOptionalInt(session.lastInputTokens);
+  if (!Number.isFinite(last)) return false;
+  return last >= MAX_INPUT_TOKENS_BEFORE_COMPACT;
+}
+
+async function compactSessionContext({ session, workspaceDir, onSpawn, wasCancelled, onEvent, onLog }) {
+  if (!session?.codexThreadId) {
+    return { ok: false, summary: '', error: 'missing codex session id' };
+  }
+
+  const compactPrompt = [
+    '请压缩总结当前会话上下文，供新会话继续工作使用。',
+    '输出要求：',
+    '1) 用中文，结构化分段，控制在 1200 字以内。',
+    '2) 包含：目标、已完成工作、关键代码/文件、未完成事项、风险与约束、下一步建议。',
+    '3) 只输出摘要正文，不要寒暄。',
+  ].join('\n');
+
+  const result = await runCodex({
+    session,
+    workspaceDir,
+    prompt: compactPrompt,
+    onSpawn,
+    wasCancelled,
+    onEvent,
+    onLog,
+  });
+  if (!result.ok) {
+    return {
+      ok: false,
+      summary: '',
+      error: result.error || truncate(result.logs.join('\n'), 400),
+    };
+  }
+
+  const summary = result.messages.join('\n\n').trim();
+  if (!summary) {
+    return { ok: false, summary: '', error: 'empty compact summary' };
+  }
+
+  return { ok: true, summary, usage: result.usage };
+}
+
+function buildPromptFromCompactedContext(summary, userPrompt) {
+  return [
+    '下面是上一轮会话的压缩摘要，请先把它作为上下文再回答新的用户请求。',
+    '',
+    '【压缩摘要开始】',
+    summary,
+    '【压缩摘要结束】',
+    '',
+    '请在不丢失关键上下文的前提下继续处理以下新请求：',
+    userPrompt,
+  ].join('\n');
+}
+
+async function runCodex({ session, workspaceDir, prompt, onSpawn, wasCancelled, onEvent, onLog }) {
   ensureDir(workspaceDir);
   ensureGitRepo(workspaceDir);
 
@@ -626,7 +1575,19 @@ async function runCodex({ session, workspaceDir, prompt }) {
     console.log('Running codex:', [CODEX_BIN, ...args].join(' '));
   }
 
-  const { ok, exitCode, signal, messages, reasonings, usage, threadId, logs, error } = await spawnCodex(args, workspaceDir);
+  const {
+    ok,
+    exitCode,
+    signal,
+    messages,
+    reasonings,
+    usage,
+    threadId,
+    logs,
+    error,
+    timedOut,
+    cancelled,
+  } = await spawnCodex(args, workspaceDir, { onSpawn, wasCancelled, onEvent, onLog });
 
   return {
     ok,
@@ -638,6 +1599,8 @@ async function runCodex({ session, workspaceDir, prompt }) {
     threadId,
     logs,
     error,
+    timedOut,
+    cancelled,
     notes,
   };
 }
@@ -654,6 +1617,9 @@ function buildCodexArgs({ session, workspaceDir, prompt }) {
   const common = [];
   if (model) common.push('-m', model);
   if (effort) common.push('-c', `model_reasoning_effort="${effort}"`);
+  if (COMPACT_STRATEGY === 'native' && COMPACT_ON_THRESHOLD) {
+    common.push('-c', `model_auto_compact_token_limit=${MODEL_AUTO_COMPACT_TOKEN_LIMIT}`);
+  }
   for (const cfg of extraConfigs) common.push('-c', cfg);
 
   if (session.codexThreadId) {
@@ -663,13 +1629,14 @@ function buildCodexArgs({ session, workspaceDir, prompt }) {
   return ['exec', '--json', '--skip-git-repo-check', modeFlag, '-C', workspaceDir, ...common, prompt];
 }
 
-function spawnCodex(args, cwd) {
+function spawnCodex(args, cwd, options = {}) {
   return new Promise((resolve) => {
     const child = spawn(CODEX_BIN, args, {
       cwd,
       env: SPAWN_ENV,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    options.onSpawn?.(child);
 
     let stdoutBuf = '';
     let stderrBuf = '';
@@ -680,12 +1647,15 @@ function spawnCodex(args, cwd) {
     let usage = null;
     let threadId = null;
     let resolved = false;
+    let timedOut = false;
 
-    const timeout = setTimeout(() => {
-      logs.push(`Timeout after ${CODEX_TIMEOUT_MS}ms`);
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 3000).unref();
-    }, CODEX_TIMEOUT_MS);
+    const timeout = CODEX_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+        timedOut = true;
+        logs.push(`Timeout after ${CODEX_TIMEOUT_MS}ms`);
+        stopChildProcess(child);
+      }, CODEX_TIMEOUT_MS)
+      : null;
 
     const consumeLine = (line, source) => {
       const trimmed = line.trim();
@@ -696,6 +1666,7 @@ function spawnCodex(args, cwd) {
           const ev = JSON.parse(trimmed);
           if (DEBUG_EVENTS) console.log('[event]', ev.type, ev);
           handleEvent(ev);
+          options.onEvent?.(ev);
           return;
         } catch {
           // fallthrough
@@ -705,6 +1676,7 @@ function spawnCodex(args, cwd) {
       // Ignore known noisy Codex rollout logs.
       if (trimmed.includes('state db missing rollout path for thread')) return;
       if (source === 'stderr' || DEBUG_EVENTS) logs.push(trimmed);
+      options.onLog?.(trimmed, source);
     };
 
     const onData = (chunk, source) => {
@@ -752,7 +1724,7 @@ function spawnCodex(args, cwd) {
     child.on('error', (err) => {
       if (resolved) return;
       resolved = true;
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       if (err?.code === 'ENOENT') {
         logs.push(`Command not found: ${CODEX_BIN}`);
       }
@@ -766,17 +1738,26 @@ function spawnCodex(args, cwd) {
         threadId,
         logs,
         error: safeError(err),
+        timedOut,
+        cancelled: Boolean(options.wasCancelled?.()),
       });
     });
 
     child.on('close', (exitCode, signal) => {
       if (resolved) return;
       resolved = true;
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       flushRemainders();
 
       const ok = exitCode === 0;
-      const error = ok ? null : `exit=${exitCode}${signal ? ` signal=${signal}` : ''}`;
+      const cancelled = !ok && Boolean(options.wasCancelled?.());
+      const error = ok
+        ? null
+        : timedOut
+          ? `timeout after ${CODEX_TIMEOUT_MS}ms`
+          : cancelled
+            ? `cancelled (${signal || `exit=${exitCode}`})`
+            : `exit=${exitCode}${signal ? ` signal=${signal}` : ''}`;
 
       resolve({
         ok,
@@ -788,6 +1769,8 @@ function spawnCodex(args, cwd) {
         threadId,
         logs,
         error,
+        timedOut,
+        cancelled,
       });
     });
   });
@@ -829,6 +1812,7 @@ function getSession(key) {
     db.threads[key] = {
       workspaceDir: null,
       codexThreadId: null,
+      lastInputTokens: null,
       model: null,
       effort: null,
       mode: DEFAULT_MODE,
@@ -842,6 +1826,7 @@ function getSession(key) {
   if (s.effort === undefined) s.effort = null;
   if (s.configOverrides === undefined) s.configOverrides = [];
   if (s.name === undefined) s.name = null;
+  if (s.lastInputTokens === undefined) s.lastInputTokens = null;
   s.updatedAt = new Date().toISOString();
   return s;
 }
@@ -864,6 +1849,117 @@ function ensureGitRepo(dir) {
   if (check.status === 0) return;
 
   spawnSync('git', ['init'], { cwd: dir, stdio: 'ignore' });
+}
+
+function autoRepairProxyEnv(envFilePath) {
+  const logs = [];
+  const updates = {};
+
+  const http = firstNonEmptyEnv(['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy']);
+  const https = firstNonEmptyEnv(['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']);
+  let socks = firstNonEmptyEnv(['SOCKS_PROXY', 'ALL_PROXY', 'all_proxy']);
+
+  if (!socks) {
+    const inferred = inferLocalSocksProxy(http || https);
+    if (inferred) {
+      socks = inferred;
+      logs.push(`🛠️ Proxy auto-repair: inferred SOCKS proxy from local HTTP proxy -> ${inferred}`);
+    }
+  }
+
+  fillMissingEnvKeys(['HTTP_PROXY', 'http_proxy'], http, updates);
+  fillMissingEnvKeys(['HTTPS_PROXY', 'https_proxy'], https || http, updates);
+  fillMissingEnvKeys(['SOCKS_PROXY', 'ALL_PROXY', 'all_proxy'], socks, updates);
+
+  const repairedKeys = Object.keys(updates);
+  if (repairedKeys.length) {
+    logs.push(`🛠️ Proxy auto-repair: filled ${repairedKeys.join(', ')}`);
+    persistEnvUpdates(envFilePath, updates);
+    logs.push(`🛠️ Proxy auto-repair: persisted updates into ${path.basename(envFilePath)}`);
+  }
+
+  return { updates, logs };
+}
+
+function firstNonEmptyEnv(keys) {
+  for (const key of keys) {
+    const value = String(process.env[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function fillMissingEnvKeys(keys, value, updates) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return;
+
+  for (const key of keys) {
+    const current = String(process.env[key] || '').trim();
+    if (current) continue;
+    process.env[key] = normalized;
+    updates[key] = normalized;
+  }
+}
+
+function inferLocalSocksProxy(proxyValue) {
+  const parsed = parseProxyUrl(proxyValue);
+  if (!parsed) return '';
+  if (!isLocalProxyHost(parsed.hostname)) return '';
+  if (!parsed.port) return '';
+  return `socks5h://${parsed.hostname}:${parsed.port}`;
+}
+
+function parseProxyUrl(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  const withScheme = value.includes('://') ? value : `http://${value}`;
+
+  try {
+    return new URL(withScheme);
+  } catch {
+    return null;
+  }
+}
+
+function isLocalProxyHost(host) {
+  const value = String(host || '').trim().toLowerCase();
+  if (!value) return false;
+  return value === '127.0.0.1' || value === 'localhost' || value === '::1';
+}
+
+function persistEnvUpdates(envFilePath, updates) {
+  const keys = Object.keys(updates);
+  if (!keys.length) return;
+
+  let content = '';
+  try {
+    content = fs.existsSync(envFilePath) ? fs.readFileSync(envFilePath, 'utf8') : '';
+  } catch {
+    content = '';
+  }
+
+  for (const key of keys) {
+    const rendered = `${key}=${renderEnvValue(updates[key])}`;
+    const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=.*$`, 'm');
+    if (pattern.test(content)) {
+      content = content.replace(pattern, rendered);
+    } else {
+      if (content && !content.endsWith('\n')) content += '\n';
+      content += `${rendered}\n`;
+    }
+  }
+
+  fs.writeFileSync(envFilePath, content, 'utf8');
+}
+
+function renderEnvValue(value) {
+  const text = String(value || '');
+  if (!/[#\s"']/g.test(text)) return text;
+  return JSON.stringify(text);
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function parseCsvSet(value) {
@@ -985,6 +2081,51 @@ function isAllowedChannel(channel) {
 
   const parentId = channel.isThread?.() ? channel.parentId : null;
   return Boolean(parentId && ALLOWED_CHANNEL_IDS.has(parentId));
+}
+
+function buildPromptFromMessage(rawContent, attachments) {
+  const text = String(rawContent || '').trim();
+  const attachmentBlock = formatAttachmentsForPrompt(attachments);
+
+  if (!text && !attachmentBlock) return '';
+  if (text && !attachmentBlock) return text;
+
+  if (!text && attachmentBlock) {
+    return [
+      '用户发送了附件，请先查看附件再回复。',
+      attachmentBlock,
+    ].join('\n\n');
+  }
+
+  return [
+    text,
+    attachmentBlock,
+  ].join('\n\n').trim();
+}
+
+function formatAttachmentsForPrompt(attachments) {
+  if (!attachments || !attachments.size) return '';
+
+  const lines = [];
+  let index = 0;
+  for (const attachment of attachments.values()) {
+    index += 1;
+    if (index > 8) {
+      lines.push(`...and ${attachments.size - 8} more attachment(s).`);
+      break;
+    }
+
+    const name = attachment.name || 'unnamed-file';
+    const type = attachment.contentType || 'unknown';
+    const size = Number.isFinite(attachment.size) ? `${attachment.size}B` : 'unknown';
+    const url = attachment.url || attachment.proxyURL || '(missing-url)';
+    lines.push(`${index}. name=${name}; type=${type}; size=${size}; url=${url}`);
+  }
+
+  return [
+    'Attachments:',
+    ...lines,
+  ].join('\n');
 }
 
 async function isAllowedInteractionChannel(interaction) {
@@ -1115,6 +2256,89 @@ function toInt(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function toOptionalInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.floor(n) : null;
+}
+
+function normalizeTimeoutMs(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  if (n <= 0) return 0;
+  return Math.floor(n);
+}
+
+function normalizeIntervalMs(value, fallback, min = 1000) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(min, Math.floor(n));
+}
+
+function normalizeCompactStrategy(value) {
+  const s = String(value || 'hard').trim().toLowerCase();
+  if (s === 'hard' || s === 'native' || s === 'off') return s;
+  console.warn(`⚠️ Unknown COMPACT_STRATEGY=${value}, fallback to hard`);
+  return 'hard';
+}
+
+function describeCompactStrategy(strategy) {
+  switch (strategy) {
+    case 'native':
+      return 'native (Codex CLI auto-compact + continue)';
+    case 'off':
+      return 'off (disabled)';
+    default:
+      return 'hard (summary + new session)';
+  }
+}
+
+function formatTokenValue(value) {
+  const n = toOptionalInt(value);
+  return n === null ? '(unknown)' : `${n}`;
+}
+
+function extractInputTokensFromUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+
+  const directKeys = [
+    'input_tokens',
+    'inputTokens',
+    'prompt_tokens',
+    'promptTokens',
+    'input_token_count',
+    'prompt_token_count',
+  ];
+
+  for (const key of directKeys) {
+    const n = toOptionalInt(usage[key]);
+    if (n !== null) return n;
+  }
+
+  const queue = [usage];
+  const seen = new Set();
+  while (queue.length) {
+    const node = queue.shift();
+    if (!node || typeof node !== 'object') continue;
+    if (seen.has(node)) continue;
+    seen.add(node);
+
+    for (const [key, value] of Object.entries(node)) {
+      if (value && typeof value === 'object') {
+        queue.push(value);
+        continue;
+      }
+
+      const n = toOptionalInt(value);
+      if (n === null) continue;
+      if (/input.*token|token.*input|prompt.*token|token.*prompt/i.test(key)) {
+        return n;
+      }
+    }
+  }
+
+  return null;
+}
+
 function resolvePath(input) {
   if (path.isAbsolute(input)) return path.normalize(input);
   return path.resolve(process.cwd(), input);
@@ -1124,6 +2348,27 @@ function safeError(err) {
   if (!err) return 'unknown error';
   if (typeof err === 'string') return err;
   return err.message || String(err);
+}
+
+function isReplyToSystemMessageError(err) {
+  if (!err) return false;
+  if (Number(err.code) !== 50035) return false;
+
+  const message = String(err.message || '');
+  if (message.includes('REPLIES_CANNOT_REPLY_TO_SYSTEM_MESSAGE')) return true;
+
+  const rawCode = err.rawError?.errors?.message_reference?._errors?.[0]?.code;
+  return rawCode === 'REPLIES_CANNOT_REPLY_TO_SYSTEM_MESSAGE';
+}
+
+async function safeReply(message, payload) {
+  try {
+    return await message.reply(payload);
+  } catch (err) {
+    if (!isReplyToSystemMessageError(err)) throw err;
+    console.warn(`⚠️ Cannot reply to system message ${message?.id}, fallback to channel.send`);
+    return await message.channel.send(payload);
+  }
 }
 
 function humanAge(ms) {
