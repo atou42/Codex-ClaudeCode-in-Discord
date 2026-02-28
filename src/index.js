@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import { safeReply } from './discord-reply-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2348,27 +2349,6 @@ function safeError(err) {
   if (!err) return 'unknown error';
   if (typeof err === 'string') return err;
   return err.message || String(err);
-}
-
-function isReplyToSystemMessageError(err) {
-  if (!err) return false;
-  if (Number(err.code) !== 50035) return false;
-
-  const message = String(err.message || '');
-  if (message.includes('REPLIES_CANNOT_REPLY_TO_SYSTEM_MESSAGE')) return true;
-
-  const rawCode = err.rawError?.errors?.message_reference?._errors?.[0]?.code;
-  return rawCode === 'REPLIES_CANNOT_REPLY_TO_SYSTEM_MESSAGE';
-}
-
-async function safeReply(message, payload) {
-  try {
-    return await message.reply(payload);
-  } catch (err) {
-    if (!isReplyToSystemMessageError(err)) throw err;
-    console.warn(`⚠️ Cannot reply to system message ${message?.id}, fallback to channel.send`);
-    return await message.channel.send(payload);
-  }
 }
 
 function humanAge(ms) {
