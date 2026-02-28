@@ -9,7 +9,9 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "setup-hooks": "git config core.hooksPath .githooks",
-    "check:atomic": "scripts/check-atomic-commit.sh --staged",
+    "check:atomic": "node scripts/check-atomic-commit.mjs --staged",
+    "run:auto-upgrade": "node scripts/codex-auto-upgrade.mjs",
+    "install:auto-upgrade": "node scripts/install-codex-auto-upgrade.mjs",
     "patch-ws": "node scripts/patch-discord-ws.mjs",
     "postinstall": "node scripts/patch-discord-ws.mjs"
   },

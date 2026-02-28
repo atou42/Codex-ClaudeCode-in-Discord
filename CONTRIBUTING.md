@@ -17,6 +17,13 @@ Before committing:
 - Staged files are minimal and relevant.
 - Basic verification for touched code has been run.
 - Commit message explains exactly what changed.
+- Run `npm run check:atomic` (cross-platform; same logic used by pre-commit).
+- Ensure hooks are enabled in your clone: `npm run setup-hooks`.
+
+## Windows notes
+
+- Use `npm run setup-hooks` after clone so Git uses `.githooks` on Windows too.
+- If bot runtime cannot find codex, set absolute `CODEX_BIN` in `.env` (for example `C:\\Users\\<you>\\AppData\\Local\\Programs\\Codex\\codex.exe`).
 
 ## Pull request checklist
 

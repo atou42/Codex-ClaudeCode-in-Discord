@@ -1,4 +1,16 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env node
 
-scripts/check-atomic-commit.sh --staged
+import {spawnSync} from 'node:child_process';
+
+const result = spawnSync(
+  process.execPath,
+  ['scripts/check-atomic-commit.mjs', '--staged'],
+  {stdio: 'inherit'}
+);
+
+if (result.error) {
+  console.error('[atomic-check] Failed to run atomic pre-commit hook.', result.error.message);
+  process.exit(2);
+}
+
+process.exit(result.status ?? 1);
