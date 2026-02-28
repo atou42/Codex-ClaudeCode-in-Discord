@@ -53,9 +53,13 @@ if (HTTP_PROXY || SOCKS_PROXY) {
 }
 
 const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   GatewayIntentBits,
   Partials,
+  PermissionFlagsBits,
   SlashCommandBuilder,
   REST,
   Routes,
@@ -69,6 +73,18 @@ if (!DISCORD_TOKEN) {
 
 const ALLOWED_CHANNEL_IDS = parseCsvSet(process.env.ALLOWED_CHANNEL_IDS);
 const ALLOWED_USER_IDS = parseCsvSet(process.env.ALLOWED_USER_IDS);
+const SECURITY_PROFILE = normalizeSecurityProfile(process.env.SECURITY_PROFILE || 'auto');
+const SECURITY_PROFILE_DEFAULTS = Object.freeze({
+  solo: { mentionOnly: false, maxQueuePerChannel: 0 },
+  team: { mentionOnly: false, maxQueuePerChannel: 20 },
+  public: { mentionOnly: true, maxQueuePerChannel: 20 },
+});
+const MENTION_ONLY_OVERRIDE = parseOptionalBool(process.env.MENTION_ONLY);
+const MAX_QUEUE_PER_CHANNEL_OVERRIDE = normalizeQueueLimit(process.env.MAX_QUEUE_PER_CHANNEL);
+const ENABLE_CONFIG_CMD = String(process.env.ENABLE_CONFIG_CMD || 'false').toLowerCase() === 'true';
+const CONFIG_POLICY = parseConfigAllowlist(
+  process.env.CONFIG_ALLOWLIST || 'personality,model_reasoning_effort,model_auto_compact_token_limit',
+);
 
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.join(ROOT, 'workspaces');
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || null;
@@ -113,6 +129,14 @@ if (bootCodexHealth.ok) {
     '• 处理: 安装 codex CLI，或在 .env 里设置 CODEX_BIN=/绝对路径/codex，然后重启 bot。',
   ].join('\n'));
 }
+console.log([
+  '🔐 Security defaults:',
+  `• SECURITY_PROFILE=${SECURITY_PROFILE}`,
+  `• MENTION_ONLY=${MENTION_ONLY_OVERRIDE === null ? 'profile-default' : MENTION_ONLY_OVERRIDE}`,
+  `• MAX_QUEUE_PER_CHANNEL=${MAX_QUEUE_PER_CHANNEL_OVERRIDE === null ? 'profile-default' : MAX_QUEUE_PER_CHANNEL_OVERRIDE}`,
+  `• ENABLE_CONFIG_CMD=${ENABLE_CONFIG_CMD}`,
+  `• CONFIG_ALLOWLIST=${describeConfigPolicy()}`,
+].join('\n'));
 
 // Read codex config.toml defaults for display
 function getCodexDefaults() {
@@ -137,6 +161,7 @@ let client = null;
 let selfHealTimer = null;
 let selfHealInFlight = false;
 let lockFd = null;
+const ONBOARDING_TOTAL_STEPS = 4;
 
 function createClient() {
   const bot = new Client({
@@ -185,30 +210,34 @@ function bindClientHandlers(bot) {
       if (message.author.bot) return;
       if (message.system) return;
       if (!isAllowedUser(message.author.id)) return;
+      const channelAllowed = isAllowedChannel(message.channel);
+      const security = resolveSecurityContext(message.channel);
 
       // Debug: log all incoming messages
       const chId = message.channel.id;
       const parentId = message.channel.isThread?.() ? message.channel.parentId : null;
       const attachmentCount = message.attachments?.size || 0;
-      console.log(`[msg] ch=${chId} parent=${parentId} author=${message.author.tag} allowed=${isAllowedChannel(message.channel)} contentLen=${message.content.length} attachments=${attachmentCount} system=${message.system}`);
+      console.log(`[msg] ch=${chId} parent=${parentId} author=${message.author.tag} allowed=${channelAllowed} profile=${security.profile} mentionOnly=${security.mentionOnly} contentLen=${message.content.length} attachments=${attachmentCount} system=${message.system}`);
 
-      if (!isAllowedChannel(message.channel)) return;
+      if (!channelAllowed) return;
 
       // Strip bot mention if present, otherwise use raw content
       const rawContent = message.content
         .replace(new RegExp(`<@!?${bot.user.id}>`, 'g'), '')
         .trim();
-      const content = buildPromptFromMessage(rawContent, message.attachments);
-      if (!content) return;
-
+      const isCommand = rawContent.startsWith('!');
       const key = message.channel.id;
 
-      if (rawContent.startsWith('!')) {
+      if (isCommand) {
         await handleCommand(message, key, rawContent);
         return;
       }
 
-      await enqueuePrompt(message, key, content);
+      if (security.mentionOnly && !doesMessageTargetBot(message, bot.user.id)) return;
+
+      const content = buildPromptFromMessage(rawContent, message.attachments);
+      if (!content) return;
+      await enqueuePrompt(message, key, content, security);
     } catch (err) {
       console.error('messageCreate handler error:', err);
       try {
@@ -292,6 +321,12 @@ const slashCommands = [
     .setName(slashName('queue'))
     .setDescription('查看当前频道的任务队列状态'),
   new SlashCommandBuilder()
+    .setName(slashName('doctor'))
+    .setDescription('查看 bot 运行与安全配置体检'),
+  new SlashCommandBuilder()
+    .setName(slashName('onboarding'))
+    .setDescription('新用户引导：安装后检查与首跑步骤（按钮分步）'),
+  new SlashCommandBuilder()
     .setName(slashName('progress'))
     .setDescription('查看当前任务的最新执行进度'),
   new SlashCommandBuilder()
@@ -318,6 +353,27 @@ async function registerSlashCommands(client) {
 }
 
 async function handleInteractionCreate(interaction) {
+  if (interaction.isButton()) {
+    if (!isOnboardingButtonId(interaction.customId)) return;
+    try {
+      if (!isAllowedUser(interaction.user.id)) {
+        await interaction.reply({ content: '⛔ 没有权限。', flags: 64 });
+        return;
+      }
+      if (!(await isAllowedInteractionChannel(interaction))) {
+        await interaction.reply({ content: '⛔ 当前频道未开放。', flags: 64 });
+        return;
+      }
+      await handleOnboardingButtonInteraction(interaction);
+    } catch (err) {
+      const reply = interaction.replied || interaction.deferred
+        ? interaction.followUp.bind(interaction)
+        : interaction.reply.bind(interaction);
+      await reply({ content: `❌ ${safeError(err)}`, flags: 64 });
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   if (!isAllowedUser(interaction.user.id)) {
     await interaction.reply({ content: '⛔ 没有权限。', flags: 64 });
@@ -344,6 +400,7 @@ async function handleInteractionCreate(interaction) {
         const defaults = getCodexDefaults();
         const codexHealth = getCodexCliHealth();
         const runtime = getRuntimeSnapshot(key);
+        const security = resolveSecurityContext(interaction.channel);
         const modeDesc = session.mode === 'dangerous'
           ? 'dangerous (无沙盒, 全权限)'
           : 'safe (沙盒隔离, 无网络)';
@@ -362,7 +419,11 @@ async function handleInteractionCreate(interaction) {
             `• last input tokens: ${formatTokenValue(session.lastInputTokens)}`,
             `• runtime: ${formatRuntimeLabel(runtime)}`,
             `• queued prompts: ${runtime.queued}`,
+            `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
             runtime.progressText ? `• latest progress: ${runtime.progressText}` : null,
+            `• security profile: ${formatSecurityProfileDisplay(security)}`,
+            `• mention only: ${security.mentionOnly ? 'on' : 'off'}`,
+            `• !config: ${formatConfigCommandStatus()}`,
             `• codex timeout: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}`,
             `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
             `• compact trigger: ${COMPACT_ON_THRESHOLD ? 'on' : 'off'}`,
@@ -460,7 +521,25 @@ async function handleInteractionCreate(interaction) {
 
       case 'queue': {
         await interaction.reply({
-          content: formatQueueReport(key),
+          content: formatQueueReport(key, interaction.channel),
+          flags: 64,
+        });
+        break;
+      }
+
+      case 'doctor': {
+        await interaction.reply({
+          content: formatDoctorReport(key, interaction.channel),
+          flags: 64,
+        });
+        break;
+      }
+
+      case 'onboarding': {
+        const step = 1;
+        await interaction.reply({
+          content: formatOnboardingStepReport(step, key, interaction.channel),
+          components: buildOnboardingActionRows(step, interaction.user.id),
           flags: 64,
         });
         break;
@@ -723,6 +802,7 @@ async function handleCommand(message, key, content) {
   const [cmd, ...rest] = content.split(/\s+/);
   const arg = rest.join(' ').trim();
   const session = getSession(key);
+  const security = resolveSecurityContext(message.channel);
 
   switch (cmd.toLowerCase()) {
     case '!help': {
@@ -732,6 +812,9 @@ async function handleCommand(message, key, content) {
         '**会话管理**',
         '• `!status` — 当前配置一览',
         '• `!queue` — 查看当前频道队列（运行中/排队数）',
+        '• `!doctor` — 查看 bot 健康状态与当前安全策略',
+        `• \`${slashRef('onboarding')}\` — 交互式引导（按钮分步）`,
+        '• `!onboarding` — 文本版引导流程与检查清单',
         '• `!progress` — 查看当前任务的最新进度',
         '• `!abort` / `!cancel` / `!stop` — 中断当前任务并清空队列',
         '• `!reset` — 清空会话，下条消息新开上下文',
@@ -746,7 +829,7 @@ async function handleCommand(message, key, content) {
         '• `!model <name|default>` — 切换模型（如 gpt-5.3-codex, o3）',
         '• `!effort <high|medium|low|default>` — reasoning effort',
         '• `!mode <safe|dangerous>` — 执行模式',
-        '• `!config <key=value>` — 传任意 codex -c 配置',
+        '• `!config <key=value>` — 添加 codex -c 配置（需 ENABLE_CONFIG_CMD=true 且 key 在白名单）',
         '',
         '普通消息直接转给 Codex。',
       ].join('\n'));
@@ -772,7 +855,11 @@ async function handleCommand(message, key, content) {
         `• last input tokens: ${formatTokenValue(session.lastInputTokens)}`,
         `• runtime: ${formatRuntimeLabel(runtime)}`,
         `• queued prompts: ${runtime.queued}`,
+        `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
         runtime.progressText ? `• latest progress: ${runtime.progressText}` : null,
+        `• security profile: ${formatSecurityProfileDisplay(security)}`,
+        `• mention only: ${security.mentionOnly ? 'on' : 'off'}`,
+        `• !config: ${formatConfigCommandStatus()}`,
         `• codex timeout: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}`,
         `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
         `• compact trigger: ${COMPACT_ON_THRESHOLD ? 'on' : 'off'}`,
@@ -786,7 +873,19 @@ async function handleCommand(message, key, content) {
     }
 
     case '!queue': {
-      await safeReply(message, formatQueueReport(key));
+      await safeReply(message, formatQueueReport(key, message.channel));
+      break;
+    }
+
+    case '!doctor': {
+      await safeReply(message, formatDoctorReport(key, message.channel));
+      break;
+    }
+
+    case '!onboarding':
+    case '!onboard':
+    case '!guide': {
+      await safeReply(message, formatOnboardingReport(key, message.channel));
       break;
     }
 
@@ -888,8 +987,25 @@ async function handleCommand(message, key, content) {
     }
 
     case '!config': {
+      if (!ENABLE_CONFIG_CMD) {
+        await safeReply(message, '⛔ `!config` 当前已禁用。可在 `.env` 设置 `ENABLE_CONFIG_CMD=true` 后重启。');
+        return;
+      }
       if (!arg) {
-        await safeReply(message, '用法：`!config <key=value>`\n例：`!config personality="concise"` / `!config sandbox_permissions=["disk-full-read-access"]`');
+        await safeReply(message, [
+          '用法：`!config <key=value>`',
+          '例：`!config personality="concise"`',
+          `允许的 key：${describeConfigPolicy()}`,
+        ].join('\n'));
+        return;
+      }
+      const keyName = parseConfigKey(arg);
+      if (!keyName) {
+        await safeReply(message, '❌ 参数格式错误：必须是 `key=value`。');
+        return;
+      }
+      if (!isConfigKeyAllowed(keyName)) {
+        await safeReply(message, `⛔ 不允许的配置 key：\`${keyName}\`\n允许的 key：${describeConfigPolicy()}`);
         return;
       }
       session.configOverrides = session.configOverrides || [];
@@ -937,8 +1053,17 @@ function getChannelState(key) {
   return state;
 }
 
-async function enqueuePrompt(message, key, content) {
+async function enqueuePrompt(message, key, content, securityContext = null) {
   const state = getChannelState(key);
+  const security = securityContext || resolveSecurityContext(message.channel);
+  const maxQueue = security.maxQueuePerChannel;
+  if (maxQueue > 0 && state.queue.length >= maxQueue) {
+    await safeReply(
+      message,
+      `🚧 当前频道队列已满（上限 ${maxQueue}）。请稍后重试，或用 \`!queue\` / \`!abort\` 处理积压任务。`,
+    );
+    return;
+  }
   const queuedAhead = (state.running ? 1 : 0) + state.queue.length;
 
   state.queue.push({
@@ -1098,12 +1223,14 @@ function formatTimeoutLabel(timeoutMs) {
   return `${n}ms (~${humanAge(n)})`;
 }
 
-function formatQueueReport(key) {
+function formatQueueReport(key, channel = null) {
   const runtime = getRuntimeSnapshot(key);
+  const security = resolveSecurityContext(channel);
   return [
     '📮 **任务队列状态**',
     `• runtime: ${formatRuntimeLabel(runtime)}`,
     `• queued prompts: ${runtime.queued}`,
+    `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
     runtime.progressText ? `• latest step: ${runtime.progressText}` : null,
     runtime.progressAgoMs !== null ? `• progress updated: ${humanAge(runtime.progressAgoMs)} ago` : null,
     runtime.messageId ? `• active message id: \`${runtime.messageId}\`` : null,
@@ -1138,6 +1265,244 @@ function formatCancelReport(outcome) {
     outcome.pid ? `• pid: ${outcome.pid}` : null,
     `• cleared queued prompts: ${outcome.clearedQueued}`,
   ].filter(Boolean).join('\n');
+}
+
+function formatDoctorReport(key, channel = null) {
+  const runtime = getRuntimeSnapshot(key);
+  const codexHealth = getCodexCliHealth();
+  const security = resolveSecurityContext(channel);
+  return [
+    '🩺 **Bot Doctor**',
+    `• codex-cli: ${formatCodexHealth(codexHealth)}`,
+    `• runtime: ${formatRuntimeLabel(runtime)}`,
+    `• queued prompts: ${runtime.queued}`,
+    `• security profile: ${formatSecurityProfileDisplay(security)}`,
+    `• mention only: ${security.mentionOnly ? 'on' : 'off'}`,
+    `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
+    `• !config: ${formatConfigCommandStatus()}`,
+    `• config allowlist: ${describeConfigPolicy()}`,
+    `• ALLOWED_CHANNEL_IDS: ${ALLOWED_CHANNEL_IDS ? `${ALLOWED_CHANNEL_IDS.size} configured` : '(all channels)'}`,
+    `• ALLOWED_USER_IDS: ${ALLOWED_USER_IDS ? `${ALLOWED_USER_IDS.size} configured` : '(all users)'}`,
+    `• codex timeout: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}`,
+    `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
+  ].join('\n');
+}
+
+function getOnboardingSnapshot(key, channel = null) {
+  const runtime = getRuntimeSnapshot(key);
+  const codexHealth = getCodexCliHealth();
+  const security = resolveSecurityContext(channel);
+  const hasToken = Boolean(DISCORD_TOKEN);
+  const hasApiKey = Boolean(String(process.env.OPENAI_API_KEY || '').trim());
+  const hasWorkspace = Boolean(String(WORKSPACE_ROOT || '').trim());
+  const mentionHint = security.mentionOnly
+    ? '本频道普通消息需 @Bot（或直接用 `!` 命令）。'
+    : '本频道普通消息可直接发送给 Bot。';
+  const firstPromptHint = security.mentionOnly
+    ? '发送 `@Bot 帮我检查当前目录并创建一个 TODO`'
+    : '发送 `帮我检查当前目录并创建一个 TODO`';
+  return {
+    runtime,
+    codexHealth,
+    security,
+    hasToken,
+    hasApiKey,
+    hasWorkspace,
+    mentionHint,
+    firstPromptHint,
+  };
+}
+
+function formatOnboardingReport(key, channel = null) {
+  const snapshot = getOnboardingSnapshot(key, channel);
+  return [
+    '🧭 **Onboarding（文本版）**',
+    `• 交互分步版请使用 \`${slashRef('onboarding')}\`（按钮：上一步/下一步/完成）`,
+    '',
+    '**1) 安装自检（先看当前是否可跑）**',
+    `• DISCORD_TOKEN: ${snapshot.hasToken ? '✅ loaded' : '❌ missing'}`,
+    `• OPENAI_API_KEY: ${snapshot.hasApiKey ? '✅ loaded' : '⚠️ missing/unused (按 provider 需要配置)'}`,
+    `• WORKSPACE_ROOT: ${snapshot.hasWorkspace ? `✅ \`${WORKSPACE_ROOT}\`` : '❌ missing'}`,
+    `• codex-cli: ${formatCodexHealth(snapshot.codexHealth)}`,
+    '',
+    '**2) 访问范围与安全策略（当前生效）**',
+    `• ALLOWED_CHANNEL_IDS: ${ALLOWED_CHANNEL_IDS ? `${ALLOWED_CHANNEL_IDS.size} configured` : '(all channels)'}`,
+    `• ALLOWED_USER_IDS: ${ALLOWED_USER_IDS ? `${ALLOWED_USER_IDS.size} configured` : '(all users)'}`,
+    `• security profile: ${formatSecurityProfileDisplay(snapshot.security)}`,
+    `• mention only: ${snapshot.security.mentionOnly ? 'on' : 'off'}（${snapshot.mentionHint}）`,
+    `• queue limit: ${formatQueueLimit(snapshot.security.maxQueuePerChannel)}`,
+    `• queued prompts now: ${snapshot.runtime.queued}`,
+    `• !config: ${formatConfigCommandStatus()}`,
+    '',
+    '**3) 首跑流程（按顺序）**',
+    `1. \`${slashRef('doctor')}\` 或 \`!doctor\`，确认健康检查通过。`,
+    `2. \`${slashRef('status')}\` 或 \`!status\`，确认 mode/model/workspace。`,
+    `3. \`${slashRef('setdir')} <path>\` 或 \`!setdir <path>\`，绑定目标项目目录。`,
+    `4. 发送第一条任务：${snapshot.firstPromptHint}`,
+    `5. 如有积压，用 \`${slashRef('queue')}\` / \`!queue\` 查看；必要时 \`${slashRef('cancel')}\` / \`!abort\`。`,
+    '',
+    '**4) 新用户默认建议**',
+    '• 先限制到 1 个频道 + 1 个管理员账号，再逐步放开。',
+    '• 保持 `ENABLE_CONFIG_CMD=false`；确实要开时仅白名单必要 key。',
+    '• 默认用 `safe`；仅在可信环境切到 `dangerous`。',
+    '',
+    `需要快速复查时可直接执行：\`${slashRef('doctor')}\``,
+  ].join('\n');
+}
+
+function normalizeOnboardingStep(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(1, Math.min(ONBOARDING_TOTAL_STEPS, Math.floor(n)));
+}
+
+function buildOnboardingButtonId(action, step, userId) {
+  const safeAction = String(action || '').trim().toLowerCase();
+  const safeStep = normalizeOnboardingStep(step);
+  const safeUserId = String(userId || '').trim();
+  return `onb:${safeAction}:${safeStep}:${safeUserId}`;
+}
+
+function isOnboardingButtonId(customId) {
+  return /^onb:/.test(String(customId || ''));
+}
+
+function parseOnboardingButtonId(customId) {
+  const text = String(customId || '').trim();
+  const match = text.match(/^onb:(goto|refresh|done):([0-9]+):([0-9]{5,32})$/);
+  if (!match) return null;
+  return {
+    action: match[1],
+    step: normalizeOnboardingStep(match[2]),
+    userId: match[3],
+  };
+}
+
+function buildOnboardingActionRows(step, userId) {
+  const current = normalizeOnboardingStep(step);
+  const previous = normalizeOnboardingStep(current - 1);
+  const next = normalizeOnboardingStep(current + 1);
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(buildOnboardingButtonId('goto', previous, userId))
+        .setLabel('上一步')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(current <= 1),
+      new ButtonBuilder()
+        .setCustomId(buildOnboardingButtonId('refresh', current, userId))
+        .setLabel('刷新')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(buildOnboardingButtonId('goto', next, userId))
+        .setLabel('下一步')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(current >= ONBOARDING_TOTAL_STEPS),
+      new ButtonBuilder()
+        .setCustomId(buildOnboardingButtonId('done', current, userId))
+        .setLabel('完成')
+        .setStyle(ButtonStyle.Success),
+    ),
+  ];
+}
+
+function formatOnboardingStepReport(step, key, channel = null) {
+  const current = normalizeOnboardingStep(step);
+  const snapshot = getOnboardingSnapshot(key, channel);
+  switch (current) {
+    case 1:
+      return [
+        '🧭 **Onboarding 1/4：安装自检**',
+        `• DISCORD_TOKEN: ${snapshot.hasToken ? '✅ loaded' : '❌ missing'}`,
+        `• OPENAI_API_KEY: ${snapshot.hasApiKey ? '✅ loaded' : '⚠️ missing/unused (按 provider 需要配置)'}`,
+        `• WORKSPACE_ROOT: ${snapshot.hasWorkspace ? `✅ \`${WORKSPACE_ROOT}\`` : '❌ missing'}`,
+        `• codex-cli: ${formatCodexHealth(snapshot.codexHealth)}`,
+        '',
+        `下一步建议：点击「下一步」检查当前频道生效的安全策略。`,
+      ].join('\n');
+    case 2:
+      return [
+        '🧭 **Onboarding 2/4：访问范围与安全策略**',
+        `• ALLOWED_CHANNEL_IDS: ${ALLOWED_CHANNEL_IDS ? `${ALLOWED_CHANNEL_IDS.size} configured` : '(all channels)'}`,
+        `• ALLOWED_USER_IDS: ${ALLOWED_USER_IDS ? `${ALLOWED_USER_IDS.size} configured` : '(all users)'}`,
+        `• security profile: ${formatSecurityProfileDisplay(snapshot.security)}`,
+        `• mention only: ${snapshot.security.mentionOnly ? 'on' : 'off'}（${snapshot.mentionHint}）`,
+        `• queue limit: ${formatQueueLimit(snapshot.security.maxQueuePerChannel)}`,
+        `• queued prompts now: ${snapshot.runtime.queued}`,
+        `• !config: ${formatConfigCommandStatus()}`,
+        '',
+        '下一步建议：按「下一步」走首跑 5 步。',
+      ].join('\n');
+    case 3:
+      return [
+        '🧭 **Onboarding 3/4：首跑流程（5 步）**',
+        `1. \`${slashRef('doctor')}\` 或 \`!doctor\`，确认健康检查通过。`,
+        `2. \`${slashRef('status')}\` 或 \`!status\`，确认 mode/model/workspace。`,
+        `3. \`${slashRef('setdir')} <path>\` 或 \`!setdir <path>\`，绑定目标项目目录。`,
+        `4. 发送第一条任务：${snapshot.firstPromptHint}`,
+        `5. 如有积压，用 \`${slashRef('queue')}\` / \`!queue\` 查看；必要时 \`${slashRef('cancel')}\` / \`!abort\`。`,
+        '',
+        '下一步建议：按「下一步」查看默认安全建议。',
+      ].join('\n');
+    case 4:
+    default:
+      return [
+        '🧭 **Onboarding 4/4：默认建议与排障入口**',
+        '• 先限制到 1 个频道 + 1 个管理员账号，再逐步放开。',
+        '• 保持 `ENABLE_CONFIG_CMD=false`；确实要开时仅白名单必要 key。',
+        '• 默认用 `safe`；仅在可信环境切到 `dangerous`。',
+        '',
+        `快速排障：\`${slashRef('doctor')}\` / \`!doctor\``,
+        `快速状态：\`${slashRef('status')}\` / \`!status\``,
+        `当前队列：\`${slashRef('queue')}\` / \`!queue\``,
+        '',
+        '完成后点击「完成」关闭引导面板。',
+      ].join('\n');
+  }
+}
+
+function formatOnboardingDoneReport(key, channel = null) {
+  const snapshot = getOnboardingSnapshot(key, channel);
+  return [
+    '✅ **Onboarding 已完成**',
+    `• 当前安全策略：${formatSecurityProfileDisplay(snapshot.security)}`,
+    `• mention only: ${snapshot.security.mentionOnly ? 'on' : 'off'}`,
+    `• queue limit: ${formatQueueLimit(snapshot.security.maxQueuePerChannel)}`,
+    '',
+    `后续可直接使用：\`${slashRef('doctor')}\`、\`${slashRef('status')}\`、\`${slashRef('queue')}\``,
+  ].join('\n');
+}
+
+async function handleOnboardingButtonInteraction(interaction) {
+  const parsed = parseOnboardingButtonId(interaction.customId);
+  if (!parsed) return;
+
+  if (parsed.userId !== interaction.user.id) {
+    await interaction.reply({
+      content: `这个引导面板只对发起者可操作。请执行 \`${slashRef('onboarding')}\` 创建你自己的面板。`,
+      flags: 64,
+    });
+    return;
+  }
+
+  const key = interaction.channelId;
+  if (!key) {
+    await interaction.reply({ content: '❌ 无法识别当前频道。', flags: 64 });
+    return;
+  }
+
+  if (parsed.action === 'done') {
+    await interaction.update({
+      content: formatOnboardingDoneReport(key, interaction.channel),
+      components: [],
+    });
+    return;
+  }
+
+  await interaction.update({
+    content: formatOnboardingStepReport(parsed.step, key, interaction.channel),
+    components: buildOnboardingActionRows(parsed.step, interaction.user.id),
+  });
 }
 
 function createProgressReporter({ message, channelState }) {
@@ -1966,6 +2331,142 @@ function escapeRegExp(text) {
 function parseCsvSet(value) {
   if (!value || !value.trim()) return null;
   return new Set(value.split(',').map((s) => s.trim()).filter(Boolean));
+}
+
+function normalizeSecurityProfile(value) {
+  const raw = String(value || 'auto').trim().toLowerCase();
+  if (['auto', 'solo', 'team', 'public'].includes(raw)) return raw;
+  console.warn(`⚠️ Unknown SECURITY_PROFILE=${value}, fallback to auto`);
+  return 'auto';
+}
+
+function parseOptionalBool(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  console.warn(`⚠️ Invalid boolean value: ${value} (ignored)`);
+  return null;
+}
+
+function normalizeQueueLimit(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    console.warn(`⚠️ Invalid MAX_QUEUE_PER_CHANNEL=${value}, using profile default`);
+    return null;
+  }
+  if (n <= 0) return 0;
+  return Math.floor(n);
+}
+
+function parseConfigAllowlist(value) {
+  const raw = String(value || '').trim();
+  if (raw === '*') {
+    return { allowAll: true, keys: new Set() };
+  }
+  const keys = new Set(
+    raw.split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  return { allowAll: false, keys };
+}
+
+function parseConfigKey(input) {
+  const text = String(input || '').trim();
+  const match = text.match(/^([a-zA-Z0-9_.-]+)\s*=/);
+  return match?.[1]?.toLowerCase() || '';
+}
+
+function isConfigKeyAllowed(key) {
+  if (CONFIG_POLICY.allowAll) return true;
+  return CONFIG_POLICY.keys.has(String(key || '').trim().toLowerCase());
+}
+
+function describeConfigPolicy() {
+  if (CONFIG_POLICY.allowAll) return '`*` (allow all)';
+  if (!CONFIG_POLICY.keys.size) return '(none)';
+  return [...CONFIG_POLICY.keys].map((k) => `\`${k}\``).join(', ');
+}
+
+function formatConfigCommandStatus() {
+  if (!ENABLE_CONFIG_CMD) return 'off';
+  return `on (${describeConfigPolicy()})`;
+}
+
+function formatQueueLimit(limit) {
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return 'unlimited';
+  return `${Math.floor(n)}`;
+}
+
+function doesMessageTargetBot(message, botUserId) {
+  const mentioned = Boolean(message.mentions?.users?.has?.(botUserId));
+  const repliedToBot = message.mentions?.repliedUser?.id === botUserId;
+  return mentioned || repliedToBot;
+}
+
+function resolveSecurityContext(channel) {
+  const resolved = resolveSecurityProfileForChannel(channel);
+  const defaults = SECURITY_PROFILE_DEFAULTS[resolved.profile] || SECURITY_PROFILE_DEFAULTS.team;
+  return {
+    configuredProfile: SECURITY_PROFILE,
+    profile: resolved.profile,
+    source: resolved.source,
+    reason: resolved.reason,
+    mentionOnly: MENTION_ONLY_OVERRIDE === null ? defaults.mentionOnly : MENTION_ONLY_OVERRIDE,
+    maxQueuePerChannel: MAX_QUEUE_PER_CHANNEL_OVERRIDE === null ? defaults.maxQueuePerChannel : MAX_QUEUE_PER_CHANNEL_OVERRIDE,
+  };
+}
+
+function resolveSecurityProfileForChannel(channel) {
+  if (SECURITY_PROFILE !== 'auto') {
+    return {
+      profile: SECURITY_PROFILE,
+      source: 'manual',
+      reason: `SECURITY_PROFILE=${SECURITY_PROFILE}`,
+    };
+  }
+  if (!channel) {
+    return { profile: 'team', source: 'auto', reason: 'channel unavailable (fallback team)' };
+  }
+  if (channel.isDMBased?.()) {
+    return { profile: 'solo', source: 'auto', reason: 'dm channel' };
+  }
+
+  const visibility = resolveGuildChannelVisibility(channel);
+  if (visibility.visibility === 'public') {
+    return { profile: 'public', source: 'auto', reason: visibility.reason };
+  }
+  if (visibility.visibility === 'team') {
+    return { profile: 'team', source: 'auto', reason: visibility.reason };
+  }
+  return { profile: 'team', source: 'auto', reason: `${visibility.reason} (fallback team)` };
+}
+
+function resolveGuildChannelVisibility(channel) {
+  const baseChannel = channel.isThread?.() ? (channel.parent || null) : channel;
+  const target = baseChannel || channel;
+  const guild = target?.guild || channel.guild || null;
+  if (!guild) return { visibility: 'unknown', reason: 'missing guild context' };
+  const everyoneRole = guild.roles?.everyone;
+  if (!everyoneRole) return { visibility: 'unknown', reason: 'missing @everyone role' };
+  const perms = target?.permissionsFor?.(everyoneRole);
+  if (!perms) return { visibility: 'unknown', reason: 'permissions unavailable' };
+  const canView = perms.has(PermissionFlagsBits.ViewChannel, true);
+  return canView
+    ? { visibility: 'public', reason: '@everyone can view channel' }
+    : { visibility: 'team', reason: '@everyone cannot view channel' };
+}
+
+function formatSecurityProfileDisplay(security) {
+  if (!security) return '(unknown)';
+  if (security.source === 'manual') {
+    return `${security.profile} (manual)`;
+  }
+  return `${security.profile} (auto: ${security.reason})`;
 }
 
 function normalizeSlashPrefix(value) {
