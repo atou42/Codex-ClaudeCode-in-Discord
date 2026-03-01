@@ -1341,12 +1341,52 @@ function getRuntimeSnapshot(key) {
   };
 }
 
-function formatRuntimeLabel(runtime) {
-  if (!runtime.running) return 'idle';
-  const age = runtime.activeSinceMs === null ? 'just-now' : humanAge(runtime.activeSinceMs);
-  const phase = runtime.phase ? `, phase=${runtime.phase}` : '';
-  const pid = runtime.pid ? `, pid=${runtime.pid}` : '';
-  return `running (${age}${phase}${pid})`;
+function formatRuntimePhaseLabel(phase, language = 'en') {
+  const value = String(phase || '').trim().toLowerCase();
+  if (language === 'en') return value || 'unknown';
+  switch (value) {
+    case 'starting':
+      return '启动中';
+    case 'compact':
+      return '上下文压缩';
+    case 'exec':
+      return '执行中';
+    case 'retry':
+      return '重试中';
+    case 'done':
+      return '已结束';
+    default:
+      return value || '未知';
+  }
+}
+
+function localizeProgressLine(line, language = 'en') {
+  if (language === 'en') return line;
+  const text = String(line || '');
+  return text
+    .replace(/^• activity (\d+): /, '• 活动 $1：')
+    .replace(/^• plan: received$/, '• 计划：已接收')
+    .replace(/^• plan: (\d+)\/(\d+) completed(?:, (\d+) in progress)?$/, (_m, completed, total, inProgress) => (
+      `• 计划：${completed}/${total} 已完成${inProgress ? `，${inProgress} 进行中` : ''}`
+    ))
+    .replace(/^• completed milestones: /, '• 已完成里程碑：')
+    .replace(/^• completed steps: /, '• 已完成步骤：')
+    .replace(/^  note: /, '  说明：')
+    .replace(/^  … \+(\d+) more$/, '  … 还有 $1 项');
+}
+
+function localizeProgressLines(lines, language = 'en') {
+  if (!Array.isArray(lines) || !lines.length) return [];
+  return lines.map((line) => localizeProgressLine(line, language));
+}
+
+function formatRuntimeLabel(runtime, language = 'en') {
+  if (!runtime.running) return language === 'en' ? 'idle' : '空闲';
+  const age = runtime.activeSinceMs === null ? (language === 'en' ? 'just-now' : '刚刚') : humanAge(runtime.activeSinceMs);
+  const phaseLabel = runtime.phase ? formatRuntimePhaseLabel(runtime.phase, language) : '';
+  const phase = phaseLabel ? `${language === 'en' ? ', phase=' : '，阶段='}${phaseLabel}` : '';
+  const pid = runtime.pid ? `${language === 'en' ? ', pid=' : '，pid='}${runtime.pid}` : '';
+  return language === 'en' ? `running (${age}${phase}${pid})` : `运行中（${age}${phase}${pid}）`;
 }
 
 function formatTimeoutLabel(timeoutMs) {
@@ -1446,35 +1486,65 @@ function formatQueueReport(key, session = null, channel = null) {
   ].filter(Boolean).join('\n');
 }
 
-function formatProgressReport(key, channel = null) {
+function formatProgressReport(key, session = null, channel = null) {
   const runtime = getRuntimeSnapshot(key);
-  const security = resolveSecurityContext(channel);
+  const security = resolveSecurityContext(channel, session);
+  const language = getSessionLanguage(session);
+  const lang = normalizeUiLanguage(language);
   if (!runtime.running) {
+    if (lang === 'en') {
+      return [
+        'ℹ️ No running task in this channel.',
+        `• queued prompts: ${runtime.queued}`,
+        `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
+        `• hint: After sending a task, use \`!progress\` / \`${slashRef('progress')}\` for live updates.`,
+      ].join('\n');
+    }
     return [
       'ℹ️ 当前没有运行中的任务。',
+      `• 排队任务: ${runtime.queued}`,
+      `• 队列上限: ${formatQueueLimit(security.maxQueuePerChannel)}`,
+      `• 提示: 发送新任务后可用 \`!progress\` / \`${slashRef('progress')}\` 查看实时进度。`,
+    ].join('\n');
+  }
+  const recentLines = localizeProgressLines(renderRecentActivitiesLines(runtime.recentActivities, PROGRESS_ACTIVITY_MAX_LINES), lang);
+  const planLines = localizeProgressLines(renderProgressPlanLines(runtime.progressPlan, PROGRESS_PLAN_MAX_LINES), lang);
+  const completedLines = localizeProgressLines(renderCompletedStepsLines(runtime.completedSteps, {
+    planState: runtime.progressPlan,
+    latestStep: runtime.progressText,
+    maxSteps: PROGRESS_DONE_STEPS_MAX,
+  }), lang);
+  if (lang === 'en') {
+    return [
+      '🧵 **Task Progress**',
+      `• runtime: ${formatRuntimeLabel(runtime, lang)}`,
+      `• event count: ${runtime.progressEvents}`,
+      runtime.progressText ? `• latest activity: ${runtime.progressText}` : null,
+      ...recentLines,
+      ...planLines,
+      ...completedLines,
+      runtime.progressAgoMs !== null ? `• last update: ${humanAge(runtime.progressAgoMs)} ago` : null,
+      runtime.messageId ? `• active message id: \`${runtime.messageId}\`` : null,
+      runtime.progressMessageId ? `• progress message id: \`${runtime.progressMessageId}\`` : null,
       `• queued prompts: ${runtime.queued}`,
       `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
-      `• hint: 发送新任务后可用 \`!progress\` / \`${slashRef('progress')}\` 查看实时进度。`,
-    ].join('\n');
+      `• hint: Use \`!abort\` / \`${slashRef('cancel')}\` to interrupt current task and clear queue.`,
+    ].filter(Boolean).join('\n');
   }
   return [
     '🧵 **任务进度**',
-    `• runtime: ${formatRuntimeLabel(runtime)}`,
-    `• event count: ${runtime.progressEvents}`,
-    runtime.progressText ? `• latest activity: ${runtime.progressText}` : null,
-    ...renderRecentActivitiesLines(runtime.recentActivities, PROGRESS_ACTIVITY_MAX_LINES),
-    ...renderProgressPlanLines(runtime.progressPlan, PROGRESS_PLAN_MAX_LINES),
-    ...renderCompletedStepsLines(runtime.completedSteps, {
-      planState: runtime.progressPlan,
-      latestStep: runtime.progressText,
-      maxSteps: PROGRESS_DONE_STEPS_MAX,
-    }),
-    runtime.progressAgoMs !== null ? `• last update: ${humanAge(runtime.progressAgoMs)} ago` : null,
-    runtime.messageId ? `• active message id: \`${runtime.messageId}\`` : null,
-    runtime.progressMessageId ? `• progress message id: \`${runtime.progressMessageId}\`` : null,
-    `• queued prompts: ${runtime.queued}`,
-    `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
-    `• hint: 可用 \`!abort\` / \`${slashRef('cancel')}\` 中断当前任务并清空队列。`,
+    `• 运行状态: ${formatRuntimeLabel(runtime, lang)}`,
+    `• 事件数: ${runtime.progressEvents}`,
+    runtime.progressText ? `• 最新活动: ${runtime.progressText}` : null,
+    ...recentLines,
+    ...planLines,
+    ...completedLines,
+    runtime.progressAgoMs !== null ? `• 上次更新: ${humanAge(runtime.progressAgoMs)}前` : null,
+    runtime.messageId ? `• 运行消息 ID: \`${runtime.messageId}\`` : null,
+    runtime.progressMessageId ? `• 进度消息 ID: \`${runtime.progressMessageId}\`` : null,
+    `• 排队任务: ${runtime.queued}`,
+    `• 队列上限: ${formatQueueLimit(security.maxQueuePerChannel)}`,
+    `• 提示: 可用 \`!abort\` / \`${slashRef('cancel')}\` 中断当前任务并清空队列。`,
   ].filter(Boolean).join('\n');
 }
 
@@ -2264,25 +2334,32 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
 
   const render = (status = 'running') => {
     const elapsed = humanElapsed(Math.max(0, Date.now() - startedAt));
-    const phase = channelState.activeRun?.phase || 'starting';
+    const phase = formatRuntimePhaseLabel(channelState.activeRun?.phase || 'starting', lang);
     const hint = status === 'running'
-      ? `可用 \`!abort\` / \`${slashRef('cancel')}\` 中断，\`!progress\` 查看详情。`
-      : '可继续发送新消息，或用 `!queue` 查看是否还有排队任务。';
+      ? (lang === 'en'
+        ? `Use \`!abort\` / \`${slashRef('cancel')}\` to interrupt, and \`!progress\` for details.`
+        : `可用 \`!abort\` / \`${slashRef('cancel')}\` 中断，\`!progress\` 查看详情。`)
+      : (lang === 'en'
+        ? 'You can continue with a new message, or check remaining backlog with `!queue`.'
+        : '可继续发送新消息，或用 `!queue` 查看是否还有排队任务。');
+    const statusLine = status === 'running'
+      ? (lang === 'en' ? '⏳ **Task Running**' : '⏳ **任务进行中**')
+      : status;
     const body = [
-      status === 'running' ? '⏳ **任务进行中**' : status,
-      `• elapsed: ${elapsed}`,
-      `• phase: ${phase}`,
-      `• event count: ${events}`,
-      `• latest activity: ${latestStep}`,
-      ...renderRecentActivitiesLines(recentActivities, PROGRESS_ACTIVITY_MAX_LINES),
-      ...renderProgressPlanLines(planState, PROGRESS_PLAN_MAX_LINES),
-      ...renderCompletedStepsLines(completedSteps, {
+      statusLine,
+      `${lang === 'en' ? '• elapsed' : '• 耗时'}: ${elapsed}`,
+      `${lang === 'en' ? '• phase' : '• 阶段'}: ${phase}`,
+      `${lang === 'en' ? '• event count' : '• 事件数'}: ${events}`,
+      `${lang === 'en' ? '• latest activity' : '• 最新活动'}: ${latestStep}`,
+      ...localizeProgressLines(renderRecentActivitiesLines(recentActivities, PROGRESS_ACTIVITY_MAX_LINES), lang),
+      ...localizeProgressLines(renderProgressPlanLines(planState, PROGRESS_PLAN_MAX_LINES), lang),
+      ...localizeProgressLines(renderCompletedStepsLines(completedSteps, {
         planState,
         latestStep,
         maxSteps: PROGRESS_DONE_STEPS_MAX,
-      }),
-      `• queued prompts: ${channelState.queue.length}`,
-      `• hint: ${hint}`,
+      }), lang),
+      `${lang === 'en' ? '• queued prompts' : '• 排队任务'}: ${channelState.queue.length}`,
+      `${lang === 'en' ? '• hint' : '• 提示'}: ${hint}`,
     ]
       .filter(Boolean)
       .join('\n');
@@ -2359,7 +2436,10 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
     if (source === 'stderr' && !PROGRESS_INCLUDE_STDERR) return;
     if (source === 'stdout' && !PROGRESS_INCLUDE_STDOUT) return;
     events += 1;
-    latestStep = `${source}: ${truncate(String(line || '').replace(/\s+/g, ' ').trim(), PROGRESS_TEXT_PREVIEW_CHARS)}`;
+    const sourceLabel = lang === 'en'
+      ? source
+      : (source === 'stderr' ? '标准错误' : '标准输出');
+    latestStep = `${sourceLabel}: ${truncate(String(line || '').replace(/\s+/g, ' ').trim(), PROGRESS_TEXT_PREVIEW_CHARS)}`;
     appendRecentActivity(recentActivities, latestStep);
     syncActiveRun();
     void emit(false);
@@ -2374,26 +2454,26 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
 
     const elapsed = humanElapsed(Math.max(0, Date.now() - startedAt));
     const status = cancelled
-      ? '🛑 **任务已中断**'
+      ? (lang === 'en' ? '🛑 **Task Cancelled**' : '🛑 **任务已中断**')
       : ok
-        ? '✅ **任务已完成**'
+        ? (lang === 'en' ? '✅ **Task Completed**' : '✅ **任务已完成**')
         : timedOut
-          ? '⏱️ **任务超时**'
-          : '❌ **任务失败**';
+          ? (lang === 'en' ? '⏱️ **Task Timed Out**' : '⏱️ **任务超时**')
+          : (lang === 'en' ? '❌ **Task Failed**' : '❌ **任务失败**');
     const body = [
       status,
-      `• elapsed: ${elapsed}`,
-      `• phase: ${channelState.activeRun?.phase || 'done'}`,
-      `• event count: ${events}`,
-      `• latest activity: ${latestStep}`,
-      ...renderRecentActivitiesLines(recentActivities, PROGRESS_ACTIVITY_MAX_LINES),
-      ...renderProgressPlanLines(planState, PROGRESS_PLAN_MAX_LINES),
-      ...renderCompletedStepsLines(completedSteps, {
+      `${lang === 'en' ? '• elapsed' : '• 耗时'}: ${elapsed}`,
+      `${lang === 'en' ? '• phase' : '• 阶段'}: ${formatRuntimePhaseLabel(channelState.activeRun?.phase || 'done', lang)}`,
+      `${lang === 'en' ? '• event count' : '• 事件数'}: ${events}`,
+      `${lang === 'en' ? '• latest activity' : '• 最新活动'}: ${latestStep}`,
+      ...localizeProgressLines(renderRecentActivitiesLines(recentActivities, PROGRESS_ACTIVITY_MAX_LINES), lang),
+      ...localizeProgressLines(renderProgressPlanLines(planState, PROGRESS_PLAN_MAX_LINES), lang),
+      ...localizeProgressLines(renderCompletedStepsLines(completedSteps, {
         planState,
         latestStep,
         maxSteps: PROGRESS_DONE_STEPS_MAX,
-      }),
-      !ok && !cancelled && error ? `• error: ${truncate(String(error), 260)}` : null,
+      }), lang),
+      !ok && !cancelled && error ? `${lang === 'en' ? '• error' : '• 错误'}: ${truncate(String(error), 260)}` : null,
     ]
       .filter(Boolean)
       .join('\n');
@@ -2495,7 +2575,11 @@ async function handlePrompt(message, key, prompt, channelState) {
   const typingInterval = setInterval(() => {
     message.channel.sendTyping().catch(() => {});
   }, 8000);
-  const progress = createProgressReporter({ message, channelState });
+  const progress = createProgressReporter({
+    message,
+    channelState,
+    language: getSessionLanguage(session),
+  });
   await progress?.start();
   let progressOutcome = { ok: false, cancelled: false, timedOut: false, error: '' };
 
@@ -2593,11 +2677,14 @@ async function handlePrompt(message, key, prompt, channelState) {
       }
 
       const codexMissing = isCodexNotFound(result.error);
+      const timeoutSetting = resolveTimeoutSetting(session);
       const failText = [
         result.timedOut ? '❌ Codex 执行超时' : '❌ Codex 执行失败',
         result.error ? `• error: ${result.error}` : null,
         result.logs.length ? `• logs: ${truncate(result.logs.join('\n'), 1200)}` : null,
-        result.timedOut ? `• 处理: 可在 .env 调大 CODEX_TIMEOUT_MS，或设为 0 关闭硬超时。当前: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}` : null,
+        result.timedOut
+          ? `• 处理: 可用 \`${slashRef('timeout')} <ms|off|status>\` 或 \`!timeout <ms|off|status>\` 调整本频道超时。当前: ${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`
+          : null,
         codexMissing ? '• 诊断: 当前环境找不到 Codex CLI 可执行文件。' : null,
         codexMissing ? '• 处理: 在该设备安装 codex，或在 .env 配置 `CODEX_BIN=/绝对路径/codex`，然后重启 bot。' : null,
         codexMissing ? `• 自检: 用 \`${slashRef('status')}\` 或 \`!status\` 查看 codex-cli 状态。` : null,
