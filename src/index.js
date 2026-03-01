@@ -1313,44 +1313,338 @@ function formatCancelReport(outcome) {
   ].filter(Boolean).join('\n');
 }
 
-function formatDoctorReport(key, channel = null) {
+function formatDoctorReport(key, session = null, channel = null) {
   const runtime = getRuntimeSnapshot(key);
   const codexHealth = getCodexCliHealth();
-  const security = resolveSecurityContext(channel);
+  const security = resolveSecurityContext(channel, session);
+  const timeoutSetting = resolveTimeoutSetting(session);
+  const securitySetting = getEffectiveSecurityProfile(session);
   return [
     '🩺 **Bot Doctor**',
     `• codex-cli: ${formatCodexHealth(codexHealth)}`,
     `• runtime: ${formatRuntimeLabel(runtime)}`,
     `• queued prompts: ${runtime.queued}`,
     `• security profile: ${formatSecurityProfileDisplay(security)}`,
+    `• profile setting: ${formatSecurityProfileLabel(securitySetting.profile)} (${securitySetting.source})`,
     `• mention only: ${security.mentionOnly ? 'on' : 'off'}`,
     `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
     `• !config: ${formatConfigCommandStatus()}`,
     `• config allowlist: ${describeConfigPolicy()}`,
     `• ALLOWED_CHANNEL_IDS: ${ALLOWED_CHANNEL_IDS ? `${ALLOWED_CHANNEL_IDS.size} configured` : '(all channels)'}`,
     `• ALLOWED_USER_IDS: ${ALLOWED_USER_IDS ? `${ALLOWED_USER_IDS.size} configured` : '(all users)'}`,
-    `• codex timeout: ${formatTimeoutLabel(CODEX_TIMEOUT_MS)}`,
+    `• codex timeout: ${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`,
     `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
   ].join('\n');
 }
 
-function getOnboardingSnapshot(key, channel = null) {
+function parseUiLanguageInput(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['zh', 'zh-cn', 'cn', 'chinese', '中文'].includes(raw)) return 'zh';
+  if (['en', 'en-us', 'english', '英文'].includes(raw)) return 'en';
+  return null;
+}
+
+function normalizeUiLanguage(value) {
+  return parseUiLanguageInput(value) || 'zh';
+}
+
+function getSessionLanguage(session) {
+  if (!session) return DEFAULT_UI_LANGUAGE;
+  return normalizeUiLanguage(session.language || DEFAULT_UI_LANGUAGE);
+}
+
+function formatLanguageLabel(language) {
+  return language === 'en' ? 'en (English)' : 'zh (中文)';
+}
+
+function parseSecurityProfileInput(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['auto', 'solo', 'team', 'public'].includes(raw)) return raw;
+  return null;
+}
+
+function normalizeSessionSecurityProfile(value) {
+  return parseSecurityProfileInput(value);
+}
+
+function getEffectiveSecurityProfile(session) {
+  const sessionProfile = normalizeSessionSecurityProfile(session?.securityProfile);
+  if (sessionProfile) {
+    return { profile: sessionProfile, source: 'session override' };
+  }
+  return { profile: SECURITY_PROFILE, source: 'env default' };
+}
+
+function formatSecurityProfileLabel(profile) {
+  return parseSecurityProfileInput(profile) || 'team';
+}
+
+function normalizeSessionTimeoutMs(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return normalizeTimeoutMs(n, 0);
+}
+
+function resolveTimeoutSetting(session) {
+  const sessionTimeout = normalizeSessionTimeoutMs(session?.timeoutMs);
+  if (sessionTimeout !== null) {
+    return { timeoutMs: sessionTimeout, source: 'session override' };
+  }
+  return { timeoutMs: CODEX_TIMEOUT_MS, source: 'env default' };
+}
+
+function parseTimeoutConfigAction(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['status', 'show', 'state', '查看', '状态'].includes(raw)) return { type: 'status' };
+  if (['off', 'disable', 'disabled', 'none', '0', '关闭', '禁用'].includes(raw)) {
+    return { type: 'set', timeoutMs: 0 };
+  }
+  if (!/^\d+$/.test(raw)) return { type: 'invalid' };
+  const timeoutMs = normalizeTimeoutMs(Number(raw), 0);
+  return { type: 'set', timeoutMs };
+}
+
+function isOnboardingEnabled(session) {
+  if (!session) return ONBOARDING_ENABLED_BY_DEFAULT;
+  return session.onboardingEnabled !== false;
+}
+
+function parseOnboardingConfigAction(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['status', 'show', 'state', '查看', '状态'].includes(raw)) return { type: 'status' };
+  if (['on', 'enable', 'enabled', 'true', '1', 'yes', '开启', '启用', '打开'].includes(raw)) {
+    return { type: 'set', enabled: true };
+  }
+  if (['off', 'disable', 'disabled', 'false', '0', 'no', '关闭', '禁用'].includes(raw)) {
+    return { type: 'set', enabled: false };
+  }
+  return { type: 'invalid' };
+}
+
+function formatLanguageConfigHelp(language) {
+  if (language === 'en') {
+    return [
+      `Usage: \`!lang <zh|en>\``,
+      `Current: ${formatLanguageLabel(language)}`,
+      `Examples: \`!lang en\`, \`!lang zh\``,
+    ].join('\n');
+  }
+  return [
+    '用法：`!lang <zh|en>`',
+    `当前：${formatLanguageLabel(language)}`,
+    '示例：`!lang en`、`!lang zh`',
+  ].join('\n');
+}
+
+function formatLanguageConfigReport(language, changed) {
+  if (language === 'en') {
+    return changed
+      ? `✅ Message language set to ${formatLanguageLabel(language)}`
+      : `ℹ️ Message language is ${formatLanguageLabel(language)}`;
+  }
+  return changed
+    ? `✅ 消息提示语言已设置为 ${formatLanguageLabel(language)}`
+    : `ℹ️ 当前消息提示语言为 ${formatLanguageLabel(language)}`;
+}
+
+function formatProfileConfigHelp(language) {
+  if (language === 'en') {
+    return [
+      'Usage: `!profile <auto|solo|team|public|status>`',
+      `Slash: \`${slashRef('profile')} <auto|solo|team|public|status>\``,
+    ].join('\n');
+  }
+  return [
+    '用法：`!profile <auto|solo|team|public|status>`',
+    `Slash：\`${slashRef('profile')} <auto|solo|team|public|status>\``,
+  ].join('\n');
+}
+
+function formatProfileConfigReport(language, profile, changed) {
+  const label = formatSecurityProfileLabel(profile);
+  if (language === 'en') {
+    return changed
+      ? `✅ Security profile set to ${label}`
+      : `ℹ️ Security profile is ${label}`;
+  }
+  return changed
+    ? `✅ 安全策略 profile 已设置为 ${label}`
+    : `ℹ️ 当前安全策略 profile 为 ${label}`;
+}
+
+function formatTimeoutConfigHelp(language) {
+  if (language === 'en') {
+    return [
+      'Usage: `!timeout <ms|off|status>`',
+      `Slash: \`${slashRef('timeout')} <ms|off|status>\``,
+      'Examples: `!timeout 60000`, `!timeout off`, `!timeout status`',
+    ].join('\n');
+  }
+  return [
+    '用法：`!timeout <毫秒|off|status>`',
+    `Slash：\`${slashRef('timeout')} <毫秒|off|status>\``,
+    '示例：`!timeout 60000`、`!timeout off`、`!timeout status`',
+  ].join('\n');
+}
+
+function formatTimeoutConfigReport(language, timeoutSetting, changed) {
+  const label = `${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`;
+  if (language === 'en') {
+    return changed
+      ? `✅ Codex timeout set to ${label}`
+      : `ℹ️ Codex timeout is ${label}`;
+  }
+  return changed
+    ? `✅ Codex 超时已设置为 ${label}`
+    : `ℹ️ 当前 Codex 超时为 ${label}`;
+}
+
+function formatOnboardingDisabledMessage(language) {
+  if (language === 'en') {
+    return [
+      'ℹ️ Onboarding is currently disabled in this channel.',
+      `Enable with \`${slashRef('onboarding_config')} on\` or \`!onboarding on\`.`,
+    ].join('\n');
+  }
+  return [
+    'ℹ️ 当前频道已关闭 onboarding。',
+    `可通过 \`${slashRef('onboarding_config')} on\` 或 \`!onboarding on\` 重新开启。`,
+  ].join('\n');
+}
+
+function formatOnboardingConfigReport(language, enabled, changed) {
+  const state = enabled ? 'on' : 'off';
+  if (language === 'en') {
+    if (changed) {
+      return `✅ Onboarding is now ${state}\nUse \`${slashRef('onboarding')}\` or \`!onboarding\` to open guide.`;
+    }
+    return `ℹ️ Onboarding is currently ${state}`;
+  }
+  if (changed) {
+    return `✅ onboarding 已设置为 ${state}\n可使用 \`${slashRef('onboarding')}\` 或 \`!onboarding\` 打开引导。`;
+  }
+  return `ℹ️ 当前 onboarding = ${state}`;
+}
+
+function formatOnboardingConfigHelp(language) {
+  if (language === 'en') {
+    return [
+      'Usage: `!onboarding <on|off|status>`',
+      `Current command also supports slash: \`${slashRef('onboarding_config')} <on|off|status>\``,
+    ].join('\n');
+  }
+  return [
+    '用法：`!onboarding <on|off|status>`',
+    `也可使用 slash：\`${slashRef('onboarding_config')} <on|off|status>\``,
+  ].join('\n');
+}
+
+function formatHelpReport(session) {
+  const language = getSessionLanguage(session);
+  if (language === 'en') {
+    return [
+      '**📋 Commands**',
+      '',
+      '**Session**',
+      '• `!status` — current config snapshot',
+      '• `!queue` — queue status in current channel',
+      '• `!doctor` — runtime + security diagnostics',
+      `• \`${slashRef('onboarding')}\` — interactive onboarding`,
+      '• `!onboarding` — onboarding text checklist',
+      `• \`${slashRef('onboarding_config')} <on|off|status>\` / \`!onboarding <on|off|status>\` — onboarding switch`,
+      `• \`${slashRef('language')} <中文|English>\` / \`!lang <zh|en>\` — message language`,
+      `• \`${slashRef('profile')} <auto|solo|team|public|status>\` / \`!profile <...|status>\` — channel security profile`,
+      `• \`${slashRef('timeout')} <ms|off|status>\` / \`!timeout <...>\` — codex timeout`,
+      '• `!progress` — current run progress',
+      '• `!abort` / `!cancel` / `!stop` — stop running task and clear queue',
+      '• `!reset` — clear session context',
+      '• `!resume <session_id>` — bind existing Codex session',
+      '• `!sessions` — list recent Codex sessions',
+      '',
+      '**Workspace**',
+      '• `!setdir <path>` — set workspace (resets session)',
+      '• `!cd <path>` — alias of `!setdir`',
+      '',
+      '**Model & Runtime**',
+      '• `!model <name|default>` — set model override',
+      '• `!effort <high|medium|low|default>` — reasoning effort',
+      '• `!mode <safe|dangerous>` — execution mode',
+      '• `!config <key=value>` — append codex `-c` config (when enabled + allowlisted)',
+      '',
+      'Normal messages are forwarded to Codex.',
+    ].join('\n');
+  }
+  return [
+    '**📋 命令列表**',
+    '',
+    '**会话管理**',
+    '• `!status` — 当前配置一览',
+    '• `!queue` — 查看当前频道队列（运行中/排队数）',
+    '• `!doctor` — 查看 bot 健康状态与当前安全策略',
+    `• \`${slashRef('onboarding')}\` — 交互式引导（按钮分步）`,
+    '• `!onboarding` — 文本版引导流程与检查清单',
+    `• \`${slashRef('onboarding_config')} <on|off|status>\` / \`!onboarding <on|off|status>\` — onboarding 开关`,
+    `• \`${slashRef('language')} <中文|English>\` / \`!lang <zh|en>\` — 消息提示语言`,
+    `• \`${slashRef('profile')} <auto|solo|team|public|status>\` / \`!profile <...|status>\` — 当前频道 security profile`,
+    `• \`${slashRef('timeout')} <毫秒|off|status>\` / \`!timeout <...>\` — Codex 超时`,
+    '• `!progress` — 查看当前任务的最新进度',
+    '• `!abort` / `!cancel` / `!stop` — 中断当前任务并清空队列',
+    '• `!reset` — 清空会话，下条消息新开上下文',
+    '• `!resume <session_id>` — 继承一个已有的 Codex session',
+    '• `!sessions` — 列出最近的 Codex sessions（从 ~/.codex/sessions/）',
+    '',
+    '**工作目录**',
+    '• `!setdir <path>` — 设置工作目录（会清空旧会话）',
+    '• `!cd <path>` — 同 !setdir 的别名',
+    '',
+    '**模型 & 执行**',
+    '• `!model <name|default>` — 切换模型（如 gpt-5.3-codex, o3）',
+    '• `!effort <high|medium|low|default>` — reasoning effort',
+    '• `!mode <safe|dangerous>` — 执行模式',
+    '• `!config <key=value>` — 添加 codex -c 配置（需 ENABLE_CONFIG_CMD=true 且 key 在白名单）',
+    '',
+    '普通消息直接转给 Codex。',
+  ].join('\n');
+}
+
+function getOnboardingSnapshot(key, session = null, channel = null, language = DEFAULT_UI_LANGUAGE) {
   const runtime = getRuntimeSnapshot(key);
   const codexHealth = getCodexCliHealth();
-  const security = resolveSecurityContext(channel);
+  const security = resolveSecurityContext(channel, session);
+  const profileSetting = getEffectiveSecurityProfile(session);
+  const timeoutSetting = resolveTimeoutSetting(session);
+  const currentLanguage = getSessionLanguage(session);
   const hasToken = Boolean(DISCORD_TOKEN);
   const hasApiKey = Boolean(String(process.env.OPENAI_API_KEY || '').trim());
   const hasWorkspace = Boolean(String(WORKSPACE_ROOT || '').trim());
+  const lang = normalizeUiLanguage(language);
   const mentionHint = security.mentionOnly
-    ? '本频道普通消息需 @Bot（或直接用 `!` 命令）。'
-    : '本频道普通消息可直接发送给 Bot。';
+    ? (lang === 'en'
+      ? 'Normal chat messages require @Bot mention (or use `!` commands).'
+      : '本频道普通消息需 @Bot（或直接用 `!` 命令）。')
+    : (lang === 'en'
+      ? 'Normal messages in this channel can be sent directly to the bot.'
+      : '本频道普通消息可直接发送给 Bot。');
   const firstPromptHint = security.mentionOnly
-    ? '发送 `@Bot 帮我检查当前目录并创建一个 TODO`'
-    : '发送 `帮我检查当前目录并创建一个 TODO`';
+    ? (lang === 'en'
+      ? 'Send `@Bot check current directory and create a TODO`'
+      : '发送 `@Bot 帮我检查当前目录并创建一个 TODO`')
+    : (lang === 'en'
+      ? 'Send `check current directory and create a TODO`'
+      : '发送 `帮我检查当前目录并创建一个 TODO`');
   return {
+    language: lang,
     runtime,
     codexHealth,
     security,
+    profileSetting,
+    timeoutSetting,
+    currentLanguage,
     hasToken,
     hasApiKey,
     hasWorkspace,
