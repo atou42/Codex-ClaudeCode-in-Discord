@@ -21,7 +21,10 @@
   - `/cancel` / `!abort` 可中断当前运行并清空队列
   - 长任务实时进度（阶段/耗时/最新步骤），并支持 `/progress` / `!progress`
   - `/doctor` / `!doctor` 可做运行与安全配置体检
-  - `/onboarding` 可用按钮分步引导，`!onboarding` 提供文本版兜底
+  - `/onboarding` 可用按钮分步引导并可直接配置关键项，`!onboarding` 提供文本版兜底
+  - 支持按线程配置 onboarding 开关（on/off/status）与消息提示语言（zh/en，默认 zh）
+  - 支持按线程覆盖 security profile（`auto|solo|team|public`）
+  - 支持按线程覆盖 codex timeout（`毫秒|off|status`）
 
 ## 前置条件
 
@@ -60,6 +63,10 @@ Git hooks 说明：
 - `/cx_queue` - 查看当前频道运行中/排队任务数量
 - `/cx_doctor` - 查看 Bot 运行/安全体检信息
 - `/cx_onboarding` - 交互式新用户引导（分步按钮，ephemeral）
+- `/cx_onboarding_config <on|off|status>` - 配置当前频道 onboarding 是否可用
+- `/cx_language <中文|English>` - 设置当前频道消息提示语言
+- `/cx_profile <auto|solo|team|public|status>` - 设置或查看当前频道 security profile 覆盖
+- `/cx_timeout <毫秒|off|status>` - 设置当前频道 codex timeout 覆盖
 - `/cx_progress` - 查看当前运行任务的最新进度快照
 - `/cx_cancel` - 中断当前运行并清空队列
 
@@ -77,6 +84,8 @@ Git hooks 说明：
 - `ENABLE_CONFIG_CMD`：是否启用 `!config`（默认 `false`）
 - `CONFIG_ALLOWLIST`：`!config key=value` 允许的 key（逗号分隔，或 `*` 表示全部允许）
 - `SLASH_PREFIX`：slash 前缀，默认 `cx`（例如 `/cx_status`）
+- `DEFAULT_UI_LANGUAGE`：新频道默认提示语言（`zh` 或 `en`，默认 `zh`）
+- `ONBOARDING_ENABLED_DEFAULT`：新频道 onboarding 默认开关（`true` 或 `false`，默认 `true`）
 - `DEFAULT_MODE`：`safe` 或 `dangerous`
 - `WORKSPACE_ROOT`：按线程创建目录的根路径
 - `CODEX_BIN`：codex 命令/路径（默认 `codex`）

@@ -23,7 +23,10 @@ A tiny Discord bot that bridges **Codex CLI** (`codex exec --json`) into Discord
   - `/cancel` / `!abort` to interrupt the current run and clear queued prompts
   - long-run live progress updates (phase/elapsed/latest step), plus `/progress` / `!progress`
   - `/doctor` / `!doctor` for runtime + security diagnostics
-  - `/onboarding` interactive step-by-step onboarding (buttons), `!onboarding` text fallback
+  - `/onboarding` interactive onboarding wizard (buttons + direct config), `!onboarding` text fallback
+  - per-thread onboarding switch (`on/off/status`) and message language (`zh/en`, default `zh`)
+  - per-thread security profile override (`auto|solo|team|public`)
+  - per-thread codex timeout override (`ms|off|status`)
 
 ## Prerequisites
 
@@ -62,6 +65,10 @@ Then in your Discord server, invite the bot, and use these slash commands:
 - `/cx_queue` — show running/queued task count in current channel
 - `/cx_doctor` — show bot runtime/security diagnostics
 - `/cx_onboarding` — interactive onboarding (step-by-step buttons, ephemeral)
+- `/cx_onboarding_config <on|off|status>` — configure onboarding availability in current channel
+- `/cx_language <中文|English>` — set bot message hint language in current channel
+- `/cx_profile <auto|solo|team|public|status>` — set or view current channel security profile override
+- `/cx_timeout <ms|off|status>` — set current channel codex timeout override
 - `/cx_progress` — show latest progress snapshot for the running task
 - `/cx_cancel` — interrupt current run and clear queued prompts
 
@@ -79,6 +86,8 @@ Important knobs:
 - `ENABLE_CONFIG_CMD`: enable/disable `!config` command (default `false`)
 - `CONFIG_ALLOWLIST`: allowed keys for `!config key=value` (comma-separated, or `*` to allow all)
 - `SLASH_PREFIX`: slash prefix, default `cx` (e.g. `/cx_status`)
+- `DEFAULT_UI_LANGUAGE`: default bot message language for new channels (`zh` or `en`, default `zh`)
+- `ONBOARDING_ENABLED_DEFAULT`: onboarding default for new channels (`true` or `false`, default `true`)
 - `DEFAULT_MODE`: `safe` or `dangerous`
 - `WORKSPACE_ROOT`: where per-thread folders are created
 - `CODEX_BIN`: codex command/path (default `codex`)
