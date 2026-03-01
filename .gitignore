@@ -6,3 +6,4 @@ logs/
 workspaces/
 data/
 .DS_Store
+.bot.log

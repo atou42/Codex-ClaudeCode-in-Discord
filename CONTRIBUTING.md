@@ -40,3 +40,19 @@ Before opening a PR:
 2. Implement only that task.
 3. Commit in small logical units.
 4. Open a focused PR.
+
+## Release workflow
+
+This repository uses Semantic Versioning with a changelog-first flow.
+
+1. Update `CHANGELOG.md` with a new section: `## [x.y.z] - YYYY-MM-DD`.
+2. Ensure `main` is clean and up to date.
+3. Run one of:
+   - `npm run release:patch`
+   - `npm run release:minor`
+   - `npm run release:major`
+4. The release script will:
+   - bump `package.json` and `package-lock.json`,
+   - create commit + tag (`vX.Y.Z`),
+   - push `main` and tags to GitHub,
+   - create or update the GitHub Release using `CHANGELOG.md` notes for that version.
