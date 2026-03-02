@@ -203,6 +203,46 @@ test('extractRawProgressTextFromEvent ignores final_answer from event_msg agent_
   assert.equal(raw, '');
 });
 
+test('extractRawProgressTextFromEvent reads commentary from response_item assistant message', () => {
+  const ev = {
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'assistant',
+      phase: 'commentary',
+      content: [
+        {
+          type: 'output_text',
+          text: '我先搜索官方文档，再整理分步实现方案。',
+        },
+      ],
+    },
+  };
+
+  const raw = extractRawProgressTextFromEvent(ev);
+  assert.equal(raw, '我先搜索官方文档，再整理分步实现方案。');
+});
+
+test('extractRawProgressTextFromEvent ignores final_answer from response_item assistant message', () => {
+  const ev = {
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'assistant',
+      phase: 'final_answer',
+      content: [
+        {
+          type: 'output_text',
+          text: '最终答案不应进入过程窗口。',
+        },
+      ],
+    },
+  };
+
+  const raw = extractRawProgressTextFromEvent(ev);
+  assert.equal(raw, '');
+});
+
 test('summarizeCodexEvent unwraps event_msg payload for summary rendering', () => {
   const ev = {
     type: 'event_msg',

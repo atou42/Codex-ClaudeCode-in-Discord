@@ -482,8 +482,21 @@ export function extractRawProgressTextFromEvent(ev) {
 
   if (type === 'response_item' && payload && typeof payload === 'object') {
     const payloadType = normalizeEventType(payload.type || '');
+    if (payloadType === 'message') {
+      const phase = normalizeEventType(payload.phase || '');
+      const role = normalizeEventType(payload.role || '');
+      if (phase === 'final_answer') return '';
+      if (role && role !== 'assistant') return '';
+      const text = pickFirstRawText([
+        payload.message,
+        payload.text,
+        payload.output_text,
+        payload.input_text,
+      ]) || pickFirstRawTextFromContent(payload.content);
+      if (!text || isLowSignalProcessText(text)) return '';
+      return text;
+    }
     if (payloadType === 'reasoning') return '';
-    if (payloadType === 'message') return '';
     if (payloadType === 'agent_message') return '';
   }
 
