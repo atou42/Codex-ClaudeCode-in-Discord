@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
-import { safeReply } from './discord-reply-utils.js';
+import { safeReply, withDiscordNetworkRetry } from './discord-reply-utils.js';
 import {
   appendRecentActivity as appendRecentActivityBase,
   appendCompletedStep as appendCompletedStepBase,
@@ -2774,7 +2774,10 @@ async function handlePrompt(message, key, prompt, channelState) {
 
     await safeReply(message, parts[0]);
     for (let i = 1; i < parts.length; i++) {
-      await message.channel.send(parts[i]);
+      await withDiscordNetworkRetry(
+        () => message.channel.send(parts[i]),
+        { logger: console, label: 'channel.send (result part)' },
+      );
     }
 
     progressOutcome = { ok: true, cancelled: false, timedOut: false, error: '' };
