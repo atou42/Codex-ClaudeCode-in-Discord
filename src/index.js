@@ -2965,6 +2965,8 @@ function spawnCodex(args, cwd, options = {}) {
     let threadId = null;
     let resolved = false;
     let timedOut = false;
+    let progressBridgeThreadId = null;
+    let stopSessionProgressBridge = null;
     const timeoutMs = normalizeTimeoutMs(options.timeoutMs, CODEX_TIMEOUT_MS);
     const timeout = timeoutMs > 0
       ? setTimeout(() => {
@@ -2973,6 +2975,32 @@ function spawnCodex(args, cwd, options = {}) {
         stopChildProcess(child);
       }, timeoutMs)
       : null;
+
+    const stopBridges = () => {
+      if (typeof stopSessionProgressBridge === 'function') {
+        try {
+          stopSessionProgressBridge();
+        } catch {
+          // ignore bridge teardown failures
+        }
+      }
+      stopSessionProgressBridge = null;
+      progressBridgeThreadId = null;
+    };
+
+    const ensureSessionProgressBridge = (nextThreadId) => {
+      const id = String(nextThreadId || '').trim();
+      if (!id) return;
+      if (typeof options.onEvent !== 'function') return;
+      if (id === progressBridgeThreadId && typeof stopSessionProgressBridge === 'function') return;
+
+      stopBridges();
+      stopSessionProgressBridge = startCodexSessionProgressBridge({
+        threadId: id,
+        onEvent: options.onEvent,
+      });
+      progressBridgeThreadId = id;
+    };
 
     const consumeLine = (line, source) => {
       const trimmed = line.trim();
@@ -3017,6 +3045,7 @@ function spawnCodex(args, cwd, options = {}) {
       switch (ev.type) {
         case 'thread.started':
           threadId = ev.thread_id || threadId;
+          ensureSessionProgressBridge(threadId);
           break;
         case 'item.completed': {
           const item = ev.item || {};
@@ -3042,6 +3071,7 @@ function spawnCodex(args, cwd, options = {}) {
       if (resolved) return;
       resolved = true;
       if (timeout) clearTimeout(timeout);
+      stopBridges();
       if (err?.code === 'ENOENT') {
         logs.push(`Command not found: ${CODEX_BIN}`);
       }
@@ -3064,6 +3094,7 @@ function spawnCodex(args, cwd, options = {}) {
       if (resolved) return;
       resolved = true;
       if (timeout) clearTimeout(timeout);
+      stopBridges();
       flushRemainders();
 
       const ok = exitCode === 0;
@@ -3091,6 +3122,141 @@ function spawnCodex(args, cwd, options = {}) {
       });
     });
   });
+}
+
+function startCodexSessionProgressBridge({ threadId, onEvent }) {
+  const sessionId = String(threadId || '').trim();
+  if (!sessionId || typeof onEvent !== 'function') return () => {};
+
+  const sessionsDir = getCodexSessionsDir();
+  if (!sessionsDir || !fs.existsSync(sessionsDir)) return () => {};
+
+  const bridgeStartedAtMs = Date.now();
+  const minMtimeMs = bridgeStartedAtMs - 2 * 60 * 1000;
+  const dedupeKeys = [];
+  const dedupeSet = new Set();
+
+  let stopped = false;
+  let rolloutFile = null;
+  let rolloutFileMtimeMs = 0;
+  let offset = 0;
+  let remainder = '';
+  let pollTimer = null;
+  let lastScanAt = 0;
+
+  const rememberKey = (key) => {
+    if (!key || dedupeSet.has(key)) return false;
+    dedupeSet.add(key);
+    dedupeKeys.push(key);
+    if (dedupeKeys.length > 500) {
+      const stale = dedupeKeys.shift();
+      if (stale) dedupeSet.delete(stale);
+    }
+    return true;
+  };
+
+  const handleSessionLine = (line) => {
+    const raw = String(line || '').trim();
+    if (!raw || !raw.startsWith('{') || !raw.endsWith('}')) return;
+
+    let ev = null;
+    try {
+      ev = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!ev || typeof ev !== 'object') return;
+
+    const text = extractRawProgressTextFromEventBase(ev);
+    if (!text) return;
+    const key = [
+      ev.timestamp || '',
+      ev.type || '',
+      ev.payload?.type || '',
+      ev.payload?.phase || '',
+      text,
+    ].join('|');
+    if (!rememberKey(key)) return;
+    onEvent(ev);
+  };
+
+  const consumeChunk = (chunk) => {
+    if (!chunk) return;
+    remainder += chunk;
+    const lines = remainder.split('\n');
+    remainder = lines.pop() ?? '';
+    for (const line of lines) handleSessionLine(line);
+  };
+
+  const readNewTail = () => {
+    if (!rolloutFile) return;
+
+    let stat = null;
+    try {
+      stat = fs.statSync(rolloutFile);
+    } catch {
+      rolloutFile = null;
+      offset = 0;
+      remainder = '';
+      return;
+    }
+    if (!stat || !stat.isFile()) return;
+    if (stat.size < offset) {
+      offset = 0;
+      remainder = '';
+    }
+    if (stat.size === offset) return;
+
+    const bytesToRead = stat.size - offset;
+    if (bytesToRead <= 0) return;
+
+    const fd = fs.openSync(rolloutFile, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(bytesToRead);
+      const readBytes = fs.readSync(fd, buf, 0, bytesToRead, offset);
+      offset += readBytes;
+      consumeChunk(buf.toString('utf8', 0, readBytes));
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+
+  const resolveRolloutFile = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastScanAt < 2500) return false;
+    lastScanAt = now;
+
+    const match = findLatestRolloutFileBySessionId(sessionId, minMtimeMs);
+    if (!match) return false;
+    const nextPath = String(match.file || '');
+    if (!nextPath) return false;
+    if (nextPath === rolloutFile) return true;
+
+    rolloutFile = match.file;
+    rolloutFileMtimeMs = Number(match.mtimeMs) || 0;
+    offset = rolloutFileMtimeMs < bridgeStartedAtMs
+      ? Math.max(0, Number(match.sizeBytes) || 0)
+      : 0;
+    remainder = '';
+    readNewTail();
+    return true;
+  };
+
+  const poll = () => {
+    if (stopped) return;
+    if (!resolveRolloutFile(!rolloutFile) && !rolloutFile) return;
+    readNewTail();
+  };
+
+  pollTimer = setInterval(poll, 700);
+  pollTimer.unref?.();
+  poll();
+
+  return () => {
+    stopped = true;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+  };
 }
 
 function composeResultText(result, session) {
@@ -3662,8 +3828,7 @@ function ensureDir(dir) {
 }
 
 function listRecentCodexSessions(limit = 10) {
-  const home = process.env.HOME || process.env.USERPROFILE || '';
-  const sessionsDir = path.join(home, '.codex', 'sessions');
+  const sessionsDir = getCodexSessionsDir();
   if (!sessionsDir || !fs.existsSync(sessionsDir)) return [];
 
   const files = findRolloutFiles(sessionsDir);
@@ -3689,6 +3854,47 @@ function listRecentCodexSessions(limit = 10) {
   return [...latestById.values()]
     .sort((a, b) => b.mtime - a.mtime)
     .slice(0, limit);
+}
+
+function findLatestRolloutFileBySessionId(sessionId, notOlderThanMs = 0) {
+  const targetId = String(sessionId || '').trim().toLowerCase();
+  if (!targetId) return null;
+
+  const sessionsDir = getCodexSessionsDir();
+  if (!sessionsDir || !fs.existsSync(sessionsDir)) return null;
+
+  const files = findRolloutFiles(sessionsDir);
+  let latest = null;
+
+  for (const file of files) {
+    const id = parseSessionIdFromRolloutFile(path.basename(file));
+    if (!id || String(id).toLowerCase() !== targetId) continue;
+
+    let stat = null;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (!stat?.isFile()) continue;
+    if (notOlderThanMs > 0 && stat.mtimeMs < notOlderThanMs) continue;
+
+    if (!latest || stat.mtimeMs > latest.mtimeMs) {
+      latest = {
+        file,
+        mtimeMs: stat.mtimeMs,
+        sizeBytes: stat.size,
+      };
+    }
+  }
+
+  return latest;
+}
+
+function getCodexSessionsDir() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) return '';
+  return path.join(home, '.codex', 'sessions');
 }
 
 function findRolloutFiles(root) {
