@@ -121,7 +121,12 @@ const PROGRESS_INCLUDE_STDERR = String(process.env.PROGRESS_INCLUDE_STDERR || 'f
 const PROGRESS_PLAN_MAX_LINES = Math.min(8, Math.max(1, toInt(process.env.PROGRESS_PLAN_MAX_LINES, 4)));
 const PROGRESS_DONE_STEPS_MAX = Math.min(12, Math.max(1, toInt(process.env.PROGRESS_DONE_STEPS_MAX, 4)));
 const PROGRESS_ACTIVITY_MAX_LINES = Math.min(12, Math.max(1, toInt(process.env.PROGRESS_ACTIVITY_MAX_LINES, 4)));
-const PROGRESS_PROCESS_LINES = 5;
+const PROGRESS_PROCESS_LINES = Math.min(5, Math.max(2, toInt(process.env.PROGRESS_PROCESS_LINES, 3)));
+const PROGRESS_PROCESS_PUSH_INTERVAL_MS = normalizeIntervalMs(
+  process.env.PROGRESS_PROCESS_PUSH_INTERVAL_MS,
+  1100,
+  300,
+);
 const PROGRESS_MESSAGE_MAX_CHARS = Math.max(600, toInt(process.env.PROGRESS_MESSAGE_MAX_CHARS, 1800));
 const SELF_HEAL_ENABLED = String(process.env.SELF_HEAL_ENABLED || 'true').toLowerCase() !== 'false';
 const SELF_HEAL_RESTART_DELAY_MS = toInt(process.env.SELF_HEAL_RESTART_DELAY_MS, 5000);
@@ -2388,8 +2393,11 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
   const recentActivities = Array.isArray(channelState.activeRun?.recentActivities)
     ? [...channelState.activeRun.recentActivities]
     : [];
+  const pendingActivities = [];
+  let lastActivityPushAt = 0;
   let isEmitting = false;
   let rerunEmit = false;
+  let activityTimer = null;
 
   const syncActiveRun = () => {
     if (!channelState.activeRun) return;
@@ -2467,6 +2475,36 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
     }
   };
 
+  const normalizeActivityKey = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+  const enqueueActivity = (activityText) => {
+    const text = String(activityText || '').replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    const key = normalizeActivityKey(text);
+    if (!key) return;
+
+    const latestVisible = normalizeActivityKey(recentActivities[recentActivities.length - 1]);
+    if (latestVisible && latestVisible === key) return;
+    const latestQueued = normalizeActivityKey(pendingActivities[pendingActivities.length - 1]);
+    if (latestQueued && latestQueued === key) return;
+
+    pendingActivities.push(text);
+    if (pendingActivities.length > 80) {
+      pendingActivities.splice(0, pendingActivities.length - 80);
+    }
+  };
+
+  const pushOneActivity = ({ force = false } = {}) => {
+    if (!pendingActivities.length) return false;
+    const now = Date.now();
+    if (!force && now - lastActivityPushAt < PROGRESS_PROCESS_PUSH_INTERVAL_MS) return false;
+    const next = pendingActivities.shift();
+    if (!next) return false;
+    appendRecentActivity(recentActivities, next);
+    lastActivityPushAt = now;
+    return true;
+  };
+
   const start = async () => {
     try {
       const body = render('running');
@@ -2478,6 +2516,13 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
         void emit(true);
       }, PROGRESS_UPDATE_INTERVAL_MS);
       timer.unref?.();
+      activityTimer = setInterval(() => {
+        if (stopped) return;
+        if (!pushOneActivity()) return;
+        syncActiveRun();
+        void emit(false);
+      }, PROGRESS_PROCESS_PUSH_INTERVAL_MS);
+      activityTimer.unref?.();
     } catch {
       progressMessage = null;
     }
@@ -2494,7 +2539,13 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
     }
     const rawActivity = extractRawProgressTextFromEvent(ev);
     if (rawActivity) {
-      appendRecentActivity(recentActivities, rawActivity);
+      enqueueActivity(rawActivity);
+      // First visible line should appear quickly, then continue as a rolling queue.
+      if (recentActivities.length === 0) {
+        pushOneActivity({ force: true });
+      } else {
+        pushOneActivity();
+      }
     }
     const nextPlan = extractPlanStateFromEvent(ev);
     if (nextPlan) {
@@ -2528,6 +2579,10 @@ function createProgressReporter({ message, channelState, language = DEFAULT_UI_L
     if (stopped) return;
     stopped = true;
     if (timer) clearInterval(timer);
+    if (activityTimer) clearInterval(activityTimer);
+    while (pushOneActivity({ force: true })) {
+      // Drain any buffered progress lines so final card shows the latest context window.
+    }
     syncActiveRun();
     if (!progressMessage) return;
 
