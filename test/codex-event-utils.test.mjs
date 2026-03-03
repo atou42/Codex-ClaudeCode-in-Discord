@@ -28,6 +28,14 @@ test('extractAgentMessageText reads direct text and content fallback', () => {
   );
 });
 
+test('extractAgentMessageText keeps markdown line breaks', () => {
+  const text = extractAgentMessageText({
+    type: 'agent_message',
+    text: '  结论：\n1. 第一条\n2. 第二条\n\n```txt\nline a\nline b\n```  ',
+  });
+  assert.equal(text, '结论：\n1. 第一条\n2. 第二条\n\n```txt\nline a\nline b\n```');
+});
+
 test('getAgentMessagePhase normalizes phase and defaults empty', () => {
   assert.equal(getAgentMessagePhase({ phase: 'Final.Answer' }), 'final_answer');
   assert.equal(getAgentMessagePhase({}), '');
@@ -54,6 +62,14 @@ test('composeFinalAnswerText keeps all final answer segments', () => {
     finalAnswerMessages: ['最终答案 A', '最终答案 B'],
   });
   assert.equal(text, '最终答案 A\n\n最终答案 B');
+});
+
+test('composeFinalAnswerText preserves paragraph structure in final answer', () => {
+  const text = composeFinalAnswerText({
+    messages: ['过程消息'],
+    finalAnswerMessages: ['结论：\n- A\n- B', '证据：\n```txt\nx\ny\n```'],
+  });
+  assert.equal(text, '结论：\n- A\n- B\n\n证据：\n```txt\nx\ny\n```');
 });
 
 test('composeFinalAnswerText falls back to latest message when no final segments', () => {

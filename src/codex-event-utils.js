@@ -2,6 +2,12 @@ function normalizeWhitespace(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function normalizeMessageText(value) {
+  if (value === null || value === undefined) return '';
+  const text = String(value).replace(/\r\n?/g, '\n');
+  return text.trim();
+}
+
 function normalizePhase(value) {
   return normalizeWhitespace(value).toLowerCase().replace(/[.-]/g, '_');
 }
@@ -9,7 +15,7 @@ function normalizePhase(value) {
 function pickFirstText(values) {
   if (!Array.isArray(values)) return '';
   for (const value of values) {
-    const text = normalizeWhitespace(value);
+    const text = normalizeMessageText(value);
     if (text) return text;
   }
   return '';
@@ -34,7 +40,7 @@ function pickFirstTextFromContent(content) {
 function normalizeTextList(list) {
   if (!Array.isArray(list)) return [];
   return list
-    .map((item) => normalizeWhitespace(item))
+    .map((item) => normalizeMessageText(item))
     .filter(Boolean);
 }
 
