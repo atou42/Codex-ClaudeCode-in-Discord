@@ -6,6 +6,7 @@ import path from 'node:path';
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { safeReply, withDiscordNetworkRetry } from './discord-reply-utils.js';
+import { splitForDiscord } from './discord-message-splitter.js';
 import {
   appendRecentActivity as appendRecentActivityBase,
   appendCompletedStep as appendCompletedStepBase,
@@ -4161,23 +4162,6 @@ function loadDb() {
 
 function saveDb() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
-}
-
-function splitForDiscord(text, limit = 1900) {
-  const s = String(text || '').trim();
-  if (!s) return [];
-
-  const out = [];
-  let rest = s;
-
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf('\n', limit);
-    if (cut < 200) cut = limit;
-    out.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut).trim();
-  }
-  if (rest) out.push(rest);
-  return out;
 }
 
 function truncate(text, max) {

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.2.3] - 2026-03-04
+
+### Changed
+- `splitForDiscord` now performs markdown-aware chunking and keeps fenced code blocks balanced across message parts.
+- Extracted Discord output chunking into `src/discord-message-splitter.js` for isolated testing and safer iteration.
+
+### Fixed
+- Avoid splitting inside fenced blocks without reopening/closing markers, preventing broken rendering in long final answers.
+- Added regression tests for long plain text, fenced code block chunking, and unclosed-fence auto-healing.
+
 ## [0.2.2] - 2026-03-04
 
 ### Fixed
