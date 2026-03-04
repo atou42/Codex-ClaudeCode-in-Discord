@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.2.2] - 2026-03-04
+
+### Fixed
+- Preserve Markdown line breaks, paragraphs, and fenced code blocks when extracting final answer text from Codex events.
+- Add regression tests for Markdown structure preservation in `codex-event-utils`.
+
+## [0.2.1] - 2026-03-03
+
+### Added
+- Audience-facing progress stream with a fixed process window and commentary capture from Codex events.
+- Configurable process window lines command and event dedupe controls.
+
+### Changed
+- Progress rendering now uses raw Codex event text and incremental streaming behavior.
+- Added semver release automation (`scripts/cut-release.mjs`) and npm release scripts.
+
+### Fixed
+- Acknowledge slash interactions earlier to reduce timeout errors.
+- Retry transient Discord send/reply failures.
+- Fallback to `channel.send` for system messages when direct replies fail.
+
 ## [0.2.0] - 2026-03-01
 
 ### Added
