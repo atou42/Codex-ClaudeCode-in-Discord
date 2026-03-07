@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.0] - 2026-03-07
+
+### Added
+- Shared and dedicated startup flows for Discord bot instances via `npm run start:shared`, `npm run start:codex`, and `npm run start:claude`.
+- Provider-scoped single-file `.env` loading with `CODEX__*` and `CLAUDE__*` sections plus new utility coverage for provider/env resolution.
+- Provider-aware state isolation for locked bot instances, including per-provider session/lock files and default slash prefixes.
+
+### Changed
+- Expanded the bot bridge from Codex-only wording to first-class Codex + Claude support across docs, config examples, and runtime helpers.
+- Progress/event parsing now understands additional assistant and stream event shapes used by Claude-style runtimes.
+
+### Fixed
+- Prefer provider-scoped Discord token and runtime overrides without clobbering higher-priority shell environment values.
+- Preserve progress milestones from tool-style response items that omit explicit completion status.
+
 ## [0.2.3] - 2026-03-04
 
 ### Changed

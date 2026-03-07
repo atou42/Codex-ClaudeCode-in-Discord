@@ -1,10 +1,10 @@
 # codex-cli-discord
 
-A tiny Discord bot that bridges **Codex CLI** (`codex exec --json`) into Discord.
+A tiny Discord bot that bridges **Codex CLI** or **Claude Code** into Discord.
 
 [中文文档](./README.zh-CN.md)
 
-**Design:** 1 Discord **thread/channel = 1 Codex session** (auto `exec resume`).
+**Design:** 1 Discord **thread/channel = 1 CLI session** (auto resume for the active provider).
 
 ## Features
 
@@ -31,9 +31,13 @@ A tiny Discord bot that bridges **Codex CLI** (`codex exec --json`) into Discord
 ## Prerequisites
 
 - Node.js 18+
-- `codex` CLI installed and working in your shell
-  - If running under pm2/launchd/systemd, you may need `CODEX_BIN=/absolute/path/to/codex` in `.env`
-- A **separate** Discord Application/Bot token (don’t reuse OpenClaw’s token)
+- Install the CLI(s) you plan to use
+  - Codex: `codex` available in shell, or set `CODEX_BIN=/absolute/path/to/codex`
+  - Claude: `claude` available in shell, or set `CLAUDE_BIN=/absolute/path/to/claude`
+- If the CLI itself needs login, complete that in the CLI first; this project does not manage provider auth in `.env`
+- One or two Discord Application/Bot tokens
+  - Shared mode: one bot token is enough
+  - Dedicated mode: use separate tokens for Codex and Claude bots
 
 ## Quickstart
 
@@ -51,12 +55,14 @@ Git hooks note:
 - Run `npm run setup-hooks` once after clone (or after re-clone).
 - The pre-commit atomic check is Node-based and works on macOS/Linux/Windows (no bash required).
 
-Then in your Discord server, invite the bot, and use these slash commands:
+Then in your Discord server, invite the bot, and use these slash commands. Examples below use the default Codex/shared prefix `cx_`; a dedicated Claude bot defaults to `cc_`, and both can be overridden with `SLASH_PREFIX`, `CODEX__SLASH_PREFIX`, or `CLAUDE__SLASH_PREFIX`:
 
 - `/cx_status` — show current thread config
 - `/cx_setdir <path>` — set workspace dir for current thread
 - `/cx_model <name|default>` — set model override
 - `/cx_effort <high|medium|low|default>` — set reasoning effort
+- `/cx_effort <xhigh|high|medium|low|default>` — set reasoning effort
+- `/cx_compact key:<status|strategy|token_limit|native_limit|enabled|reset> value:<...>` — configure compact for current channel (Codex only)
 - `/cx_mode <safe|dangerous>` — set execution mode
 - `/cx_name <label>` — name the session (for display)
 - `/cx_reset` — clear current thread session
@@ -72,6 +78,19 @@ Then in your Discord server, invite the bot, and use these slash commands:
 - `/cx_progress` — show latest progress snapshot for the running task
 - `/cx_cancel` — interrupt current run and clear queued prompts
 
+If you want **separate Discord bots** for Codex and Claude, keep everything in one `.env`, but group provider-specific values with clear prefixes:
+
+```bash
+# one-time setup
+cp .env.example .env
+
+# start dedicated bots
+npm run start:codex
+npm run start:claude
+```
+
+Use plain keys for shared Discord/runtime settings, then put dedicated bot settings under `CODEX__*` and `CLAUDE__*` sections in the same file. In practice, you usually only need `DISCORD_TOKEN`, optional `DEFAULT_MODEL`, optional `DEFAULT_MODE`, and optional CLI path overrides. Each locked instance uses its own state files (`data/sessions.codex.json`, `data/sessions.claude.json`) and its own process lock, so channel/session context does not mix across bots.
+
 ## Configuration (.env)
 
 See `.env.example`.
@@ -79,18 +98,27 @@ See `.env.example`.
 Important knobs:
 
 - `ALLOWED_CHANNEL_IDS` / `ALLOWED_USER_IDS`: lock the bot down (recommended)
+- Shared `.env` keys: Discord/runtime settings only (`ALLOWED_*`, `WORKSPACE_ROOT`, proxy, etc.)
+- `CODEX__*`: Codex bot section in the same `.env` (normally `CODEX__DISCORD_TOKEN`, plus optional `CODEX__DEFAULT_MODEL`, `CODEX__DEFAULT_MODE`, `CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`, `CODEX__CODEX_BIN`)
+- `CLAUDE__*`: Claude bot section in the same `.env` (normally `CLAUDE__DISCORD_TOKEN`, plus optional `CLAUDE__DEFAULT_MODEL`, `CLAUDE__DEFAULT_MODE`, `CLAUDE__CLAUDE_BIN`)
+- `BOT_PROVIDER`: leave empty for shared mode, or set `codex` / `claude` to lock one bot instance to a single provider; `npm run start:codex` / `npm run start:claude` set this automatically
+- `ENV_FILE`: optional extra overlay file if you really need one, but the normal setup is now a single grouped `.env`
+- `DISCORD_TOKEN_CODEX` / `DISCORD_TOKEN_CLAUDE`: legacy fallback for older single-file setups
+- Provider auth is outside this project's config surface; keep CLI-specific login or secrets outside this `.env` unless you intentionally need them for your own runtime
 - `SECURITY_PROFILE`: `auto | solo | team | public`
   - `auto`: DM -> `solo`; guild channel where `@everyone` can view -> `public`; else `team`
 - `MENTION_ONLY`: require bot mention for normal messages (leave empty to use profile default)
 - `MAX_QUEUE_PER_CHANNEL`: max queued prompts per channel (`0` = unlimited; leave empty to use profile default)
 - `ENABLE_CONFIG_CMD`: enable/disable `!config` command (default `false`)
 - `CONFIG_ALLOWLIST`: allowed keys for `!config key=value` (comma-separated, or `*` to allow all)
-- `SLASH_PREFIX`: slash prefix, default `cx` (e.g. `/cx_status`)
+- `SLASH_PREFIX`: shared/global slash prefix; default `cx` in shared mode (e.g. `/cx_status`)
+- `CODEX__SLASH_PREFIX` / `CLAUDE__SLASH_PREFIX`: dedicated-bot slash prefix overrides; defaults are `cx` for Codex and `cc` for Claude
 - `DEFAULT_UI_LANGUAGE`: default bot message language for new channels (`zh` or `en`, default `zh`)
 - `ONBOARDING_ENABLED_DEFAULT`: onboarding default for new channels (`true` or `false`, default `true`)
-- `DEFAULT_MODE`: `safe` or `dangerous`
+- `DEFAULT_MODE`: `safe` or `dangerous`; for dedicated bots keep this under `CODEX__DEFAULT_MODE` / `CLAUDE__DEFAULT_MODE`
 - `WORKSPACE_ROOT`: where per-thread folders are created
 - `CODEX_BIN`: codex command/path (default `codex`)
+- `CLAUDE_BIN`: claude command/path (default `claude`)
 - `CODEX_TIMEOUT_MS`: hard timeout per codex run (ms). `0` disables timeout.
 - `PROGRESS_UPDATES_ENABLED`: enable/disable live progress updates in channel (default `true`)
 - `PROGRESS_UPDATE_INTERVAL_MS`: heartbeat refresh interval for progress message
@@ -111,7 +139,9 @@ Important knobs:
   - `hard`: bot summarizes then switches to a new session
   - `native`: pass `model_auto_compact_token_limit` to Codex CLI and continue same session
   - `off`: disable compact behavior
+- You can also override compact strategy per channel with `/cx_compact` or `!compact`
 - `COMPACT_ON_THRESHOLD`: enable/disable threshold-triggered compact logic
+- Channel-level compact config supports: `strategy`, `token_limit`, `native_limit`, `enabled`, `reset`, and `status`
 
 ## Auto-upgrade Codex CLI (Optional Scheduler Adapter)
 
@@ -217,7 +247,7 @@ CODEX_BIN=C:\\Users\\<you>\\AppData\\Local\\Programs\\Codex\\codex.exe
 ```
 3. Restart the bot process.
 
-You can also run `/cx_status` (or your custom slash prefix + `_status`) to see codex-cli health in bot output.
+You can also run `/cx_status` (or your active slash prefix + `_status`, such as `/cc_status` on the default Claude bot) to see codex-cli health in bot output.
 
 ## Proxy / Clash setup (optional)
 

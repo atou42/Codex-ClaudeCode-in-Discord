@@ -72,6 +72,36 @@ test('extractCompletedStepFromEvent ignores update_plan tool completion noise', 
   assert.equal(step, '');
 });
 
+test('extractCompletedStepFromEvent treats response_item function_call without status as completed milestone', () => {
+  const ev = {
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'exec_command',
+      arguments: '{"cmd":"git status --short"}',
+      call_id: 'call_123',
+    },
+  };
+
+  const step = extractCompletedStepFromEvent(ev, { previewChars: 180 });
+  assert.equal(step, 'exec_command: run: git status --short');
+});
+
+test('extractCompletedStepFromEvent still ignores response_item update_plan function_call noise', () => {
+  const ev = {
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'update_plan',
+      arguments: '{"steps":[{"status":"completed","step":"Inspect code"}]}',
+      call_id: 'call_plan',
+    },
+  };
+
+  const step = extractCompletedStepFromEvent(ev, { previewChars: 180 });
+  assert.equal(step, '');
+});
+
 test('extractPlanStateFromEvent reads nested plan from tool arguments', () => {
   const ev = {
     type: 'item.completed',
@@ -258,6 +288,37 @@ test('summarizeCodexEvent unwraps event_msg payload for summary rendering', () =
   assert.equal(summary, 'turn completed (input tokens: 123)');
 });
 
+test('summarizeCodexEvent handles Claude assistant message events', () => {
+  const ev = {
+    type: 'assistant/message',
+    sessionId: '123',
+    message: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: '我先检查当前工作区，再继续实现。' }],
+    },
+  };
+
+  const summary = summarizeCodexEvent(ev, { previewChars: 180 });
+  assert.equal(summary, 'agent message: 我先检查当前工作区，再继续实现。');
+});
+
+test('extractRawProgressTextFromEvent reads Claude assistant commentary messages', () => {
+  const ev = {
+    type: 'assistant/message',
+    sessionId: '123',
+    message: {
+      type: 'message',
+      role: 'assistant',
+      phase: 'commentary',
+      content: [{ type: 'text', text: '正在比对 Claude 与 Codex 的事件格式。' }],
+    },
+  };
+
+  const raw = extractRawProgressTextFromEvent(ev);
+  assert.equal(raw, '正在比对 Claude 与 Codex 的事件格式。');
+});
+
 test('appendRecentActivity can keep full raw text without truncation', () => {
   const list = [];
   const rawText = '这是一段用于验证不截断行为的原始过程文本 '.repeat(12).trim();
@@ -270,4 +331,48 @@ test('appendRecentActivity can keep full raw text without truncation', () => {
 
   assert.equal(list.length, 1);
   assert.equal(list[0], rawText);
+});
+
+test('summarizeCodexEvent unwraps Claude stream_event content_block_delta', () => {
+  const ev = {
+    type: 'stream_event',
+    session_id: '11111111-1111-4111-8111-111111111111',
+    event: {
+      type: 'content_block_delta',
+      delta: {
+        type: 'text_delta',
+        text: '正在检查 Claude stream 事件',
+      },
+    },
+  };
+
+  const summary = summarizeCodexEvent(ev, { previewChars: 180 });
+  assert.equal(summary, 'agent message: 正在检查 Claude stream 事件');
+});
+
+test('extractRawProgressTextFromEvent unwraps Claude stream_event content_block_delta', () => {
+  const ev = {
+    type: 'stream_event',
+    session_id: '11111111-1111-4111-8111-111111111111',
+    event: {
+      type: 'content_block_delta',
+      delta: {
+        type: 'text_delta',
+        text: '正在逐步输出目录路径',
+      },
+    },
+  };
+
+  const raw = extractRawProgressTextFromEvent(ev);
+  assert.equal(raw, '正在逐步输出目录路径');
+});
+
+test('summarizeCodexEvent renders Claude queue-operation events', () => {
+  const ev = {
+    type: 'queue-operation',
+    operation: 'enqueue',
+  };
+
+  const summary = summarizeCodexEvent(ev, { previewChars: 180 });
+  assert.equal(summary, 'prompt queued');
 });

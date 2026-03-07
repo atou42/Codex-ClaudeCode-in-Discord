@@ -26,6 +26,16 @@ test('extractAgentMessageText reads direct text and content fallback', () => {
     }),
     '第二段',
   );
+  assert.equal(
+    extractAgentMessageText({
+      type: 'assistant',
+      message: {
+        type: 'message',
+        content: [{ type: 'text', text: '第三段' }],
+      },
+    }),
+    '第三段',
+  );
 });
 
 test('extractAgentMessageText keeps markdown line breaks', () => {
@@ -38,6 +48,7 @@ test('extractAgentMessageText keeps markdown line breaks', () => {
 
 test('getAgentMessagePhase normalizes phase and defaults empty', () => {
   assert.equal(getAgentMessagePhase({ phase: 'Final.Answer' }), 'final_answer');
+  assert.equal(getAgentMessagePhase({ message: { phase: 'commentary' } }), 'commentary');
   assert.equal(getAgentMessagePhase({}), '');
 });
 

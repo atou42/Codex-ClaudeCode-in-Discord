@@ -1,8 +1,8 @@
 # codex-cli-discord
 
-一个轻量的 Discord Bot，用于把 **Codex CLI**（`codex exec --json`）桥接到 Discord 中。
+一个轻量的 Discord Bot，用于把 **Codex CLI** 或 **Claude Code** 桥接到 Discord 中。
 
-**设计原则：**1 个 Discord **线程/频道 = 1 个 Codex 会话**（自动 `exec resume`）。
+**设计原则：**1 个 Discord **线程/频道 = 1 个 CLI 会话**（按当前 provider 自动续聊）。
 
 ## 功能特性
 
@@ -29,9 +29,13 @@
 ## 前置条件
 
 - Node.js 18+
-- 已安装并可在当前 shell 中执行 `codex` CLI
-  - 如果通过 pm2/launchd/systemd 运行，可能需要在 `.env` 里设置 `CODEX_BIN=/absolute/path/to/codex`
-- 一个**独立的** Discord Application/Bot Token（不要复用 OpenClaw 的 token）
+- 安装你计划使用的 CLI
+  - Codex：当前 shell 可直接执行 `codex`，或在 `.env` 设置 `CODEX_BIN=/absolute/path/to/codex`
+  - Claude：当前 shell 可直接执行 `claude`，或在 `.env` 设置 `CLAUDE_BIN=/absolute/path/to/claude`
+- 如果 CLI 自己需要登录，请先在 CLI 内完成；这个项目不通过 `.env` 管 provider auth
+- 一个或两个 Discord Application/Bot Token
+  - 共享模式：一个 bot token 即可
+  - 独立模式：Codex / Claude 分别使用不同 bot token
 
 ## 快速开始
 
@@ -49,12 +53,14 @@ Git hooks 说明：
 - clone 后（或重新 clone 后）执行一次 `npm run setup-hooks`
 - pre-commit 原子性检查基于 Node，可在 macOS/Linux/Windows 上工作（不依赖 bash）
 
-然后在你的 Discord 服务器邀请 Bot，并使用以下 slash 命令：
+然后在你的 Discord 服务器邀请 Bot，并使用以下 slash 命令。下面示例使用的是 Codex / shared 模式默认前缀 `cx_`；独立 Claude bot 默认前缀改为 `cc_`，并且两者都可通过 `SLASH_PREFIX`、`CODEX__SLASH_PREFIX`、`CLAUDE__SLASH_PREFIX` 覆盖：
 
 - `/cx_status` - 查看当前线程配置
 - `/cx_setdir <path>` - 设置当前线程的 workspace 目录
 - `/cx_model <name|default>` - 设置模型覆盖
 - `/cx_effort <high|medium|low|default>` - 设置推理强度
+- `/cx_effort <xhigh|high|medium|low|default>` - 设置 reasoning effort
+- `/cx_compact key:<status|strategy|token_limit|native_limit|enabled|reset> value:<...>` - 配置当前频道 compact（仅 Codex）
 - `/cx_mode <safe|dangerous>` - 设置执行模式
 - `/cx_name <label>` - 命名会话（用于显示）
 - `/cx_reset` - 清空当前线程会话
@@ -70,6 +76,19 @@ Git hooks 说明：
 - `/cx_progress` - 查看当前运行任务的最新进度快照
 - `/cx_cancel` - 中断当前运行并清空队列
 
+如果你希望 **Codex 和 Claude 绑定不同 Discord bot**，现在改成只用一个 `.env`，但在文件里分段分组：
+
+```bash
+# 首次准备
+cp .env.example .env
+
+# 启动两个独立 bot
+npm run start:codex
+npm run start:claude
+```
+
+共享配置继续用普通 key，只放 Discord / 运行时配置；Codex / Claude 专属配置放在同一个 `.env` 里的 `CODEX__*` / `CLAUDE__*` 段落里。实际通常只需要各自的 `DISCORD_TOKEN`，以及按需填写 `DEFAULT_MODEL`、`DEFAULT_MODE`、CLI 路径。锁定实例后会自动使用独立状态文件（`data/sessions.codex.json`、`data/sessions.claude.json`）和独立进程锁，因此不会串频道/串会话上下文。
+
 ## 配置（.env）
 
 见 `.env.example`。
@@ -77,18 +96,27 @@ Git hooks 说明：
 关键项：
 
 - `ALLOWED_CHANNEL_IDS` / `ALLOWED_USER_IDS`：限制可用范围（推荐）
+- 共享 `.env` key：只放 Discord / 运行时配置（`ALLOWED_*`、`WORKSPACE_ROOT`、代理等）
+- `CODEX__*`：同一个 `.env` 里的 Codex bot 分组（通常只需要 `CODEX__DISCORD_TOKEN`，以及按需填写 `CODEX__DEFAULT_MODEL`、`CODEX__DEFAULT_MODE`、`CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`、`CODEX__CODEX_BIN`）
+- `CLAUDE__*`：同一个 `.env` 里的 Claude bot 分组（通常只需要 `CLAUDE__DISCORD_TOKEN`，以及按需填写 `CLAUDE__DEFAULT_MODEL`、`CLAUDE__DEFAULT_MODE`、`CLAUDE__CLAUDE_BIN`）
+- `BOT_PROVIDER`：留空表示共享模式；设为 `codex` / `claude` 可把当前 bot 实例锁到单一 provider；`npm run start:codex` / `npm run start:claude` 会自动设置
+- `ENV_FILE`：仍可选配额外 overlay 文件，但常规使用现在就是单个分组 `.env`
+- `DISCORD_TOKEN_CODEX` / `DISCORD_TOKEN_CLAUDE`：旧的单文件回退方案，保留兼容
+- provider 登录/鉴权不属于这个项目的配置面；除非你明确需要，否则不要把 CLI 自己的 secret 塞进这个 `.env`
 - `SECURITY_PROFILE`：`auto | solo | team | public`
   - `auto`：DM -> `solo`；服务器内若 `@everyone` 可见频道则 `public`；否则 `team`
 - `MENTION_ONLY`：普通消息是否必须 @Bot（留空则使用 profile 默认）
 - `MAX_QUEUE_PER_CHANNEL`：每频道最大排队数（`0` 表示无限制；留空则使用 profile 默认）
 - `ENABLE_CONFIG_CMD`：是否启用 `!config`（默认 `false`）
 - `CONFIG_ALLOWLIST`：`!config key=value` 允许的 key（逗号分隔，或 `*` 表示全部允许）
-- `SLASH_PREFIX`：slash 前缀，默认 `cx`（例如 `/cx_status`）
+- `SLASH_PREFIX`：shared / 全局 slash 前缀；shared 模式默认 `cx`（例如 `/cx_status`）
+- `CODEX__SLASH_PREFIX` / `CLAUDE__SLASH_PREFIX`：独立 bot 的 slash 前缀覆盖；默认分别是 Codex=`cx`、Claude=`cc`
 - `DEFAULT_UI_LANGUAGE`：新频道默认提示语言（`zh` 或 `en`，默认 `zh`）
 - `ONBOARDING_ENABLED_DEFAULT`：新频道 onboarding 默认开关（`true` 或 `false`，默认 `true`）
-- `DEFAULT_MODE`：`safe` 或 `dangerous`
+- `DEFAULT_MODE`：`safe` 或 `dangerous`；独立 bot 建议分别写成 `CODEX__DEFAULT_MODE` / `CLAUDE__DEFAULT_MODE`
 - `WORKSPACE_ROOT`：按线程创建目录的根路径
 - `CODEX_BIN`：codex 命令/路径（默认 `codex`）
+- `CLAUDE_BIN`：claude 命令/路径（默认 `claude`）
 - `CODEX_TIMEOUT_MS`：单次 codex 运行硬超时（毫秒），`0` 表示禁用超时
 - `PROGRESS_UPDATES_ENABLED`：是否启用频道实时进度更新（默认 `true`）
 - `PROGRESS_UPDATE_INTERVAL_MS`：进度消息心跳刷新间隔
@@ -107,7 +135,9 @@ Git hooks 说明：
   - `hard`：Bot 先总结，再切换到新会话
   - `native`：给 Codex CLI 传 `model_auto_compact_token_limit`，继续同一会话
   - `off`：关闭 compact 行为
+- 也可以通过 `/cx_compact` 或 `!compact` 在频道级覆盖 compact strategy
 - `COMPACT_ON_THRESHOLD`：是否启用阈值触发的 compact 逻辑
+- 频道级 compact 配置支持：`strategy`、`token_limit`、`native_limit`、`enabled`、`reset`、`status`
 
 ## Codex CLI 自动升级（可选调度适配器）
 
@@ -213,7 +243,7 @@ CODEX_BIN=C:\\Users\\<you>\\AppData\\Local\\Programs\\Codex\\codex.exe
 ```
 3. 重启 Bot 进程。
 
-你也可以执行 `/cx_status`（或你自定义前缀 + `_status`）查看 Bot 输出中的 codex-cli 健康状态。
+你也可以执行 `/cx_status`（或当前生效前缀 + `_status`，例如默认 Claude bot 用 `/cc_status`）查看 Bot 输出中的 codex-cli 健康状态。
 
 ## 代理 / Clash 配置（可选）
 

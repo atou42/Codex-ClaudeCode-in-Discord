@@ -14,7 +14,7 @@ function normalizeWhitespace(value) {
 }
 
 function normalizeEventType(type) {
-  return String(type || '').trim().toLowerCase().replace(/[.-]/g, '_');
+  return String(type || '').trim().toLowerCase().replace(/[./-]/g, '_');
 }
 
 function prettifyEventType(type) {
@@ -43,7 +43,9 @@ function normalizeStatus(status) {
 
 function extractEventPayload(ev) {
   if (!ev || typeof ev !== 'object') return null;
-  return ev.payload && typeof ev.payload === 'object' ? ev.payload : null;
+  if (ev.payload && typeof ev.payload === 'object') return ev.payload;
+  if (ev.message && typeof ev.message === 'object') return ev.message;
+  return null;
 }
 
 function compactUrl(rawUrl, previewChars = DEFAULT_PREVIEW_CHARS) {
@@ -202,10 +204,12 @@ function extractDeltaTextPreview(ev, payload, options = {}) {
   };
 
   pushText(ev?.delta);
+  pushText(ev?.delta?.text);
   pushText(ev?.text_delta);
   pushText(ev?.output_text_delta);
   pushText(ev?.reasoning_delta);
   pushText(payload?.delta);
+  pushText(payload?.delta?.text);
   pushText(payload?.text_delta);
   pushText(payload?.output_text_delta);
   pushText(payload?.reasoning_delta);
@@ -292,9 +296,22 @@ export function summarizeCodexEvent(ev, options = {}) {
     }
   }
 
+  if (type === 'stream_event' && ev.event && typeof ev.event === 'object') {
+    return summarizeCodexEvent({
+      ...ev.event,
+      type: ev.event.type,
+      session_id: ev.session_id || ev.sessionId,
+    }, options);
+  }
+
   if (type === 'response_item' && payload) {
     const summary = summarizeResponseItem(payload, opts);
     if (summary) return summary;
+  }
+
+  if (type === 'assistant' || type === 'assistant_message') {
+    const preview = extractPayloadTextPreview(payload || ev.message || ev, opts);
+    return preview ? `agent message: ${preview}` : 'agent message';
   }
 
   if (type.endsWith('_delta')) {
@@ -303,7 +320,7 @@ export function summarizeCodexEvent(ev, options = {}) {
       if (!showReasoning) return 'reasoning delta';
       return delta ? `reasoning: ${delta}` : 'reasoning delta';
     }
-    if (type.includes('output_text') || type.includes('message') || type.includes('content_part')) {
+    if (type.includes('output_text') || type.includes('message') || type.includes('content_part') || type.includes('content_block')) {
       return delta ? `agent message: ${delta}` : 'agent message delta';
     }
     return delta ? `${prettifyEventType(rawType)}: ${delta}` : prettifyEventType(rawType);
@@ -312,10 +329,37 @@ export function summarizeCodexEvent(ev, options = {}) {
   switch (type) {
     case 'thread_started':
       return ev.thread_id ? `session started: ${ev.thread_id}` : 'session started';
+    case 'system_init':
+      return ev.session_id ? `session started: ${ev.session_id}` : 'session started';
+    case 'message_start':
+      return 'turn started';
+    case 'content_block_start':
+      return 'agent message started';
+    case 'assistant':
+    case 'assistant_message': {
+      const preview = extractPayloadTextPreview(ev.message || ev, { previewChars });
+      return preview ? `agent message: ${preview}` : 'agent message';
+    }
+    case 'queue_operation': {
+      const op = normalizeEventType(ev.operation || 'updated');
+      if (op === 'enqueue') return 'prompt queued';
+      if (op === 'dequeue') return 'prompt dequeued';
+      return op ? `queue ${op}` : 'queue updated';
+    }
+    case 'result': {
+      const input = extractInputTokensFromUsage(ev.usage);
+      return input === null ? 'turn completed' : `turn completed (input tokens: ${input})`;
+    }
+    case 'system_init':
+      return ev.session_id || ev.sessionId ? `session started: ${ev.session_id || ev.sessionId}` : 'session started';
     case 'turn_started':
       return 'turn started';
     case 'turn_completed': {
       const input = extractInputTokensFromUsage(ev.usage);
+      return input === null ? 'turn completed' : `turn completed (input tokens: ${input})`;
+    }
+    case 'result': {
+      const input = extractInputTokensFromUsage(ev.usage || ev.result?.usage);
       return input === null ? 'turn completed' : `turn completed (input tokens: ${input})`;
     }
     case 'error': {
@@ -456,14 +500,39 @@ export function extractRawProgressTextFromEvent(ev) {
     }
   }
 
+  if (type === 'stream_event' && ev.event && typeof ev.event === 'object') {
+    return extractRawProgressTextFromEvent({
+      ...ev.event,
+      type: ev.event.type,
+      session_id: ev.session_id || ev.sessionId,
+    });
+  }
+
+  if (type === 'assistant' || type === 'assistant_message') {
+    const phase = normalizeEventType(payload?.phase || ev.phase || '');
+    if (phase === 'final_answer') return '';
+    const text = pickFirstRawText([
+      payload?.message,
+      payload?.text,
+      payload?.output_text,
+      payload?.input_text,
+      ev?.message,
+      ev?.text,
+    ]) || pickFirstRawTextFromContent(payload?.content || ev?.content);
+    if (!text || isLowSignalProcessText(text)) return '';
+    return text;
+  }
+
   if (type.endsWith('_delta')) {
     if (type.includes('reasoning')) return '';
-    if (!(type.includes('output_text') || type.includes('message') || type.includes('content_part'))) return '';
+    if (!(type.includes('output_text') || type.includes('message') || type.includes('content_part') || type.includes('content_block'))) return '';
     const text = pickFirstRawText([
       ev.delta,
+      ev.delta?.text,
       ev.text_delta,
       ev.output_text_delta,
       payload?.delta,
+      payload?.delta?.text,
       payload?.text_delta,
       payload?.output_text_delta,
       payload?.text,
@@ -691,8 +760,14 @@ export function extractCompletedStepFromEvent(ev, options = {}) {
   const payload = extractEventPayload(ev);
 
   if (type === 'response_item' && payload) {
+    const payloadType = normalizeEventType(payload.type || '');
     const status = normalizeStatus(payload.status || '');
     if (status === 'completed') return summarizeCompletedPayload(payload, opts);
+
+    if (!status && ['function_call', 'custom_tool_call', 'local_shell_call', 'web_search_call'].includes(payloadType)) {
+      return summarizeCompletedPayload(payload, opts);
+    }
+
     return '';
   }
 

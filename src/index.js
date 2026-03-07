@@ -1,5 +1,5 @@
-import 'dotenv/config';
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -7,6 +7,14 @@ import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { safeReply, withDiscordNetworkRetry } from './discord-reply-utils.js';
 import { splitForDiscord } from './discord-message-splitter.js';
+import {
+  appendProviderSuffix,
+  describeBotMode,
+  getDefaultSlashPrefix,
+  parseOptionalProvider,
+  resolveDiscordToken,
+} from './bot-instance-utils.js';
+import { loadRuntimeEnv } from './env-loader.js';
 import {
   appendRecentActivity as appendRecentActivityBase,
   appendCompletedStep as appendCompletedStepBase,
@@ -35,9 +43,22 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(ROOT, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'sessions.json');
-const LOCK_FILE = path.join(DATA_DIR, 'bot.lock');
-const ENV_FILE = path.join(ROOT, '.env');
+const envState = loadRuntimeEnv({ rootDir: ROOT, env: process.env });
+const ENV_FILE = envState.writableEnvFile;
+const BOT_PROVIDER = parseOptionalProvider(process.env.BOT_PROVIDER);
+const BOT_MODE = describeBotMode(BOT_PROVIDER);
+const DATA_FILE = path.join(DATA_DIR, appendProviderSuffix('sessions.json', BOT_PROVIDER));
+const LOCK_FILE = path.join(DATA_DIR, appendProviderSuffix('bot.lock', BOT_PROVIDER));
+
+if (envState.loadedFiles.length) {
+  const rendered = envState.loadedFiles
+    .map((filePath) => path.relative(ROOT, filePath) || path.basename(filePath))
+    .join(' -> ');
+  const scoped = envState.appliedProviderScope
+    ? ` (applied ${envState.appliedProviderScope.toUpperCase()}__* overrides)`
+    : '';
+  console.log(`🔧 Loaded env files: ${rendered}${scoped}`);
+}
 
 const proxyRepair = autoRepairProxyEnv(ENV_FILE);
 if (proxyRepair.logs.length) {
@@ -89,9 +110,9 @@ const {
   Routes,
 } = await import('discord.js');
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_TOKEN = resolveDiscordToken({ botProvider: BOT_PROVIDER, env: process.env });
 if (!DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN in environment');
+  console.error(renderMissingDiscordTokenHint({ botProvider: BOT_PROVIDER, env: process.env }));
   process.exit(1);
 }
 
@@ -111,6 +132,7 @@ const CONFIG_POLICY = parseConfigAllowlist(
 );
 
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.join(ROOT, 'workspaces');
+const DEFAULT_PROVIDER = BOT_PROVIDER || normalizeProvider(process.env.DEFAULT_PROVIDER || process.env.CLI_PROVIDER || 'codex');
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || null;
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || 'safe').toLowerCase() === 'dangerous' ? 'dangerous' : 'safe';
 const DEFAULT_UI_LANGUAGE = normalizeUiLanguage(process.env.DEFAULT_UI_LANGUAGE || 'zh');
@@ -118,6 +140,7 @@ const ONBOARDING_ENABLED_DEFAULT = parseOptionalBool(process.env.ONBOARDING_ENAB
 const ONBOARDING_ENABLED_BY_DEFAULT = ONBOARDING_ENABLED_DEFAULT === null ? true : ONBOARDING_ENABLED_DEFAULT;
 const CODEX_TIMEOUT_MS = normalizeTimeoutMs(process.env.CODEX_TIMEOUT_MS, 0);
 const CODEX_BIN = (process.env.CODEX_BIN || 'codex').trim() || 'codex';
+const CLAUDE_BIN = (process.env.CLAUDE_BIN || 'claude').trim() || 'claude';
 const SHOW_REASONING = String(process.env.SHOW_REASONING || 'false').toLowerCase() === 'true';
 const DEBUG_EVENTS = String(process.env.DEBUG_EVENTS || 'false').toLowerCase() === 'true';
 const PROGRESS_UPDATES_ENABLED = String(process.env.PROGRESS_UPDATES_ENABLED || 'true').toLowerCase() !== 'false';
@@ -155,25 +178,28 @@ const MODEL_AUTO_COMPACT_TOKEN_LIMIT = toInt(
   process.env.MODEL_AUTO_COMPACT_TOKEN_LIMIT,
   MAX_INPUT_TOKENS_BEFORE_COMPACT,
 );
-const SLASH_PREFIX = normalizeSlashPrefix(process.env.SLASH_PREFIX || 'cx');
+const SLASH_PREFIX = normalizeSlashPrefix(process.env.SLASH_PREFIX || getDefaultSlashPrefix(BOT_PROVIDER));
 const SPAWN_ENV = buildSpawnEnv(process.env);
 
 ensureDir(DATA_DIR);
 ensureDir(WORKSPACE_ROOT);
 
-const bootCodexHealth = getCodexCliHealth();
-if (bootCodexHealth.ok) {
-  console.log(`🧩 Codex CLI: ${bootCodexHealth.version} via ${bootCodexHealth.bin}`);
+const bootCliHealth = getCliHealth(DEFAULT_PROVIDER);
+if (bootCliHealth.ok) {
+  console.log(`🧩 ${getProviderDisplayName(DEFAULT_PROVIDER)} CLI: ${bootCliHealth.version} via ${bootCliHealth.bin}`);
 } else {
   console.warn([
-    '⚠️ Codex CLI 不可用，后续请求会失败。',
-    `• bin: ${bootCodexHealth.bin}`,
-    `• reason: ${bootCodexHealth.error}`,
-    '• 处理: 安装 codex CLI，或在 .env 里设置 CODEX_BIN=/绝对路径/codex，然后重启 bot。',
+    `⚠️ ${getProviderDisplayName(DEFAULT_PROVIDER)} CLI 不可用，后续请求会失败。`,
+    `• provider: ${DEFAULT_PROVIDER}`,
+    `• bin: ${bootCliHealth.bin}`,
+    `• reason: ${bootCliHealth.error}`,
+    `• 处理: 安装 ${getProviderDisplayName(DEFAULT_PROVIDER)} CLI，或在 .env 里设置 ${getProviderBinEnvName(DEFAULT_PROVIDER)}=/绝对路径/${getProviderDefaultBin(DEFAULT_PROVIDER)}，然后重启 bot。`,
   ].join('\n'));
 }
 console.log([
   '🔐 Security defaults:',
+  `• BOT_MODE=${BOT_MODE}`,
+  `• DEFAULT_PROVIDER=${DEFAULT_PROVIDER}`,
   `• SECURITY_PROFILE=${SECURITY_PROFILE}`,
   `• MENTION_ONLY=${MENTION_ONLY_OVERRIDE === null ? 'profile-default' : MENTION_ONLY_OVERRIDE}`,
   `• MAX_QUEUE_PER_CHANNEL=${MAX_QUEUE_PER_CHANNEL_OVERRIDE === null ? 'profile-default' : MAX_QUEUE_PER_CHANNEL_OVERRIDE}`,
@@ -198,6 +224,56 @@ function getCodexDefaults() {
   } catch {
     return { model: '(unknown)', effort: '(unknown)' };
   }
+}
+
+function normalizeProvider(value) {
+  return String(value || '').trim().toLowerCase() === 'claude' ? 'claude' : 'codex';
+}
+
+function getSessionProvider(session) {
+  return normalizeProvider(session?.provider || DEFAULT_PROVIDER);
+}
+
+function getProviderDisplayName(provider) {
+  return normalizeProvider(provider) === 'claude' ? 'Claude Code' : 'Codex';
+}
+
+function getProviderShortName(provider) {
+  return normalizeProvider(provider) === 'claude' ? 'Claude' : 'Codex';
+}
+
+function getProviderDefaultBin(provider) {
+  return normalizeProvider(provider) === 'claude' ? 'claude' : 'codex';
+}
+
+function getProviderBin(provider) {
+  return normalizeProvider(provider) === 'claude' ? CLAUDE_BIN : CODEX_BIN;
+}
+
+function getProviderBinEnvName(provider) {
+  return normalizeProvider(provider) === 'claude' ? 'CLAUDE_BIN' : 'CODEX_BIN';
+}
+
+function getSessionId(session) {
+  const id = session?.runnerSessionId ?? session?.codexThreadId ?? null;
+  const normalized = String(id || '').trim();
+  return normalized || null;
+}
+
+function setSessionId(session, value) {
+  if (!session || typeof session !== 'object') return null;
+  const normalized = String(value || '').trim() || null;
+  session.runnerSessionId = normalized;
+  session.codexThreadId = normalized;
+  return normalized;
+}
+
+function clearSessionId(session) {
+  setSessionId(session, null);
+}
+
+function formatSessionIdLabel(sessionId) {
+  return `\`${sessionId || '(auto — 下条消息新建)'}\``;
 }
 
 const db = loadDb();
@@ -234,7 +310,7 @@ function bindClientHandlers(bot) {
   // Auto-join threads so we receive messageCreate events in them
   bot.on('threadCreate', async (thread) => {
     try {
-      if (!thread.joined) await thread.join();
+      await joinThreadWithRetry(thread, 'threadCreate');
       console.log(`🧵 Joined thread: ${thread.name} (${thread.id})`);
     } catch (err) {
       console.error(`Failed to join thread ${thread.id}:`, err.message);
@@ -245,7 +321,9 @@ function bindClientHandlers(bot) {
   bot.on('threadListSync', (threads) => {
     for (const thread of threads.values()) {
       if (!thread.joined) {
-        thread.join().then(() => console.log(`🧵 Synced into thread: ${thread.name}`)).catch(() => {});
+        joinThreadWithRetry(thread, 'threadListSync')
+          .then(() => console.log(`🧵 Synced into thread: ${thread.name}`))
+          .catch((err) => console.error(`Failed to sync thread ${thread.id}:`, err.message));
       }
     }
   });
@@ -327,30 +405,67 @@ function bindClientHandlers(bot) {
   });
 }
 
+async function joinThreadWithRetry(thread, context = 'thread.join') {
+  if (!thread || thread.joined) return;
+
+  await withDiscordNetworkRetry(
+    () => thread.join(),
+    {
+      logger: console,
+      label: `${context} thread.join (${thread.id})`,
+      maxAttempts: 4,
+      baseDelayMs: 500,
+    },
+  );
+}
+
 // ── Slash Commands ──────────────────────────────────────────────
 
 const slashCommands = [
-  new SlashCommandBuilder().setName(slashName('status')).setDescription('查看当前 thread 的 Codex 配置'),
+  new SlashCommandBuilder().setName(slashName('status')).setDescription('查看当前 thread 的 CLI 配置'),
   new SlashCommandBuilder().setName(slashName('reset')).setDescription('清空当前会话，下条消息新开上下文'),
-  new SlashCommandBuilder().setName(slashName('sessions')).setDescription('列出最近的 Codex sessions'),
+  new SlashCommandBuilder().setName(slashName('sessions')).setDescription('列出最近的 provider sessions'),
   new SlashCommandBuilder()
     .setName(slashName('setdir'))
     .setDescription('设置当前 thread 的工作目录')
     .addStringOption(o => o.setName('path').setDescription('绝对路径，如 ~/GitHub/my-project').setRequired(true)),
+  !BOT_PROVIDER && new SlashCommandBuilder()
+    .setName(slashName('provider'))
+    .setDescription('切换当前频道使用的 CLI provider')
+    .addStringOption(o => o.setName('name').setDescription('provider').setRequired(true)
+      .addChoices(
+        { name: 'codex', value: 'codex' },
+        { name: 'claude', value: 'claude' },
+        { name: 'status', value: 'status' },
+      )),
   new SlashCommandBuilder()
     .setName(slashName('model'))
-    .setDescription('切换 Codex 模型')
+    .setDescription('切换当前 provider 模型')
     .addStringOption(o => o.setName('name').setDescription('模型名（如 o3, gpt-5.3-codex）或 default').setRequired(true)),
   new SlashCommandBuilder()
     .setName(slashName('effort'))
     .setDescription('设置 reasoning effort')
     .addStringOption(o => o.setName('level').setDescription('推理力度').setRequired(true)
       .addChoices(
+        { name: 'xhigh', value: 'xhigh' },
         { name: 'high', value: 'high' },
         { name: 'medium', value: 'medium' },
         { name: 'low', value: 'low' },
         { name: 'default', value: 'default' },
       )),
+  new SlashCommandBuilder()
+    .setName(slashName('compact'))
+    .setDescription('配置 Codex compact（strategy/limit/enabled/status）')
+    .addStringOption(o => o.setName('key').setDescription('配置项').setRequired(true)
+      .addChoices(
+        { name: 'status', value: 'status' },
+        { name: 'strategy', value: 'strategy' },
+        { name: 'token_limit', value: 'token_limit' },
+        { name: 'native_limit', value: 'native_limit' },
+        { name: 'enabled', value: 'enabled' },
+        { name: 'reset', value: 'reset' },
+      ))
+    .addStringOption(o => o.setName('value').setDescription('值：如 native / 272000 / on / default').setRequired(false)),
   new SlashCommandBuilder()
     .setName(slashName('mode'))
     .setDescription('执行模式')
@@ -365,8 +480,8 @@ const slashCommands = [
     .addStringOption(o => o.setName('label').setDescription('名字，如「cc-hub诊断」「埋点重构」').setRequired(true)),
   new SlashCommandBuilder()
     .setName(slashName('resume'))
-    .setDescription('继承一个已有的 Codex session')
-    .addStringOption(o => o.setName('session_id').setDescription('Codex session UUID').setRequired(true)),
+    .setDescription('继承一个已有的 session')
+    .addStringOption(o => o.setName('session_id').setDescription('provider session UUID').setRequired(true)),
   new SlashCommandBuilder()
     .setName(slashName('queue'))
     .setDescription('查看当前频道的任务队列状态'),
@@ -406,7 +521,7 @@ const slashCommands = [
       )),
   new SlashCommandBuilder()
     .setName(slashName('timeout'))
-    .setDescription('设置当前频道 codex timeout（ms/off/status）')
+    .setDescription('设置当前频道 runner timeout（ms/off/status）')
     .addStringOption(o => o.setName('value').setDescription('如 60000 / off / status').setRequired(true)),
   new SlashCommandBuilder()
     .setName(slashName('process_lines'))
@@ -418,7 +533,7 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName(slashName('cancel'))
     .setDescription('中断当前任务并清空排队消息'),
-];
+].filter(Boolean);
 
 async function registerSlashCommands(client) {
   try {
@@ -491,7 +606,7 @@ async function handleInteractionCreate(interaction) {
       }
 
       case 'reset': {
-        session.codexThreadId = null;
+        clearSessionId(session);
         session.configOverrides = [];
         saveDb();
         await respond('♻️ 会话已清空，下条消息新开上下文。');
@@ -500,15 +615,16 @@ async function handleInteractionCreate(interaction) {
 
       case 'sessions': {
         try {
-          const sessions = listRecentCodexSessions(10);
+          const provider = getSessionProvider(session);
+          const sessions = listRecentSessions({ provider, workspaceDir: ensureWorkspace(session, key), limit: 10 });
           if (!sessions.length) {
-            await respond({ content: '没有找到任何 Codex session。', flags: 64 });
+            await respond({ content: `没有找到任何 ${getProviderShortName(provider)} session。`, flags: 64 });
             break;
           }
 
           const lines = sessions.map((s, i) => `${i + 1}. \`${s.id}\` (${humanAge(Date.now() - s.mtime)} ago)`);
           await respond({
-            content: [`**最近 Sessions**（用 \`${slashRef('resume')}\` 继承）`, ...lines].join('\n'),
+            content: [`**最近 ${getProviderShortName(provider)} Sessions**（用 \`${slashRef('resume')}\` 继承）`, ...lines].join('\n'),
             flags: 64,
           });
         } catch (err) {
@@ -526,9 +642,33 @@ async function handleInteractionCreate(interaction) {
         }
         ensureGitRepo(resolved);
         session.workspaceDir = resolved;
-        session.codexThreadId = null;
+        clearSessionId(session);
         saveDb();
         await respond(`✅ workspace → \`${resolved}\`（会话已重置）`);
+        break;
+      }
+
+      case 'provider': {
+        if (BOT_PROVIDER) {
+          await respond({
+            content: `🔒 当前 bot 已锁定 provider = \`${BOT_PROVIDER}\` (${getProviderDisplayName(BOT_PROVIDER)})，不能在频道内切换。`,
+            flags: 64,
+          });
+          break;
+        }
+        const requested = normalizeProvider(interaction.options.getString('name'));
+        if (interaction.options.getString('name') === 'status') {
+          await respond({
+            content: `ℹ️ 当前 provider = \`${getSessionProvider(session)}\` (${getProviderDisplayName(getSessionProvider(session))})`,
+            flags: 64,
+          });
+          break;
+        }
+        const previous = getSessionProvider(session);
+        session.provider = requested;
+        clearSessionId(session);
+        saveDb();
+        await respond(`✅ provider = \`${requested}\` (${getProviderDisplayName(requested)})${previous === requested ? '' : '，已清空旧 session 绑定'}`);
         break;
       }
 
@@ -542,9 +682,59 @@ async function handleInteractionCreate(interaction) {
 
       case 'effort': {
         const level = interaction.options.getString('level');
+        const provider = getSessionProvider(session);
+        if (!isReasoningEffortSupported(provider, level)) {
+          await respond({
+            content: formatReasoningEffortUnsupported(provider, getSessionLanguage(session)),
+            flags: 64,
+          });
+          break;
+        }
         session.effort = level === 'default' ? null : level;
         saveDb();
         await respond(`✅ effort = ${session.effort || '(default)'}`);
+        break;
+      }
+
+      case 'compact': {
+        const language = getSessionLanguage(session);
+        const parsed = parseCompactConfigAction(
+          interaction.options.getString('key'),
+          interaction.options.getString('value') || '',
+        );
+        if (!parsed || parsed.type === 'invalid') {
+          await respond({
+            content: formatCompactStrategyConfigHelp(language),
+            flags: 64,
+          });
+          break;
+        }
+        if (parsed.type === 'status') {
+          await respond({
+            content: formatCompactConfigReport(language, session, false),
+            flags: 64,
+          });
+          break;
+        }
+        if (parsed.type === 'reset') {
+          session.compactStrategy = null;
+          session.compactEnabled = null;
+          session.compactThresholdTokens = null;
+          session.nativeCompactTokenLimit = null;
+        } else if (parsed.type === 'set_strategy') {
+          session.compactStrategy = parsed.strategy;
+        } else if (parsed.type === 'set_enabled') {
+          session.compactEnabled = parsed.enabled;
+        } else if (parsed.type === 'set_threshold') {
+          session.compactThresholdTokens = parsed.tokens;
+        } else if (parsed.type === 'set_native_limit') {
+          session.nativeCompactTokenLimit = parsed.tokens;
+        }
+        saveDb();
+        await respond({
+          content: formatCompactConfigReport(language, session, true),
+          flags: 64,
+        });
         break;
       }
 
@@ -558,9 +748,9 @@ async function handleInteractionCreate(interaction) {
 
       case 'resume': {
         const sid = interaction.options.getString('session_id');
-        session.codexThreadId = sid.trim();
+        setSessionId(session, sid);
         saveDb();
-        await respond(`✅ 已绑定 session: \`${session.codexThreadId}\``);
+        await respond(`✅ 已绑定 ${getProviderShortName(getSessionProvider(session))} session: \`${getSessionId(session)}\``);
         break;
       }
 
@@ -1041,6 +1231,29 @@ async function handleCommand(message, key, content) {
       break;
     }
 
+    case '!provider': {
+      if (BOT_PROVIDER) {
+        await safeReply(message, `🔒 当前 bot 已锁定 provider = \`${BOT_PROVIDER}\` (${getProviderDisplayName(BOT_PROVIDER)})，不能切换。`);
+        break;
+      }
+      if (!arg || ['status', 'state', 'show', '查看', '状态'].includes(arg.toLowerCase())) {
+        const provider = getSessionProvider(session);
+        await safeReply(message, `ℹ️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})`);
+        break;
+      }
+      const requested = parseProviderInput(arg);
+      if (!requested) {
+        await safeReply(message, '用法：`!provider <codex|claude|status>`');
+        break;
+      }
+      const previous = getSessionProvider(session);
+      session.provider = requested;
+      clearSessionId(session);
+      saveDb();
+      await safeReply(message, `✅ provider = \`${requested}\` (${getProviderDisplayName(requested)})${previous === requested ? '' : '，已清空旧 session 绑定'}`);
+      break;
+    }
+
     case '!onboarding':
     case '!onboard':
     case '!guide': {
@@ -1162,7 +1375,7 @@ async function handleCommand(message, key, content) {
       }
       ensureGitRepo(resolved);
       session.workspaceDir = resolved;
-      session.codexThreadId = null;
+      clearSessionId(session);
       saveDb();
       await safeReply(message, `✅ workspace → \`${resolved}\`\n会话已重置（新目录 = 新上下文）。`);
       break;
@@ -1170,20 +1383,21 @@ async function handleCommand(message, key, content) {
 
     case '!resume': {
       if (!arg) {
-        await safeReply(message, '用法：`!resume <codex-session-id>`\n用 `!sessions` 查看可用的 session。');
+        await safeReply(message, '用法：`!resume <session-id>`\n用 `!sessions` 查看当前 provider 可用的 session。');
         return;
       }
-      session.codexThreadId = arg.trim();
+      setSessionId(session, arg);
       saveDb();
-      await safeReply(message, `✅ 已绑定 Codex session: \`${session.codexThreadId}\`\n下条消息会 resume 这个上下文。`);
+      await safeReply(message, `✅ 已绑定 ${getProviderShortName(getSessionProvider(session))} session: \`${getSessionId(session)}\`\n下条消息会 resume 这个上下文。`);
       break;
     }
 
     case '!sessions': {
       try {
-        const sessions = listRecentCodexSessions(10);
+        const provider = getSessionProvider(session);
+        const sessions = listRecentSessions({ provider, workspaceDir: ensureWorkspace(session, key), limit: 10 });
         if (!sessions.length) {
-          await safeReply(message, '没有找到任何 Codex session。');
+          await safeReply(message, `没有找到任何 ${getProviderShortName(provider)} session。`);
           break;
         }
 
@@ -1193,7 +1407,7 @@ async function handleCommand(message, key, content) {
         });
 
         await safeReply(message, [
-          '**最近 Codex Sessions**（用 `!resume <id>` 继承）',
+          `**最近 ${getProviderShortName(provider)} Sessions**（用 \`!resume <id>\` 继承）`,
           ...lines,
         ].join('\n'));
       } catch (err) {
@@ -1218,18 +1432,54 @@ async function handleCommand(message, key, content) {
     }
 
     case '!effort': {
-      const valid = ['high', 'medium', 'low', 'default'];
-      if (!arg || !valid.includes(arg.toLowerCase())) {
-        await safeReply(message, '用法：`!effort <high|medium|low|default>`');
+      const language = getSessionLanguage(session);
+      const parsed = parseReasoningEffortInput(arg, { allowDefault: true });
+      if (!parsed) {
+        await safeReply(message, formatReasoningEffortHelp(language));
         return;
       }
-      if (arg.toLowerCase() === 'default') {
+      const provider = getSessionProvider(session);
+      if (parsed !== 'default' && !isReasoningEffortSupported(provider, parsed)) {
+        await safeReply(message, formatReasoningEffortUnsupported(provider, language));
+        return;
+      }
+      if (parsed === 'default') {
         session.effort = null;
       } else {
-        session.effort = arg.toLowerCase();
+        session.effort = parsed;
       }
       saveDb();
       await safeReply(message, `✅ reasoning effort = ${session.effort || '(default from config.toml)'}`);
+      break;
+    }
+
+    case '!compact': {
+      const language = getSessionLanguage(session);
+      const parsed = parseCompactConfigFromText(arg || 'status');
+      if (!parsed || parsed.type === 'invalid') {
+        await safeReply(message, formatCompactStrategyConfigHelp(language));
+        break;
+      }
+      if (parsed.type === 'status') {
+        await safeReply(message, formatCompactConfigReport(language, session, false));
+        break;
+      }
+      if (parsed.type === 'reset') {
+        session.compactStrategy = null;
+        session.compactEnabled = null;
+        session.compactThresholdTokens = null;
+        session.nativeCompactTokenLimit = null;
+      } else if (parsed.type === 'set_strategy') {
+        session.compactStrategy = parsed.strategy;
+      } else if (parsed.type === 'set_enabled') {
+        session.compactEnabled = parsed.enabled;
+      } else if (parsed.type === 'set_threshold') {
+        session.compactThresholdTokens = parsed.tokens;
+      } else if (parsed.type === 'set_native_limit') {
+        session.nativeCompactTokenLimit = parsed.tokens;
+      }
+      saveDb();
+      await safeReply(message, formatCompactConfigReport(language, session, true));
       break;
     }
 
@@ -1274,7 +1524,7 @@ async function handleCommand(message, key, content) {
     }
 
     case '!reset': {
-      session.codexThreadId = null;
+      clearSessionId(session);
       session.configOverrides = [];
       saveDb();
       await safeReply(message, '♻️ 已清空会话 + 额外配置。下条消息新开上下文。');
@@ -1533,72 +1783,74 @@ function formatTimeoutLabel(timeoutMs) {
 }
 
 function formatSessionStatusLabel(session) {
+  const sessionId = getSessionId(session);
   return session.name
-    ? `**${session.name}** (\`${session.codexThreadId || 'auto'}\`)`
-    : `\`${session.codexThreadId || '(auto — 下条消息新建)'}\``;
+    ? `**${session.name}** (${formatSessionIdLabel(sessionId || 'auto')})`
+    : formatSessionIdLabel(sessionId);
+}
+
+function formatPermissionsLabel(session, language = 'en') {
+  if (session.mode === 'dangerous') {
+    return language === 'en'
+      ? 'full access (--dangerously-bypass-approvals-and-sandbox)'
+      : '完全权限（--dangerously-bypass-approvals-and-sandbox）';
+  }
+  return language === 'en'
+    ? 'sandboxed (--full-auto)'
+    : '沙盒模式（--full-auto）';
 }
 
 function formatStatusReport(key, session, channel = null) {
-  const workspaceDir = ensureWorkspace(session, key);
-  const defaults = getCodexDefaults();
-  const codexHealth = getCodexCliHealth();
-  const runtime = getRuntimeSnapshot(key);
-  const security = resolveSecurityContext(channel, session);
   const language = getSessionLanguage(session);
-  const timeoutSetting = resolveTimeoutSetting(session);
-  const processLinesSetting = resolveProcessLinesSetting(session);
-  const securitySetting = getEffectiveSecurityProfile(session);
+  const lang = normalizeUiLanguage(language);
+  const provider = getSessionProvider(session);
+  const defaults = getProviderDefaults(provider);
+  const cliHealth = getCliHealth(provider);
+  const security = resolveSecurityContext(channel, session);
+  const compactSetting = resolveCompactStrategySetting(session);
+  const compactEnabled = resolveCompactEnabledSetting(session);
+  const compactThreshold = resolveCompactThresholdSetting(session);
+  const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
   const modeDesc = session.mode === 'dangerous'
-    ? 'dangerous (无沙盒, 全权限)'
-    : 'safe (沙盒隔离, 无网络)';
-  const planSummary = formatProgressPlanSummary(runtime.progressPlan);
-  const completedSummary = formatCompletedStepsSummary(runtime.completedSteps, {
-    planState: runtime.progressPlan,
-    latestStep: runtime.progressText,
-    maxSteps: 3,
-  });
-  const processLines = renderProcessContentLines(runtime.recentActivities, normalizeUiLanguage(language), processLinesSetting.lines);
+    ? (lang === 'en' ? 'dangerous (no sandbox, full access)' : 'dangerous（无沙盒，全权限）')
+    : (lang === 'en' ? 'safe (sandboxed, no network)' : 'safe（沙盒隔离，无网络）');
+
+  if (lang === 'en') {
+    return [
+      '🧭 **Current Status**',
+      `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
+      `• model: ${session.model || `${defaults.model} _(config.toml)_`}`,
+      `• mode: ${modeDesc}`,
+      `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
+      `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)} (${formatSettingSourceLabel(compactSetting.source, lang)})`,
+      `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'} (${formatSettingSourceLabel(compactEnabled.source, lang)})`,
+      `• compact token limit: ${compactThreshold.tokens} (${formatSettingSourceLabel(compactThreshold.source, lang)})`,
+      `• native compact limit: ${nativeLimit.tokens} (${formatSettingSourceLabel(nativeLimit.source, lang)})`,
+      `• ui language: ${formatLanguageLabel(language)}`,
+      `• permissions: ${formatPermissionsLabel(session, lang)}`,
+      `• cli: ${formatCliHealth(cliHealth, lang)}`,
+      `• session: ${formatSessionStatusLabel(session)}`,
+      `• last input tokens: ${formatTokenValue(session.lastInputTokens)}`,
+      `• security profile: ${formatSecurityProfileDisplay(security, lang)}`,
+    ].filter(Boolean).join('\n');
+  }
 
   return [
-    '🧭 **当前配置**',
-    `• channel id: \`${key}\``,
-    channel?.name ? `• channel: ${channel.name}` : null,
-    `• workspace: \`${workspaceDir}\``,
-    `• mode: ${modeDesc}`,
+    '🧭 **当前状态**',
+    `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
     `• model: ${session.model || `${defaults.model} _(config.toml)_`}`,
+    `• mode: ${modeDesc}`,
     `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
-    `• codex-cli: ${formatCodexHealth(codexHealth)}`,
+    `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)}（${formatSettingSourceLabel(compactSetting.source, lang)}）`,
+    `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'}（${formatSettingSourceLabel(compactEnabled.source, lang)}）`,
+    `• compact token limit: ${compactThreshold.tokens}（${formatSettingSourceLabel(compactThreshold.source, lang)}）`,
+    `• native compact limit: ${nativeLimit.tokens}（${formatSettingSourceLabel(nativeLimit.source, lang)}）`,
+    `• 界面语言: ${formatLanguageLabel(language)}`,
+    `• 权限: ${formatPermissionsLabel(session, lang)}`,
+    `• CLI: ${formatCliHealth(cliHealth, lang)}`,
     `• session: ${formatSessionStatusLabel(session)}`,
-    `• last input tokens: ${formatTokenValue(session.lastInputTokens)}`,
-    `• runtime: ${formatRuntimeLabel(runtime)}`,
-    `• queued prompts: ${runtime.queued}`,
-    `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
-    `• progress events: ${runtime.progressEvents}`,
-    runtime.progressText ? `• latest activity: ${runtime.progressText}` : null,
-    ...processLines,
-    planSummary ? `• plan: ${planSummary}` : null,
-    completedSummary ? `• completed milestones: ${completedSummary}` : null,
-    runtime.progressAgoMs !== null ? `• progress updated: ${humanAge(runtime.progressAgoMs)} ago` : null,
-    runtime.messageId ? `• active message id: \`${runtime.messageId}\`` : null,
-    runtime.progressMessageId ? `• progress message id: \`${runtime.progressMessageId}\`` : null,
-    `• security profile: ${formatSecurityProfileDisplay(security)}`,
-    `• profile setting: ${formatSecurityProfileLabel(securitySetting.profile)} (${securitySetting.source})`,
-    `• mention only: ${security.mentionOnly ? 'on' : 'off'}`,
-    `• ui language: ${formatLanguageLabel(language)}`,
-    `• onboarding: ${isOnboardingEnabled(session) ? 'on' : 'off'}`,
-    `• !config: ${formatConfigCommandStatus()}`,
-    `• config allowlist: ${describeConfigPolicy()}`,
-    `• codex timeout: ${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`,
-    `• process window: ${processLinesSetting.lines} lines (${processLinesSetting.source})`,
-    `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
-    `• compact trigger: ${COMPACT_ON_THRESHOLD ? 'on' : 'off'}`,
-    `• compact threshold: ${MAX_INPUT_TOKENS_BEFORE_COMPACT}`,
-    COMPACT_STRATEGY === 'native' && COMPACT_ON_THRESHOLD
-      ? `• native auto compact limit: ${MODEL_AUTO_COMPACT_TOKEN_LIMIT} (model_auto_compact_token_limit)`
-      : null,
-    session.configOverrides?.length ? `• extra config: ${session.configOverrides.join(', ')}` : null,
-    `• bot pid: ${process.pid}`,
-    `• bot uptime: ${humanAge(Math.max(0, Math.floor(process.uptime() * 1000)))}`,
+    `• 最近输入 tokens: ${formatTokenValue(session.lastInputTokens)}`,
+    `• security profile: ${formatSecurityProfileDisplay(security, lang)}`,
   ].filter(Boolean).join('\n');
 }
 
@@ -1705,13 +1957,20 @@ function formatCancelReport(outcome) {
 
 function formatDoctorReport(key, session = null, channel = null) {
   const runtime = getRuntimeSnapshot(key);
-  const codexHealth = getCodexCliHealth();
+  const provider = getSessionProvider(session);
+  const cliHealth = getCliHealth(provider);
   const security = resolveSecurityContext(channel, session);
   const timeoutSetting = resolveTimeoutSetting(session);
   const securitySetting = getEffectiveSecurityProfile(session);
+  const compactSetting = resolveCompactStrategySetting(session);
+  const compactEnabled = resolveCompactEnabledSetting(session);
+  const compactThreshold = resolveCompactThresholdSetting(session);
+  const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
   return [
     '🩺 **Bot Doctor**',
-    `• codex-cli: ${formatCodexHealth(codexHealth)}`,
+    `• bot mode: ${formatBotModeLabel()}`,
+    `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
+    `• cli: ${formatCliHealth(cliHealth)}`,
     `• runtime: ${formatRuntimeLabel(runtime)}`,
     `• queued prompts: ${runtime.queued}`,
     `• security profile: ${formatSecurityProfileDisplay(security)}`,
@@ -1722,8 +1981,11 @@ function formatDoctorReport(key, session = null, channel = null) {
     `• config allowlist: ${describeConfigPolicy()}`,
     `• ALLOWED_CHANNEL_IDS: ${ALLOWED_CHANNEL_IDS ? `${ALLOWED_CHANNEL_IDS.size} configured` : '(all channels)'}`,
     `• ALLOWED_USER_IDS: ${ALLOWED_USER_IDS ? `${ALLOWED_USER_IDS.size} configured` : '(all users)'}`,
-    `• codex timeout: ${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`,
-    `• compact strategy: ${describeCompactStrategy(COMPACT_STRATEGY)}`,
+    `• runner timeout: ${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`,
+    `• compact strategy: ${describeCompactStrategy(compactSetting.strategy)} (${compactSetting.source})`,
+    `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'} (${compactEnabled.source})`,
+    `• compact token limit: ${compactThreshold.tokens} (${compactThreshold.source})`,
+    `• native compact limit: ${nativeLimit.tokens} (${nativeLimit.source})`,
   ].join('\n');
 }
 
@@ -1813,6 +2075,224 @@ function parseTimeoutConfigAction(value) {
   if (!/^\d+$/.test(raw)) return { type: 'invalid' };
   const timeoutMs = normalizeTimeoutMs(Number(raw), 0);
   return { type: 'set', timeoutMs };
+}
+
+function normalizeSessionCompactStrategy(value) {
+  const normalized = normalizeCompactStrategy(value || '');
+  return value === null || value === undefined || value === '' ? null : normalized;
+}
+
+function normalizeSessionCompactTokenLimit(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+
+function normalizeSessionCompactEnabled(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'boolean') return value;
+  const raw = String(value).trim().toLowerCase();
+  if (['1', 'true', 'on', 'enable', 'enabled', 'yes', '开启', '启用', '打开'].includes(raw)) return true;
+  if (['0', 'false', 'off', 'disable', 'disabled', 'no', '关闭', '禁用'].includes(raw)) return false;
+  return null;
+}
+
+function resolveCompactStrategySetting(session) {
+  const sessionStrategy = normalizeSessionCompactStrategy(session?.compactStrategy);
+  if (sessionStrategy) {
+    return { strategy: sessionStrategy, source: 'session override' };
+  }
+  return { strategy: COMPACT_STRATEGY, source: 'env default' };
+}
+
+function resolveCompactEnabledSetting(session) {
+  const enabled = normalizeSessionCompactEnabled(session?.compactEnabled);
+  if (enabled !== null) {
+    return { enabled, source: 'session override' };
+  }
+  return { enabled: COMPACT_ON_THRESHOLD, source: 'env default' };
+}
+
+function resolveCompactThresholdSetting(session) {
+  const tokens = normalizeSessionCompactTokenLimit(session?.compactThresholdTokens);
+  if (tokens !== null) {
+    return { tokens, source: 'session override' };
+  }
+  return { tokens: MAX_INPUT_TOKENS_BEFORE_COMPACT, source: 'env default' };
+}
+
+function resolveNativeCompactTokenLimitSetting(session) {
+  const direct = normalizeSessionCompactTokenLimit(session?.nativeCompactTokenLimit);
+  if (direct !== null) {
+    return { tokens: direct, source: 'session override' };
+  }
+
+  const threshold = normalizeSessionCompactTokenLimit(session?.compactThresholdTokens);
+  if (threshold !== null) {
+    return { tokens: threshold, source: 'session threshold fallback' };
+  }
+
+  return { tokens: MODEL_AUTO_COMPACT_TOKEN_LIMIT, source: 'env default' };
+}
+
+function parseCompactStrategyAction(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['status', 'show', 'state', '查看', '状态'].includes(raw)) return { type: 'status' };
+  if (['hard', 'native', 'off'].includes(raw)) return { type: 'set', strategy: raw };
+  return { type: 'invalid' };
+}
+
+function parseCompactEnabledAction(value) {
+  const enabled = normalizeSessionCompactEnabled(value);
+  if (enabled === null) return { type: 'invalid' };
+  return { type: 'set', enabled };
+}
+
+function parseCompactTokenLimitAction(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['default', 'reset', 'inherit', 'clear', '跟随默认', '清除'].includes(raw)) {
+    return { type: 'set', tokens: null };
+  }
+  if (!/^\d+$/.test(raw)) return { type: 'invalid' };
+  const tokens = normalizeSessionCompactTokenLimit(Number(raw));
+  if (tokens === null) return { type: 'invalid' };
+  return { type: 'set', tokens };
+}
+
+function parseCompactConfigAction(key, value = '') {
+  const normalizedKey = String(key || '').trim().toLowerCase();
+  const normalizedValue = String(value || '').trim();
+
+  if (!normalizedKey || normalizedKey === 'status') {
+    return { type: 'status' };
+  }
+
+  if (['hard', 'native', 'off'].includes(normalizedKey)) {
+    return { type: 'set_strategy', strategy: normalizedKey };
+  }
+
+  if (normalizedKey === 'reset') {
+    return { type: 'reset' };
+  }
+
+  if (normalizedKey === 'strategy') {
+    const parsed = parseCompactStrategyAction(normalizedValue);
+    if (!parsed || parsed.type !== 'set') return { type: 'invalid' };
+    return { type: 'set_strategy', strategy: parsed.strategy };
+  }
+
+  if (['token_limit', 'threshold', 'threshold_tokens', 'limit'].includes(normalizedKey)) {
+    const parsed = parseCompactTokenLimitAction(normalizedValue);
+    if (!parsed || parsed.type !== 'set') return { type: 'invalid' };
+    return { type: 'set_threshold', tokens: parsed.tokens };
+  }
+
+  if (['native_limit', 'native_token_limit', 'model_auto_compact_token_limit'].includes(normalizedKey)) {
+    const parsed = parseCompactTokenLimitAction(normalizedValue);
+    if (!parsed || parsed.type !== 'set') return { type: 'invalid' };
+    return { type: 'set_native_limit', tokens: parsed.tokens };
+  }
+
+  if (['enabled', 'on_threshold', 'auto'].includes(normalizedKey)) {
+    const parsed = parseCompactEnabledAction(normalizedValue);
+    if (!parsed || parsed.type !== 'set') return { type: 'invalid' };
+    return { type: 'set_enabled', enabled: parsed.enabled };
+  }
+
+  return { type: 'invalid' };
+}
+
+function parseCompactConfigFromText(arg = '') {
+  const parts = String(arg || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return { type: 'status' };
+  if (parts.length === 1) return parseCompactConfigAction(parts[0], '');
+  return parseCompactConfigAction(parts[0], parts.slice(1).join(' '));
+}
+
+function formatCompactStrategyConfigHelp(language) {
+  if (language === 'en') {
+    return [
+      'Usage: `!compact <status|strategy|token_limit|native_limit|enabled|reset> [value]`',
+      `Slash: \`${slashRef('compact')} key:<...> value:<...>\``,
+      'Examples: `!compact strategy native`, `!compact token_limit 272000`, `!compact enabled on`',
+      'Note: compact settings only affect Codex CLI.',
+    ].join('\n');
+  }
+  return [
+    '用法：`!compact <status|strategy|token_limit|native_limit|enabled|reset> [value]`',
+    `Slash：\`${slashRef('compact')} key:<...> value:<...>\``,
+    '示例：`!compact strategy native`、`!compact token_limit 272000`、`!compact enabled on`',
+    '说明：compact 配置仅对 Codex CLI 生效。',
+  ].join('\n');
+}
+
+function formatCompactConfigReport(language, session, changed = false) {
+  const strategy = resolveCompactStrategySetting(session);
+  const enabled = resolveCompactEnabledSetting(session);
+  const threshold = resolveCompactThresholdSetting(session);
+  const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
+
+  if (language === 'en') {
+    return [
+      changed ? '✅ Compact config updated' : 'ℹ️ Compact config',
+      `• strategy: ${describeCompactStrategy(strategy.strategy, language)} (${formatSettingSourceLabel(strategy.source, language)})`,
+      `• enabled: ${enabled.enabled ? 'on' : 'off'} (${formatSettingSourceLabel(enabled.source, language)})`,
+      `• token limit: ${threshold.tokens} (${formatSettingSourceLabel(threshold.source, language)})`,
+      `• native limit: ${nativeLimit.tokens} (${formatSettingSourceLabel(nativeLimit.source, language)})`,
+      '• note: native compaction is handled inside Codex CLI; the bot does not currently emit a guaranteed per-compact notification.',
+    ].join('\n');
+  }
+  return [
+    changed ? '✅ compact 配置已更新' : 'ℹ️ 当前 compact 配置',
+    `• strategy: ${describeCompactStrategy(strategy.strategy, language)}（${formatSettingSourceLabel(strategy.source, language)}）`,
+    `• enabled: ${enabled.enabled ? 'on' : 'off'}（${formatSettingSourceLabel(enabled.source, language)}）`,
+    `• token limit: ${threshold.tokens}（${formatSettingSourceLabel(threshold.source, language)}）`,
+    `• native limit: ${nativeLimit.tokens}（${formatSettingSourceLabel(nativeLimit.source, language)}）`,
+    '• 说明：native 压缩发生在 Codex CLI 内部，bot 目前拿不到稳定的“本次刚压缩完成”通知。',
+  ].join('\n');
+}
+
+function parseReasoningEffortInput(value, { allowDefault = false } = {}) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (allowDefault && raw === 'default') return 'default';
+  if (['low', 'medium', 'high', 'xhigh'].includes(raw)) return raw;
+  return null;
+}
+
+function isReasoningEffortSupported(provider, effort) {
+  if (!effort) return true;
+  if (normalizeProvider(provider) === 'claude' && effort === 'xhigh') return false;
+  return true;
+}
+
+function formatReasoningEffortHelp(language) {
+  return language === 'en'
+    ? 'Usage: `!effort <xhigh|high|medium|low|default>`'
+    : '用法：`!effort <xhigh|high|medium|low|default>`';
+}
+
+function formatReasoningEffortUnsupported(provider, language) {
+  if (language === 'en') {
+    return `⚠️ \`xhigh\` is currently only supported for Codex CLI. Current provider: ${getProviderDisplayName(provider)}.`;
+  }
+  return `⚠️ \`xhigh\` 目前仅支持 Codex CLI。当前 provider：${getProviderDisplayName(provider)}。`;
+}
+
+function formatSettingSourceLabel(source, language = 'en') {
+  if (source === 'session override') {
+    return language === 'en' ? 'session override' : '频道覆盖';
+  }
+  if (source === 'session threshold fallback') {
+    return language === 'en' ? 'threshold fallback' : '阈值回退';
+  }
+  if (source === 'env default') {
+    return language === 'en' ? 'env default' : '环境默认';
+  }
+  return source || (language === 'en' ? 'unknown' : '未知');
 }
 
 function parseProcessLinesConfigAction(value) {
@@ -1994,6 +2474,10 @@ function formatHelpReport(session) {
     return [
       '**📋 Commands**',
       '',
+      BOT_PROVIDER
+        ? `Bot mode: locked to ${getProviderDisplayName(BOT_PROVIDER)}`
+        : 'Bot mode: shared (use `!provider` / `/provider` to switch per channel)',
+      '',
       '**Session**',
       '• `!status` — current config snapshot',
       '• `!queue` — queue status in current channel',
@@ -2003,13 +2487,14 @@ function formatHelpReport(session) {
       `• \`${slashRef('onboarding_config')} <on|off|status>\` / \`!onboarding <on|off|status>\` — onboarding switch`,
       `• \`${slashRef('language')} <中文|English>\` / \`!lang <zh|en>\` — message language`,
       `• \`${slashRef('profile')} <auto|solo|team|public|status>\` / \`!profile <...|status>\` — channel security profile`,
-      `• \`${slashRef('timeout')} <ms|off|status>\` / \`!timeout <...>\` — codex timeout`,
+      `• \`${slashRef('timeout')} <ms|off|status>\` / \`!timeout <...>\` — runner timeout`,
       `• \`${slashRef('process_lines')} <1-5|status>\` / \`!processlines <...>\` — process content window lines`,
       '• `!progress` — current run progress',
       '• `!abort` / `!cancel` / `!stop` — stop running task and clear queue',
       '• `!reset` — clear session context',
-      '• `!resume <session_id>` — bind existing Codex session',
-      '• `!sessions` — list recent Codex sessions',
+      '• `!resume <session_id>` — bind existing provider session',
+      '• `!sessions` — list recent provider sessions',
+      !BOT_PROVIDER ? '• `!provider <codex|claude|status>` — switch provider for current channel' : null,
       '',
       '**Workspace**',
       '• `!setdir <path>` — set workspace (resets session)',
@@ -2017,15 +2502,20 @@ function formatHelpReport(session) {
       '',
       '**Model & Runtime**',
       '• `!model <name|default>` — set model override',
-      '• `!effort <high|medium|low|default>` — reasoning effort',
+      '• `!effort <xhigh|high|medium|low|default>` — reasoning effort',
+      `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — compact config (Codex only)`,
       '• `!mode <safe|dangerous>` — execution mode',
-      '• `!config <key=value>` — append codex `-c` config (when enabled + allowlisted)',
+      '• `!config <key=value>` — append provider config override (Codex only; when enabled + allowlisted)',
       '',
-      'Normal messages are forwarded to Codex.',
-    ].join('\n');
+      'Normal messages are forwarded to the current provider.',
+    ].filter(Boolean).join('\n');
   }
   return [
     '**📋 命令列表**',
+    '',
+    BOT_PROVIDER
+      ? `Bot 模式：已锁定到 ${getProviderDisplayName(BOT_PROVIDER)}`
+      : 'Bot 模式：共享实例（可用 `!provider` / `/provider` 按频道切换）',
     '',
     '**会话管理**',
     '• `!status` — 当前配置一览',
@@ -2036,13 +2526,14 @@ function formatHelpReport(session) {
     `• \`${slashRef('onboarding_config')} <on|off|status>\` / \`!onboarding <on|off|status>\` — onboarding 开关`,
     `• \`${slashRef('language')} <中文|English>\` / \`!lang <zh|en>\` — 消息提示语言`,
     `• \`${slashRef('profile')} <auto|solo|team|public|status>\` / \`!profile <...|status>\` — 当前频道 security profile`,
-    `• \`${slashRef('timeout')} <毫秒|off|status>\` / \`!timeout <...>\` — Codex 超时`,
+    `• \`${slashRef('timeout')} <毫秒|off|status>\` / \`!timeout <...>\` — runner 超时`,
     `• \`${slashRef('process_lines')} <1-5|status>\` / \`!processlines <...>\` — 过程内容窗口行数`,
     '• `!progress` — 查看当前任务的最新进度',
     '• `!abort` / `!cancel` / `!stop` — 中断当前任务并清空队列',
     '• `!reset` — 清空会话，下条消息新开上下文',
-    '• `!resume <session_id>` — 继承一个已有的 Codex session',
-    '• `!sessions` — 列出最近的 Codex sessions（从 ~/.codex/sessions/）',
+    '• `!resume <session_id>` — 继承一个已有的 provider session',
+    '• `!sessions` — 列出最近的 provider sessions',
+    !BOT_PROVIDER ? '• `!provider <codex|claude|status>` — 切换当前频道 provider' : null,
     '',
     '**工作目录**',
     '• `!setdir <path>` — 设置工作目录（会清空旧会话）',
@@ -2050,23 +2541,24 @@ function formatHelpReport(session) {
     '',
     '**模型 & 执行**',
     '• `!model <name|default>` — 切换模型（如 gpt-5.3-codex, o3）',
-    '• `!effort <high|medium|low|default>` — reasoning effort',
+    '• `!effort <xhigh|high|medium|low|default>` — reasoning effort',
+    `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — compact 配置（仅 Codex）`,
     '• `!mode <safe|dangerous>` — 执行模式',
-    '• `!config <key=value>` — 添加 codex -c 配置（需 ENABLE_CONFIG_CMD=true 且 key 在白名单）',
+    '• `!config <key=value>` — 添加 provider 配置覆盖（当前仅 Codex 支持；需 ENABLE_CONFIG_CMD=true 且 key 在白名单）',
     '',
-    '普通消息直接转给 Codex。',
-  ].join('\n');
+    '普通消息直接转给当前 provider。',
+  ].filter(Boolean).join('\n');
 }
 
 function getOnboardingSnapshot(key, session = null, channel = null, language = DEFAULT_UI_LANGUAGE) {
+  const provider = getSessionProvider(session);
   const runtime = getRuntimeSnapshot(key);
-  const codexHealth = getCodexCliHealth();
+  const cliHealth = getCliHealth(provider);
   const security = resolveSecurityContext(channel, session);
   const profileSetting = getEffectiveSecurityProfile(session);
   const timeoutSetting = resolveTimeoutSetting(session);
   const currentLanguage = getSessionLanguage(session);
   const hasToken = Boolean(DISCORD_TOKEN);
-  const hasApiKey = Boolean(String(process.env.OPENAI_API_KEY || '').trim());
   const hasWorkspace = Boolean(String(WORKSPACE_ROOT || '').trim());
   const lang = normalizeUiLanguage(language);
   const mentionHint = security.mentionOnly
@@ -2084,15 +2576,15 @@ function getOnboardingSnapshot(key, session = null, channel = null, language = D
       ? 'Send `check current directory and create a TODO`'
       : '发送 `帮我检查当前目录并创建一个 TODO`');
   return {
+    provider,
     language: lang,
     runtime,
-    codexHealth,
+    cliHealth,
     security,
     profileSetting,
     timeoutSetting,
     currentLanguage,
     hasToken,
-    hasApiKey,
     hasWorkspace,
     mentionHint,
     firstPromptHint,
@@ -2109,9 +2601,8 @@ function formatOnboardingReport(key, session = null, channel = null, language = 
       '',
       '**1) Preflight check**',
       `• DISCORD_TOKEN: ${snapshot.hasToken ? '✅ loaded' : '❌ missing'}`,
-      `• OPENAI_API_KEY: ${snapshot.hasApiKey ? '✅ loaded' : '⚠️ missing/unused (depends on your provider)'}`,
       `• WORKSPACE_ROOT: ${snapshot.hasWorkspace ? `✅ \`${WORKSPACE_ROOT}\`` : '❌ missing'}`,
-      `• codex-cli: ${formatCodexHealth(snapshot.codexHealth)}`,
+      `• cli: ${formatCliHealth(snapshot.cliHealth)}`,
       `• ui language: ${formatLanguageLabel(snapshot.currentLanguage)}`,
       `• profile setting: ${formatSecurityProfileLabel(snapshot.profileSetting.profile)} (${snapshot.profileSetting.source})`,
       `• timeout setting: ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)} (${snapshot.timeoutSetting.source})`,
@@ -2146,9 +2637,8 @@ function formatOnboardingReport(key, session = null, channel = null, language = 
     '',
     '**1) 安装自检（先看当前是否可跑）**',
     `• DISCORD_TOKEN: ${snapshot.hasToken ? '✅ loaded' : '❌ missing'}`,
-    `• OPENAI_API_KEY: ${snapshot.hasApiKey ? '✅ loaded' : '⚠️ missing/unused (按 provider 需要配置)'}`,
     `• WORKSPACE_ROOT: ${snapshot.hasWorkspace ? `✅ \`${WORKSPACE_ROOT}\`` : '❌ missing'}`,
-    `• codex-cli: ${formatCodexHealth(snapshot.codexHealth)}`,
+    `• cli: ${formatCliHealth(snapshot.cliHealth)}`,
     `• ui language: ${formatLanguageLabel(snapshot.currentLanguage)}`,
     `• profile setting: ${formatSecurityProfileLabel(snapshot.profileSetting.profile)}（${snapshot.profileSetting.source}）`,
     `• timeout setting: ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)}（${snapshot.timeoutSetting.source}）`,
@@ -2302,9 +2792,8 @@ function formatOnboardingStepReport(step, key, session = null, channel = null, l
         return [
           '🧭 **Onboarding 1/4: Preflight + Language**',
           `• DISCORD_TOKEN: ${snapshot.hasToken ? '✅ loaded' : '❌ missing'}`,
-          `• OPENAI_API_KEY: ${snapshot.hasApiKey ? '✅ loaded' : '⚠️ missing/unused (depends on your provider)'}`,
           `• WORKSPACE_ROOT: ${snapshot.hasWorkspace ? `✅ \`${WORKSPACE_ROOT}\`` : '❌ missing'}`,
-          `• codex-cli: ${formatCodexHealth(snapshot.codexHealth)}`,
+          `• cli: ${formatCliHealth(snapshot.cliHealth)}`,
           `• ui language (current): ${formatLanguageLabel(snapshot.currentLanguage)}`,
           '',
           'Choose language with buttons, then click "Next".',
@@ -2325,7 +2814,7 @@ function formatOnboardingStepReport(step, key, session = null, channel = null, l
       case 3:
         return [
           '🧭 **Onboarding 3/4: Timeout**',
-          `• codex timeout (current): ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)} (${snapshot.timeoutSetting.source})`,
+          `• runner timeout (current): ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)} (${snapshot.timeoutSetting.source})`,
           `• quick presets: off / 30s / 60s / 120s`,
           `• custom value: \`${slashRef('timeout')} <ms|off|status>\` or \`!timeout <ms|off|status>\``,
           '',
@@ -2352,9 +2841,8 @@ function formatOnboardingStepReport(step, key, session = null, channel = null, l
       return [
         '🧭 **Onboarding 1/4：安装自检 + 语言设置**',
         `• DISCORD_TOKEN: ${snapshot.hasToken ? '✅ loaded' : '❌ missing'}`,
-        `• OPENAI_API_KEY: ${snapshot.hasApiKey ? '✅ loaded' : '⚠️ missing/unused (按 provider 需要配置)'}`,
         `• WORKSPACE_ROOT: ${snapshot.hasWorkspace ? `✅ \`${WORKSPACE_ROOT}\`` : '❌ missing'}`,
-        `• codex-cli: ${formatCodexHealth(snapshot.codexHealth)}`,
+        `• cli: ${formatCliHealth(snapshot.cliHealth)}`,
         `• ui language（当前）：${formatLanguageLabel(snapshot.currentLanguage)}`,
         '',
         '请用按钮选择语言，然后点「下一步」。',
@@ -2375,7 +2863,7 @@ function formatOnboardingStepReport(step, key, session = null, channel = null, l
     case 3:
       return [
         '🧭 **Onboarding 3/4：超时设置**',
-        `• codex timeout（当前）：${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)}（${snapshot.timeoutSetting.source}）`,
+        `• runner timeout（当前）：${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)}（${snapshot.timeoutSetting.source}）`,
         '• 快捷预设：off / 30s / 60s / 120s',
         `• 自定义值：\`${slashRef('timeout')} <毫秒|off|status>\` 或 \`!timeout <毫秒|off|status>\``,
         '',
@@ -2407,7 +2895,7 @@ function formatOnboardingDoneReport(key, session = null, channel = null, languag
       `• mention only: ${snapshot.security.mentionOnly ? 'on' : 'off'}`,
       `• queue limit: ${formatQueueLimit(snapshot.security.maxQueuePerChannel)}`,
       `• ui language: ${formatLanguageLabel(snapshot.currentLanguage)}`,
-      `• codex timeout: ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)} (${snapshot.timeoutSetting.source})`,
+      `• runner timeout: ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)} (${snapshot.timeoutSetting.source})`,
       '',
       `You can use: \`${slashRef('doctor')}\`, \`${slashRef('status')}\`, \`${slashRef('queue')}\``,
     ].join('\n');
@@ -2418,7 +2906,7 @@ function formatOnboardingDoneReport(key, session = null, channel = null, languag
     `• mention only: ${snapshot.security.mentionOnly ? 'on' : 'off'}`,
     `• queue limit: ${formatQueueLimit(snapshot.security.maxQueuePerChannel)}`,
     `• ui language: ${formatLanguageLabel(snapshot.currentLanguage)}`,
-    `• codex timeout: ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)}（${snapshot.timeoutSetting.source}）`,
+    `• runner timeout: ${formatTimeoutLabel(snapshot.timeoutSetting.timeoutMs)}（${snapshot.timeoutSetting.source}）`,
     '',
     `后续可直接使用：\`${slashRef('doctor')}\`、\`${slashRef('status')}\`、\`${slashRef('queue')}\``,
   ].join('\n');
@@ -2512,8 +3000,8 @@ function createProgressReporter({
   let lastRendered = '';
   let events = 0;
   let latestStep = lang === 'en'
-    ? 'Task started, waiting for the first Codex event...'
-    : '任务已开始，等待 Codex 首个事件...';
+    ? 'Task started, waiting for the first event...'
+    : '任务已开始，等待首个事件...';
   let planState = cloneProgressPlan(channelState.activeRun?.progressPlan);
   const completedSteps = Array.isArray(channelState.activeRun?.completedSteps)
     ? [...channelState.activeRun.completedSteps]
@@ -2868,7 +3356,7 @@ async function handlePrompt(message, key, prompt, channelState) {
     let promptToRun = prompt;
     const preNotes = [];
     if (shouldCompactSession(session)) {
-      const previousThreadId = session.codexThreadId;
+      const previousThreadId = getSessionId(session);
       const compacted = await compactSessionContext({
         session,
         workspaceDir,
@@ -2881,12 +3369,12 @@ async function handlePrompt(message, key, prompt, channelState) {
         onLog: progress?.onLog,
       });
       if (compacted.ok && compacted.summary) {
-        session.codexThreadId = null;
+        clearSessionId(session);
         saveDb();
         promptToRun = buildPromptFromCompactedContext(compacted.summary, prompt);
         preNotes.push(`上下文输入 token=${session.lastInputTokens}，已自动压缩并切换新会话（旧 session: ${previousThreadId}）。`);
       } else {
-        session.codexThreadId = null;
+        clearSessionId(session);
         saveDb();
         preNotes.push(`上下文输入 token=${session.lastInputTokens}，自动压缩失败，已回退 reset（旧 session: ${previousThreadId}）。`);
         if (compacted.error) preNotes.push(`压缩失败原因：${compacted.error}`);
@@ -2915,9 +3403,9 @@ async function handlePrompt(message, key, prompt, channelState) {
     }
 
     // If resume failed, auto-reset once and retry fresh session.
-    if (!result.ok && session.codexThreadId && !result.cancelled && !result.timedOut) {
-      const previous = session.codexThreadId;
-      session.codexThreadId = null;
+    if (!result.ok && getSessionId(session) && !result.cancelled && !result.timedOut) {
+      const previous = getSessionId(session);
+      clearSessionId(session);
       saveDb();
       result = await runCodex({
         session,
@@ -2939,7 +3427,7 @@ async function handlePrompt(message, key, prompt, channelState) {
     const inputTokens = extractInputTokensFromUsage(result.usage);
     let sessionDirty = false;
     if (result.threadId) {
-      session.codexThreadId = result.threadId;
+      setSessionId(session, result.threadId);
       sessionDirty = true;
     }
     if (inputTokens !== null) {
@@ -2957,18 +3445,19 @@ async function handlePrompt(message, key, prompt, channelState) {
         return { ok: false, cancelled: true };
       }
 
-      const codexMissing = isCodexNotFound(result.error);
+      const provider = getSessionProvider(session);
+      const cliMissing = isCliNotFound(result.error);
       const timeoutSetting = resolveTimeoutSetting(session);
       const failText = [
-        result.timedOut ? '❌ Codex 执行超时' : '❌ Codex 执行失败',
+        result.timedOut ? `❌ ${getProviderShortName(provider)} 执行超时` : `❌ ${getProviderShortName(provider)} 执行失败`,
         result.error ? `• error: ${result.error}` : null,
         result.logs.length ? `• logs: ${truncate(result.logs.join('\n'), 1200)}` : null,
         result.timedOut
           ? `• 处理: 可用 \`${slashRef('timeout')} <ms|off|status>\` 或 \`!timeout <ms|off|status>\` 调整本频道超时。当前: ${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`
           : null,
-        codexMissing ? '• 诊断: 当前环境找不到 Codex CLI 可执行文件。' : null,
-        codexMissing ? '• 处理: 在该设备安装 codex，或在 .env 配置 `CODEX_BIN=/绝对路径/codex`，然后重启 bot。' : null,
-        codexMissing ? `• 自检: 用 \`${slashRef('status')}\` 或 \`!status\` 查看 codex-cli 状态。` : null,
+        cliMissing ? `• 诊断: 当前环境找不到 ${getProviderDisplayName(provider)} CLI 可执行文件。` : null,
+        cliMissing ? `• 处理: 在该设备安装 ${getProviderDefaultBin(provider)}，或在 .env 配置 \`${getProviderBinEnvName(provider)}=/绝对路径/${getProviderDefaultBin(provider)}\`，然后重启 bot。` : null,
+        cliMissing ? `• 自检: 用 \`${slashRef('status')}\` 或 \`!status\` 查看 CLI 状态。` : null,
         '',
         `可以先 \`${slashRef('reset')}\` 再重试，或 \`${slashRef('status')}\` 看状态。`,
       ].filter(Boolean).join('\n');
@@ -2976,7 +3465,7 @@ async function handlePrompt(message, key, prompt, channelState) {
         ok: false,
         cancelled: false,
         timedOut: Boolean(result.timedOut),
-        error: result.error || 'codex run failed',
+        error: result.error || `${getSessionProvider(session)} run failed`,
       };
       await safeReply(message, failText);
       return { ok: false, cancelled: false };
@@ -3011,17 +3500,20 @@ async function handlePrompt(message, key, prompt, channelState) {
 }
 
 function shouldCompactSession(session) {
-  if (!COMPACT_ON_THRESHOLD) return false;
-  if (COMPACT_STRATEGY !== 'hard') return false;
-  if (!session?.codexThreadId) return false;
+  const compactSetting = resolveCompactStrategySetting(session);
+  const enabledSetting = resolveCompactEnabledSetting(session);
+  const thresholdSetting = resolveCompactThresholdSetting(session);
+  if (!enabledSetting.enabled) return false;
+  if (compactSetting.strategy !== 'hard') return false;
+  if (!getSessionId(session)) return false;
   const last = toOptionalInt(session.lastInputTokens);
   if (!Number.isFinite(last)) return false;
-  return last >= MAX_INPUT_TOKENS_BEFORE_COMPACT;
+  return last >= thresholdSetting.tokens;
 }
 
 async function compactSessionContext({ session, workspaceDir, onSpawn, wasCancelled, onEvent, onLog }) {
-  if (!session?.codexThreadId) {
-    return { ok: false, summary: '', error: 'missing codex session id' };
+  if (!getSessionId(session)) {
+    return { ok: false, summary: '', error: 'missing session id' };
   }
 
   const compactPrompt = [
@@ -3074,12 +3566,14 @@ async function runCodex({ session, workspaceDir, prompt, onSpawn, wasCancelled, 
   ensureDir(workspaceDir);
   ensureGitRepo(workspaceDir);
 
+  const provider = getSessionProvider(session);
   const notes = [];
-  const args = buildCodexArgs({ session, workspaceDir, prompt });
+  const args = buildRunnerArgs({ provider, session, workspaceDir, prompt });
   const timeoutMs = resolveTimeoutSetting(session).timeoutMs;
+  const bin = getProviderBin(provider);
 
   if (DEBUG_EVENTS) {
-    console.log('Running codex:', [CODEX_BIN, ...args].join(' '));
+    console.log(`Running ${provider}:`, [bin, ...args].join(' '));
   }
 
   const {
@@ -3095,7 +3589,7 @@ async function runCodex({ session, workspaceDir, prompt, onSpawn, wasCancelled, 
     error,
     timedOut,
     cancelled,
-  } = await spawnCodex(args, workspaceDir, {
+  } = await spawnRunner({ provider, args, cwd: workspaceDir, workspaceDir }, {
     onSpawn,
     wasCancelled,
     onEvent,
@@ -3120,6 +3614,12 @@ async function runCodex({ session, workspaceDir, prompt, onSpawn, wasCancelled, 
   };
 }
 
+function buildRunnerArgs({ provider, session, workspaceDir, prompt }) {
+  return normalizeProvider(provider) === 'claude'
+    ? buildClaudeArgs({ session, workspaceDir, prompt })
+    : buildCodexArgs({ session, workspaceDir, prompt });
+}
+
 function buildCodexArgs({ session, workspaceDir, prompt }) {
   const modeFlag = session.mode === 'dangerous'
     ? '--dangerously-bypass-approvals-and-sandbox'
@@ -3128,25 +3628,58 @@ function buildCodexArgs({ session, workspaceDir, prompt }) {
   const model = session.model || DEFAULT_MODEL;
   const effort = session.effort;
   const extraConfigs = session.configOverrides || [];
+  const compactSetting = resolveCompactStrategySetting(session);
+  const compactEnabled = resolveCompactEnabledSetting(session);
+  const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
 
   const common = [];
   if (model) common.push('-m', model);
   if (effort) common.push('-c', `model_reasoning_effort="${effort}"`);
-  if (COMPACT_STRATEGY === 'native' && COMPACT_ON_THRESHOLD) {
-    common.push('-c', `model_auto_compact_token_limit=${MODEL_AUTO_COMPACT_TOKEN_LIMIT}`);
+  if (compactSetting.strategy === 'native' && compactEnabled.enabled) {
+    common.push('-c', `model_auto_compact_token_limit=${nativeLimit.tokens}`);
   }
   for (const cfg of extraConfigs) common.push('-c', cfg);
 
-  if (session.codexThreadId) {
-    return ['exec', 'resume', '--json', modeFlag, ...common, session.codexThreadId, prompt];
+  const sessionId = getSessionId(session);
+  if (sessionId) {
+    return ['exec', 'resume', '--json', modeFlag, ...common, sessionId, prompt];
   }
 
   return ['exec', '--json', '--skip-git-repo-check', modeFlag, '-C', workspaceDir, ...common, prompt];
 }
 
-function spawnCodex(args, cwd, options = {}) {
+function buildClaudeArgs({ session, workspaceDir, prompt }) {
+  const args = [
+    '-p',
+    '--verbose',
+    '--output-format', 'stream-json',
+    '--include-partial-messages',
+    '--add-dir', workspaceDir,
+  ];
+  const model = session.model || DEFAULT_MODEL;
+  const effort = session.effort;
+  const sessionId = getSessionId(session);
+
+  if (model) args.push('--model', model);
+  if (effort) args.push('--effort', effort);
+
+  if (session.mode === 'dangerous') {
+    args.push('--dangerously-skip-permissions');
+  } else {
+    args.push('--permission-mode', 'acceptEdits');
+  }
+
+  if (sessionId) args.push('--resume', sessionId);
+  else args.push('--session-id', randomUUID());
+
+  args.push('--allowedTools', 'default', '--', prompt);
+  return args;
+}
+
+function spawnRunner({ provider, args, cwd, workspaceDir }, options = {}) {
   return new Promise((resolve) => {
-    const child = spawn(CODEX_BIN, args, {
+    const bin = getProviderBin(provider);
+    const child = spawn(bin, args, {
       cwd,
       env: SPAWN_ENV,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -3194,8 +3727,10 @@ function spawnCodex(args, cwd, options = {}) {
       if (id === progressBridgeThreadId && typeof stopSessionProgressBridge === 'function') return;
 
       stopBridges();
-      stopSessionProgressBridge = startCodexSessionProgressBridge({
+      stopSessionProgressBridge = startSessionProgressBridge({
+        provider,
         threadId: id,
+        workspaceDir,
         onEvent: options.onEvent,
       });
       progressBridgeThreadId = id;
@@ -3218,7 +3753,7 @@ function spawnCodex(args, cwd, options = {}) {
       }
 
       // Ignore known noisy Codex rollout logs.
-      if (trimmed.includes('state db missing rollout path for thread')) return;
+      if (provider === 'codex' && trimmed.includes('state db missing rollout path for thread')) return;
       if (source === 'stderr' || DEBUG_EVENTS) logs.push(trimmed);
       options.onLog?.(trimmed, source);
     };
@@ -3241,34 +3776,14 @@ function spawnCodex(args, cwd, options = {}) {
     };
 
     const handleEvent = (ev) => {
-      switch (ev.type) {
-        case 'thread.started':
-          threadId = ev.thread_id || threadId;
-          ensureSessionProgressBridge(threadId);
-          break;
-        case 'item.completed': {
-          const item = ev.item || {};
-          if (item.type === 'agent_message') {
-            const text = extractAgentMessageText(item);
-            if (text) {
-              messages.push(text);
-              if (isFinalAnswerLikeAgentMessage(item)) {
-                finalAnswerMessages.push(text);
-              }
-            }
-          }
-          if (item.type === 'reasoning' && item.text) reasonings.push(item.text.trim());
-          break;
-        }
-        case 'turn.completed':
-          usage = ev.usage || usage;
-          break;
-        case 'error':
-          logs.push(typeof ev.error === 'string' ? ev.error : JSON.stringify(ev.error));
-          break;
-        default:
-          break;
+      const state = { messages, finalAnswerMessages, reasonings, logs, usage, threadId };
+      if (normalizeProvider(provider) === 'claude') {
+        handleClaudeRunnerEvent(ev, state, ensureSessionProgressBridge);
+      } else {
+        handleCodexRunnerEvent(ev, state, ensureSessionProgressBridge);
       }
+      usage = state.usage;
+      threadId = state.threadId;
     };
 
     child.stdout.on('data', (chunk) => onData(chunk, 'stdout'));
@@ -3280,7 +3795,7 @@ function spawnCodex(args, cwd, options = {}) {
       if (timeout) clearTimeout(timeout);
       stopBridges();
       if (err?.code === 'ENOENT') {
-        logs.push(`Command not found: ${CODEX_BIN}`);
+        logs.push(`Command not found: ${bin}`);
       }
       resolve({
         ok: false,
@@ -3331,6 +3846,123 @@ function spawnCodex(args, cwd, options = {}) {
       });
     });
   });
+}
+
+function normalizeRunnerEventType(value) {
+  return String(value || '').trim().toLowerCase().replace(/[./-]/g, '_');
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function extractRunnerSessionId(ev) {
+  return firstNonEmptyString(
+    ev?.thread_id,
+    ev?.threadId,
+    ev?.session_id,
+    ev?.sessionId,
+    ev?.payload?.thread_id,
+    ev?.payload?.threadId,
+    ev?.payload?.session_id,
+    ev?.payload?.sessionId,
+    ev?.message?.thread_id,
+    ev?.message?.threadId,
+    ev?.message?.session_id,
+    ev?.message?.sessionId,
+    ev?.result?.thread_id,
+    ev?.result?.threadId,
+    ev?.result?.session_id,
+    ev?.result?.sessionId,
+  ) || null;
+}
+
+function pushMessageParts(state, item) {
+  const text = extractAgentMessageText(item);
+  if (!text) return;
+  state.messages.push(text);
+  if (isFinalAnswerLikeAgentMessage(item)) {
+    state.finalAnswerMessages.push(text);
+  }
+}
+
+function handleCodexRunnerEvent(ev, state, ensureSessionProgressBridge) {
+  switch (ev.type) {
+    case 'thread.started':
+      state.threadId = ev.thread_id || state.threadId;
+      ensureSessionProgressBridge(state.threadId);
+      break;
+    case 'item.completed': {
+      const item = ev.item || {};
+      if (item.type === 'agent_message') {
+        pushMessageParts(state, item);
+      }
+      if (item.type === 'reasoning' && item.text) state.reasonings.push(item.text.trim());
+      break;
+    }
+    case 'turn.completed':
+      state.usage = ev.usage || state.usage;
+      break;
+    case 'error':
+      state.logs.push(typeof ev.error === 'string' ? ev.error : JSON.stringify(ev.error));
+      break;
+    default:
+      break;
+  }
+}
+
+function handleClaudeRunnerEvent(ev, state, ensureSessionProgressBridge) {
+  const type = normalizeRunnerEventType(ev?.type || '');
+  const sessionId = extractRunnerSessionId(ev);
+  if (sessionId) {
+    state.threadId = sessionId;
+    ensureSessionProgressBridge(sessionId);
+  }
+
+  if (type === 'system_init' || type === 'init') return;
+
+  if (type === 'assistant' || type === 'assistant_message') {
+    const item = ev?.message && typeof ev.message === 'object' ? ev.message : ev;
+    pushMessageParts(state, item);
+    state.usage = item?.usage || ev?.usage || state.usage;
+    return;
+  }
+
+  if (type === 'result') {
+    state.usage = ev?.usage || ev?.result?.usage || state.usage;
+    const resultText = firstNonEmptyString(
+      typeof ev?.result === 'string' ? ev.result : '',
+      typeof ev?.response === 'string' ? ev.response : '',
+      typeof ev?.content === 'string' ? ev.content : '',
+    );
+    if (resultText && !state.finalAnswerMessages.length) {
+      pushMessageParts(state, { type: 'agent_message', phase: 'final_answer', text: resultText });
+    }
+    if (ev?.subtype === 'error' || ev?.is_error) {
+      state.logs.push(firstNonEmptyString(ev?.error, ev?.message, JSON.stringify(ev?.result || 'error')) || 'Claude result error');
+    }
+    return;
+  }
+
+  if (type.includes('reasoning')) {
+    const text = extractAgentMessageText(ev?.message && typeof ev.message === 'object' ? ev.message : ev);
+    if (text) state.reasonings.push(text);
+    return;
+  }
+
+  if (type === 'error') {
+    state.logs.push(typeof ev.error === 'string' ? ev.error : JSON.stringify(ev.error));
+  }
+}
+
+function startSessionProgressBridge({ provider, threadId, workspaceDir, onEvent }) {
+  return normalizeProvider(provider) === 'claude'
+    ? startClaudeSessionProgressBridge({ threadId, workspaceDir, onEvent })
+    : startCodexSessionProgressBridge({ threadId, onEvent });
 }
 
 function startCodexSessionProgressBridge({ threadId, onEvent }) {
@@ -3468,6 +4100,136 @@ function startCodexSessionProgressBridge({ threadId, onEvent }) {
   };
 }
 
+function startClaudeSessionProgressBridge({ threadId, workspaceDir, onEvent }) {
+  const sessionId = String(threadId || '').trim();
+  if (!sessionId || typeof onEvent !== 'function') return () => {};
+
+  const projectsRoot = getClaudeProjectsDir();
+  if (!projectsRoot || !fs.existsSync(projectsRoot)) return () => {};
+
+  const bridgeStartedAtMs = Date.now();
+  const minMtimeMs = bridgeStartedAtMs - 2 * 60 * 1000;
+  const dedupeKeys = [];
+  const dedupeSet = new Set();
+
+  let stopped = false;
+  let sessionFile = null;
+  let sessionFileMtimeMs = 0;
+  let offset = 0;
+  let remainder = '';
+  let pollTimer = null;
+  let lastScanAt = 0;
+
+  const rememberKey = (key) => {
+    if (!key || dedupeSet.has(key)) return false;
+    dedupeSet.add(key);
+    dedupeKeys.push(key);
+    if (dedupeKeys.length > 500) {
+      const stale = dedupeKeys.shift();
+      if (stale) dedupeSet.delete(stale);
+    }
+    return true;
+  };
+
+  const handleSessionLine = (line) => {
+    const raw = String(line || '').trim();
+    if (!raw || !raw.startsWith('{') || !raw.endsWith('}')) return;
+
+    let ev = null;
+    try {
+      ev = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!ev || typeof ev !== 'object') return;
+    if (String(ev.type || '').toLowerCase() === 'user') return;
+
+    const text = extractRawProgressTextFromEventBase(ev);
+    if (!text) return;
+    const key = [ev.timestamp || '', ev.type || '', ev.sessionId || '', text].join('|');
+    if (!rememberKey(key)) return;
+    onEvent(ev);
+  };
+
+  const consumeChunk = (chunk) => {
+    if (!chunk) return;
+    remainder += chunk;
+    const lines = remainder.split('\n');
+    remainder = lines.pop() ?? '';
+    for (const line of lines) handleSessionLine(line);
+  };
+
+  const readNewTail = () => {
+    if (!sessionFile) return;
+
+    let stat = null;
+    try {
+      stat = fs.statSync(sessionFile);
+    } catch {
+      sessionFile = null;
+      offset = 0;
+      remainder = '';
+      return;
+    }
+    if (!stat || !stat.isFile()) return;
+    if (stat.size < offset) {
+      offset = 0;
+      remainder = '';
+    }
+    if (stat.size === offset) return;
+
+    const bytesToRead = stat.size - offset;
+    if (bytesToRead <= 0) return;
+
+    const fd = fs.openSync(sessionFile, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(bytesToRead);
+      const readBytes = fs.readSync(fd, buf, 0, bytesToRead, offset);
+      offset += readBytes;
+      consumeChunk(buf.toString('utf8', 0, readBytes));
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+
+  const resolveSessionFile = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastScanAt < 2500) return false;
+    lastScanAt = now;
+
+    const match = findLatestClaudeSessionFileBySessionId(sessionId, workspaceDir, minMtimeMs);
+    if (!match) return false;
+    const nextPath = String(match.file || '');
+    if (!nextPath) return false;
+    if (nextPath === sessionFile) return true;
+
+    sessionFile = match.file;
+    sessionFileMtimeMs = Number(match.mtimeMs) || 0;
+    offset = sessionFileMtimeMs < bridgeStartedAtMs
+      ? Math.max(0, Number(match.sizeBytes) || 0)
+      : 0;
+    remainder = '';
+    readNewTail();
+    return true;
+  };
+
+  const poll = () => {
+    if (stopped) return;
+    if (!resolveSessionFile(!sessionFile) && !sessionFile) return;
+    readNewTail();
+  };
+
+  pollTimer = setInterval(poll, 700);
+  pollTimer.unref?.();
+  poll();
+
+  return () => {
+    stopped = true;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+  };
+}
+
 function composeResultText(result, session) {
   const sections = [];
 
@@ -3482,14 +4244,15 @@ function composeResultText(result, session) {
     messages: result.messages,
     finalAnswerMessages: result.finalAnswerMessages,
   });
-  sections.push(answer || '（Codex 没有返回可见文本）');
+  sections.push(answer || `（${getProviderShortName(getSessionProvider(session))} 没有返回可见文本）`);
 
   const tail = [];
   if (result.notes.length) {
     tail.push(...result.notes.map((n) => `• ${n}`));
   }
-  if (session.codexThreadId || result.threadId) {
-    const id = result.threadId || session.codexThreadId;
+  const currentSessionId = getSessionId(session);
+  if (currentSessionId || result.threadId) {
+    const id = result.threadId || currentSessionId;
     const label = session.name ? `**${session.name}** (\`${id}\`)` : `\`${id}\``;
     tail.push(`• session: ${label}`);
   }
@@ -3506,6 +4269,8 @@ function getSession(key) {
   if (!db.threads[key]) {
     db.threads[key] = {
       workspaceDir: null,
+      provider: DEFAULT_PROVIDER,
+      runnerSessionId: null,
       codexThreadId: null,
       lastInputTokens: null,
       model: null,
@@ -3516,6 +4281,10 @@ function getSession(key) {
       securityProfile: null,
       timeoutMs: null,
       processLines: null,
+      compactStrategy: null,
+      compactEnabled: null,
+      compactThresholdTokens: null,
+      nativeCompactTokenLimit: null,
       configOverrides: [],
       updatedAt: new Date().toISOString(),
     };
@@ -3524,6 +4293,29 @@ function getSession(key) {
   const s = db.threads[key];
   // migrate old sessions
   let migrated = false;
+  if (BOT_PROVIDER && s.provider !== BOT_PROVIDER) {
+    s.provider = BOT_PROVIDER;
+    migrated = true;
+  }
+  if (s.provider === undefined) {
+    s.provider = DEFAULT_PROVIDER;
+    migrated = true;
+  }
+  const normalizedProvider = normalizeProvider(s.provider);
+  if (s.provider !== normalizedProvider) {
+    s.provider = normalizedProvider;
+    migrated = true;
+  }
+  if (s.runnerSessionId === undefined) {
+    s.runnerSessionId = s.codexThreadId || null;
+    migrated = true;
+  }
+  const normalizedSessionId = getSessionId(s);
+  if (s.runnerSessionId !== normalizedSessionId || s.codexThreadId !== normalizedSessionId) {
+    s.runnerSessionId = normalizedSessionId;
+    s.codexThreadId = normalizedSessionId;
+    migrated = true;
+  }
   if (s.effort === undefined) {
     s.effort = null;
     migrated = true;
@@ -3560,6 +4352,22 @@ function getSession(key) {
     s.processLines = null;
     migrated = true;
   }
+  if (s.compactStrategy === undefined) {
+    s.compactStrategy = null;
+    migrated = true;
+  }
+  if (s.compactEnabled === undefined) {
+    s.compactEnabled = null;
+    migrated = true;
+  }
+  if (s.compactThresholdTokens === undefined) {
+    s.compactThresholdTokens = null;
+    migrated = true;
+  }
+  if (s.nativeCompactTokenLimit === undefined) {
+    s.nativeCompactTokenLimit = null;
+    migrated = true;
+  }
   const normalizedLanguage = normalizeUiLanguage(s.language);
   if (s.language !== normalizedLanguage) {
     s.language = normalizedLanguage;
@@ -3578,6 +4386,26 @@ function getSession(key) {
   const normalizedProcessLines = normalizeSessionProcessLines(s.processLines);
   if (s.processLines !== normalizedProcessLines) {
     s.processLines = normalizedProcessLines;
+    migrated = true;
+  }
+  const normalizedCompactStrategy = normalizeSessionCompactStrategy(s.compactStrategy);
+  if (s.compactStrategy !== normalizedCompactStrategy) {
+    s.compactStrategy = normalizedCompactStrategy;
+    migrated = true;
+  }
+  const normalizedCompactEnabled = normalizeSessionCompactEnabled(s.compactEnabled);
+  if (s.compactEnabled !== normalizedCompactEnabled) {
+    s.compactEnabled = normalizedCompactEnabled;
+    migrated = true;
+  }
+  const normalizedCompactThresholdTokens = normalizeSessionCompactTokenLimit(s.compactThresholdTokens);
+  if (s.compactThresholdTokens !== normalizedCompactThresholdTokens) {
+    s.compactThresholdTokens = normalizedCompactThresholdTokens;
+    migrated = true;
+  }
+  const normalizedNativeCompactTokenLimit = normalizeSessionCompactTokenLimit(s.nativeCompactTokenLimit);
+  if (s.nativeCompactTokenLimit !== normalizedNativeCompactTokenLimit) {
+    s.nativeCompactTokenLimit = normalizedNativeCompactTokenLimit;
     migrated = true;
   }
   s.updatedAt = new Date().toISOString();
@@ -3851,15 +4679,21 @@ function resolveGuildChannelVisibility(channel) {
     : { visibility: 'team', reason: '@everyone cannot view channel' };
 }
 
-function formatSecurityProfileDisplay(security) {
-  if (!security) return '(unknown)';
+function formatSecurityProfileDisplay(security, language = 'en') {
+  if (!security) return language === 'en' ? '(unknown)' : '（未知）';
   if (security.source === 'session') {
-    return `${security.profile} (session override)`;
+    return language === 'en'
+      ? `${security.profile} (session override)`
+      : `${security.profile}（频道覆盖）`;
   }
   if (security.source === 'manual') {
-    return `${security.profile} (manual)`;
+    return language === 'en'
+      ? `${security.profile} (manual)`
+      : `${security.profile}（手动设置）`;
   }
-  return `${security.profile} (auto: ${security.reason})`;
+  return language === 'en'
+    ? `${security.profile} (auto: ${security.reason})`
+    : `${security.profile}（自动：${security.reason}）`;
 }
 
 function normalizeSlashPrefix(value) {
@@ -3900,8 +4734,19 @@ function buildSpawnEnv(env) {
   return out;
 }
 
-function getCodexCliHealth() {
-  const check = spawnSync(CODEX_BIN, ['--version'], {
+function getProviderDefaults(provider) {
+  if (normalizeProvider(provider) === 'claude') {
+    return { model: '(provider default)', effort: '(provider default)' };
+  }
+  return getCodexDefaults();
+}
+
+function getCliHealth(provider = DEFAULT_PROVIDER) {
+  return normalizeProvider(provider) === 'claude' ? getClaudeCliHealth() : getCodexCliHealth();
+}
+
+function getCliHealthForBin({ bin, envKey }) {
+  const check = spawnSync(bin, ['--version'], {
     env: SPAWN_ENV,
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8',
@@ -3910,7 +4755,8 @@ function getCodexCliHealth() {
   if (check.error) {
     return {
       ok: false,
-      bin: CODEX_BIN,
+      bin,
+      envKey,
       error: safeError(check.error),
     };
   }
@@ -3918,7 +4764,8 @@ function getCodexCliHealth() {
   if (check.status !== 0) {
     return {
       ok: false,
-      bin: CODEX_BIN,
+      bin,
+      envKey,
       error: (check.stderr || check.stdout || `exit=${check.status}`).trim(),
     };
   }
@@ -3926,22 +4773,56 @@ function getCodexCliHealth() {
   const versionLine = (check.stdout || check.stderr || '').trim().split('\n')[0] || 'ok';
   return {
     ok: true,
-    bin: CODEX_BIN,
+    bin,
+    envKey,
     version: versionLine,
   };
 }
 
-function formatCodexHealth(health) {
+function getCodexCliHealth() {
+  return getCliHealthForBin({ bin: CODEX_BIN, envKey: 'CODEX_BIN' });
+}
+
+function getClaudeCliHealth() {
+  return getCliHealthForBin({ bin: CLAUDE_BIN, envKey: 'CLAUDE_BIN' });
+}
+
+function formatCliHealth(health, language = 'zh') {
   if (health.ok) return `✅ \`${health.bin}\` (${health.version})`;
-  if (isCodexNotFound(health.error)) {
-    return `❌ 未找到 \`${health.bin}\`（可在 .env 设置 CODEX_BIN=/绝对路径/codex）`;
+  if (isCliNotFound(health.error)) {
+    return language === 'en'
+      ? `❌ \`${health.bin}\` not found (set ${health.envKey || 'CLI_BIN'}=/absolute/path/${health.bin} in .env)`
+      : `❌ 未找到 \`${health.bin}\`（可在 .env 设置 ${health.envKey || 'CLI_BIN'}=/绝对路径/${health.bin}）`;
   }
   return `❌ ${truncate(String(health.error || 'unknown error'), 220)}`;
 }
 
-function isCodexNotFound(errorText) {
+function formatCodexHealth(health) {
+  return formatCliHealth(health);
+}
+
+function isCliNotFound(errorText) {
   const msg = String(errorText || '').toLowerCase();
   return msg.includes('enoent') || msg.includes('not found');
+}
+
+function isCodexNotFound(errorText) {
+  return isCliNotFound(errorText);
+}
+
+function parseProviderInput(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['codex', 'openai'].includes(raw)) return 'codex';
+  if (['claude', 'anthropic'].includes(raw)) return 'claude';
+  return null;
+}
+
+function formatBotModeLabel() {
+  if (!BOT_PROVIDER) {
+    return 'shared (provider can switch per channel)';
+  }
+  return `locked to \`${BOT_PROVIDER}\` (${getProviderDisplayName(BOT_PROVIDER)})`;
 }
 
 function slashName(base) {
@@ -4047,11 +4928,17 @@ function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+function listRecentSessions({ provider = DEFAULT_PROVIDER, workspaceDir = '', limit = 10 } = {}) {
+  return normalizeProvider(provider) === 'claude'
+    ? listRecentClaudeSessions(limit, workspaceDir)
+    : listRecentCodexSessions(limit);
+}
+
 function listRecentCodexSessions(limit = 10) {
   const sessionsDir = getCodexSessionsDir();
   if (!sessionsDir || !fs.existsSync(sessionsDir)) return [];
 
-  const files = findRolloutFiles(sessionsDir);
+  const files = findCodexRolloutFiles(sessionsDir);
   const latestById = new Map();
 
   for (const file of files) {
@@ -4076,6 +4963,27 @@ function listRecentCodexSessions(limit = 10) {
     .slice(0, limit);
 }
 
+function listRecentClaudeSessions(limit = 10, workspaceDir = '') {
+  const preferredRoot = getClaudeProjectDir(workspaceDir);
+  const searchRoot = preferredRoot && fs.existsSync(preferredRoot) ? preferredRoot : getClaudeProjectsDir();
+  if (!searchRoot || !fs.existsSync(searchRoot)) return [];
+
+  return findClaudeSessionFiles(searchRoot)
+    .map((file) => {
+      const id = parseClaudeSessionIdFromFile(path.basename(file));
+      if (!id) return null;
+      try {
+        const stat = fs.statSync(file);
+        return stat.isFile() ? { id, mtime: stat.mtimeMs } : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, limit);
+}
+
 function findLatestRolloutFileBySessionId(sessionId, notOlderThanMs = 0) {
   const targetId = String(sessionId || '').trim().toLowerCase();
   if (!targetId) return null;
@@ -4083,7 +4991,7 @@ function findLatestRolloutFileBySessionId(sessionId, notOlderThanMs = 0) {
   const sessionsDir = getCodexSessionsDir();
   if (!sessionsDir || !fs.existsSync(sessionsDir)) return null;
 
-  const files = findRolloutFiles(sessionsDir);
+  const files = findCodexRolloutFiles(sessionsDir);
   let latest = null;
 
   for (const file of files) {
@@ -4111,13 +5019,68 @@ function findLatestRolloutFileBySessionId(sessionId, notOlderThanMs = 0) {
   return latest;
 }
 
+function findLatestClaudeSessionFileBySessionId(sessionId, workspaceDir = '', notOlderThanMs = 0) {
+  const targetId = String(sessionId || '').trim().toLowerCase();
+  if (!targetId) return null;
+
+  const roots = [];
+  const preferredRoot = getClaudeProjectDir(workspaceDir);
+  if (preferredRoot) roots.push(preferredRoot);
+  const projectsRoot = getClaudeProjectsDir();
+  if (projectsRoot && !roots.includes(projectsRoot)) roots.push(projectsRoot);
+
+  let latest = null;
+  for (const root of roots) {
+    if (!root || !fs.existsSync(root)) continue;
+    for (const file of findClaudeSessionFiles(root)) {
+      const id = parseClaudeSessionIdFromFile(path.basename(file));
+      if (!id || String(id).toLowerCase() !== targetId) continue;
+
+      let stat = null;
+      try {
+        stat = fs.statSync(file);
+      } catch {
+        continue;
+      }
+      if (!stat?.isFile()) continue;
+      if (notOlderThanMs > 0 && stat.mtimeMs < notOlderThanMs) continue;
+
+      if (!latest || stat.mtimeMs > latest.mtimeMs) {
+        latest = { file, mtimeMs: stat.mtimeMs, sizeBytes: stat.size };
+      }
+    }
+    if (latest) return latest;
+  }
+
+  return latest;
+}
+
 function getCodexSessionsDir() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   if (!home) return '';
   return path.join(home, '.codex', 'sessions');
 }
 
-function findRolloutFiles(root) {
+function getClaudeProjectsDir() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) return '';
+  return path.join(home, '.claude', 'projects');
+}
+
+function getClaudeProjectDir(workspaceDir = '') {
+  const projectsRoot = getClaudeProjectsDir();
+  const slug = encodeClaudeProjectPath(workspaceDir);
+  if (!projectsRoot || !slug) return '';
+  return path.join(projectsRoot, slug);
+}
+
+function encodeClaudeProjectPath(workspaceDir = '') {
+  const raw = String(workspaceDir || '').trim();
+  if (!raw) return '';
+  return path.resolve(raw).replace(/[\\/]/g, '-');
+}
+
+function findFilesRecursive(root, predicate) {
   const out = [];
   const stack = [root];
 
@@ -4136,7 +5099,7 @@ function findRolloutFiles(root) {
         stack.push(fullPath);
         continue;
       }
-      if (entry.isFile() && entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
+      if (entry.isFile() && predicate(entry.name, fullPath)) {
         out.push(fullPath);
       }
     }
@@ -4145,8 +5108,21 @@ function findRolloutFiles(root) {
   return out;
 }
 
+function findCodexRolloutFiles(root) {
+  return findFilesRecursive(root, (name) => name.startsWith('rollout-') && name.endsWith('.jsonl'));
+}
+
+function findClaudeSessionFiles(root) {
+  return findFilesRecursive(root, (name) => /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/i.test(name));
+}
+
 function parseSessionIdFromRolloutFile(filename) {
   const match = filename.match(/^rollout-.*-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i);
+  return match?.[1] || null;
+}
+
+function parseClaudeSessionIdFromFile(filename) {
+  const match = String(filename || '').match(/^([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i);
   return match?.[1] || null;
 }
 
@@ -4199,14 +5175,18 @@ function normalizeCompactStrategy(value) {
   return 'hard';
 }
 
-function describeCompactStrategy(strategy) {
+function describeCompactStrategy(strategy, language = 'en') {
   switch (strategy) {
     case 'native':
-      return 'native (Codex CLI auto-compact + continue)';
+      return language === 'en'
+        ? 'native (Codex CLI auto-compact + continue)'
+        : 'native（Codex CLI 自动压缩并继续当前 session）';
     case 'off':
-      return 'off (disabled)';
+      return language === 'en' ? 'off (disabled)' : 'off（关闭）';
     default:
-      return 'hard (summary + new session)';
+      return language === 'en'
+        ? 'hard (summary + new session)'
+        : 'hard（先总结再新开 session）';
   }
 }
 
@@ -4255,6 +5235,25 @@ function extractInputTokensFromUsage(usage) {
   }
 
   return null;
+}
+
+function renderMissingDiscordTokenHint({ botProvider = null, env = process.env } = {}) {
+  if (botProvider) {
+    return `Missing Discord token in environment (${`DISCORD_TOKEN_${botProvider.toUpperCase()}`} or DISCORD_TOKEN)`;
+  }
+
+  const hasCodexScopedToken = Boolean(String(env.CODEX__DISCORD_TOKEN || env.DISCORD_TOKEN_CODEX || '').trim());
+  const hasClaudeScopedToken = Boolean(String(env.CLAUDE__DISCORD_TOKEN || env.DISCORD_TOKEN_CLAUDE || '').trim());
+
+  if (hasCodexScopedToken || hasClaudeScopedToken) {
+    const availableProviders = [
+      hasCodexScopedToken ? 'codex' : null,
+      hasClaudeScopedToken ? 'claude' : null,
+    ].filter(Boolean).join(', ');
+    return `Missing DISCORD_TOKEN in shared mode. Found provider-scoped tokens for: ${availableProviders}. Start with npm run start:codex / npm run start:claude, or add a shared DISCORD_TOKEN.`;
+  }
+
+  return 'Missing DISCORD_TOKEN in environment';
 }
 
 function resolvePath(input) {

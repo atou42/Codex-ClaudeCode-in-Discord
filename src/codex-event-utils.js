@@ -4,12 +4,13 @@ function normalizeWhitespace(value) {
 
 function normalizeMessageText(value) {
   if (value === null || value === undefined) return '';
+  if (typeof value !== 'string') return '';
   const text = String(value).replace(/\r\n?/g, '\n');
   return text.trim();
 }
 
 function normalizePhase(value) {
-  return normalizeWhitespace(value).toLowerCase().replace(/[.-]/g, '_');
+  return normalizeWhitespace(value).toLowerCase().replace(/[./-]/g, '_');
 }
 
 function pickFirstText(values) {
@@ -52,10 +53,11 @@ export function extractAgentMessageText(item) {
   if (!item || typeof item !== 'object') return '';
   return pickFirstText([
     item.text,
-    item.message,
     item.output_text,
     item.input_text,
-  ]) || pickFirstTextFromContent(item.content);
+  ])
+    || (item.message && typeof item.message === 'object' ? extractAgentMessageText(item.message) : '')
+    || pickFirstTextFromContent(item.content);
 }
 
 export function getAgentMessagePhase(item) {
@@ -63,6 +65,7 @@ export function getAgentMessagePhase(item) {
   return normalizePhase(
     item.phase
       || item.message_phase
+      || item.message?.phase
       || item.payload?.phase
       || item.metadata?.phase
       || '',
