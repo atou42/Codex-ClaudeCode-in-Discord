@@ -1,17 +1,29 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 
+function uniqueDirs(dirs = []) {
+  const out = [];
+  const seen = new Set();
+  for (const dir of dirs) {
+    const key = String(dir || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
 export function createRunnerExecutor({
   debugEvents = false,
   spawnEnv,
   defaultTimeoutMs = 0,
   defaultModel = null,
   ensureDir,
-  ensureGitRepo,
   normalizeProvider,
   getSessionProvider,
   getProviderBin,
   getSessionId,
+  getProviderDefaultWorkspace = () => ({ workspaceDir: null }),
   resolveTimeoutSetting,
   resolveCompactStrategySetting,
   resolveCompactEnabledSetting,
@@ -25,11 +37,14 @@ export function createRunnerExecutor({
 } = {}) {
   async function runCodex({ session, workspaceDir, prompt, onSpawn, wasCancelled, onEvent, onLog }) {
     ensureDir(workspaceDir);
-    ensureGitRepo(workspaceDir);
 
     const provider = getSessionProvider(session);
     const notes = [];
-    const args = buildSessionRunnerArgs({ provider, session, workspaceDir, prompt });
+    const providerDefault = getProviderDefaultWorkspace(provider) || {};
+    const additionalWorkspaceDirs = normalizeProvider(provider) === 'claude'
+      ? uniqueDirs([providerDefault.workspaceDir].filter((dir) => dir && dir !== workspaceDir))
+      : [];
+    const args = buildSessionRunnerArgs({ provider, session, workspaceDir, prompt, additionalWorkspaceDirs });
     const timeoutMs = resolveTimeoutSetting(session).timeoutMs;
     const bin = getProviderBin(provider);
 
@@ -51,9 +66,9 @@ export function createRunnerExecutor({
     };
   }
 
-  function buildSessionRunnerArgs({ provider, session, workspaceDir, prompt }) {
+  function buildSessionRunnerArgs({ provider, session, workspaceDir, prompt, additionalWorkspaceDirs = [] }) {
     return normalizeProvider(provider) === 'claude'
-      ? buildClaudeArgs({ session, workspaceDir, prompt })
+      ? buildClaudeArgs({ session, workspaceDir, prompt, additionalWorkspaceDirs })
       : buildCodexArgs({ session, workspaceDir, prompt });
   }
 
@@ -85,14 +100,16 @@ export function createRunnerExecutor({
     return ['exec', '--json', '--skip-git-repo-check', modeFlag, '-C', workspaceDir, ...common, prompt];
   }
 
-  function buildClaudeArgs({ session, workspaceDir, prompt }) {
+  function buildClaudeArgs({ session, workspaceDir, prompt, additionalWorkspaceDirs = [] }) {
     const args = [
       '-p',
       '--verbose',
       '--output-format', 'stream-json',
       '--include-partial-messages',
-      '--add-dir', workspaceDir,
     ];
+    for (const dir of uniqueDirs([workspaceDir, ...additionalWorkspaceDirs])) {
+      args.push('--add-dir', dir);
+    }
     const model = session.model || defaultModel;
     const effort = session.effort;
     const sessionId = getSessionId(session);
@@ -150,7 +167,6 @@ export function createRunnerExecutor({
           try {
             stopProgressBridge();
           } catch {
-            // ignore bridge teardown failures
           }
         }
         stopProgressBridge = null;
@@ -185,7 +201,6 @@ export function createRunnerExecutor({
             options.onEvent?.(ev);
             return;
           } catch {
-            // fallthrough
           }
         }
 
@@ -222,180 +237,136 @@ export function createRunnerExecutor({
         threadId = state.threadId;
       };
 
+      const finish = (result) => {
+        if (resolved) return;
+        resolved = true;
+        if (timeout) clearTimeout(timeout);
+        stopBridges();
+        resolve(result);
+      };
+
       child.stdout.on('data', (chunk) => onData(chunk, 'stdout'));
       child.stderr.on('data', (chunk) => onData(chunk, 'stderr'));
 
       child.on('error', (err) => {
-        if (resolved) return;
-        resolved = true;
-        if (timeout) clearTimeout(timeout);
-        stopBridges();
-        if (err?.code === 'ENOENT') {
-          logs.push(`Command not found: ${bin}`);
-        }
-        resolve({
+        finish({
           ok: false,
-          exitCode: null,
-          signal: null,
+          cancelled: false,
+          timedOut,
+          error: safeError(err),
+          logs,
           messages,
           finalAnswerMessages,
           reasonings,
           usage,
           threadId,
-          logs,
-          error: safeError(err),
-          timedOut,
-          cancelled: Boolean(options.wasCancelled?.()),
         });
       });
 
-      child.on('close', (exitCode, signal) => {
-        if (resolved) return;
-        resolved = true;
-        if (timeout) clearTimeout(timeout);
-        stopBridges();
+      child.on('close', (code, signal) => {
         flushRemainders();
-
-        const ok = exitCode === 0;
-        const cancelled = !ok && Boolean(options.wasCancelled?.());
-        const error = ok
-          ? null
-          : timedOut
-            ? `timeout after ${timeoutMs}ms`
-            : cancelled
-              ? `cancelled (${signal || `exit=${exitCode}`})`
-              : `exit=${exitCode}${signal ? ` signal=${signal}` : ''}`;
-
-        resolve({
+        const cancelled = Boolean(timedOut || options.wasCancelled?.());
+        const ok = !cancelled && code === 0;
+        finish({
           ok,
-          exitCode,
-          signal,
+          cancelled,
+          timedOut,
+          error: ok ? '' : buildRunnerError({ provider, code, signal, logs }),
+          logs,
           messages,
           finalAnswerMessages,
           reasonings,
           usage,
           threadId,
-          logs,
-          error,
-          timedOut,
-          cancelled,
         });
       });
     });
   }
 
-  function normalizeRunnerEventType(value) {
-    return String(value || '').trim().toLowerCase().replace(/[./-]/g, '_');
-  }
-
-  function firstNonEmptyString(...values) {
-    for (const value of values) {
-      const text = String(value || '').trim();
-      if (text) return text;
-    }
-    return '';
-  }
-
-  function extractRunnerSessionId(ev) {
-    return firstNonEmptyString(
-      ev?.thread_id,
-      ev?.threadId,
-      ev?.session_id,
-      ev?.sessionId,
-      ev?.payload?.thread_id,
-      ev?.payload?.threadId,
-      ev?.payload?.session_id,
-      ev?.payload?.sessionId,
-      ev?.message?.thread_id,
-      ev?.message?.threadId,
-      ev?.message?.session_id,
-      ev?.message?.sessionId,
-      ev?.result?.thread_id,
-      ev?.result?.threadId,
-      ev?.result?.session_id,
-      ev?.result?.sessionId,
-    ) || null;
-  }
-
-  function pushMessageParts(state, item) {
-    const text = extractAgentMessageText(item);
-    if (!text) return;
-    state.messages.push(text);
-    if (isFinalAnswerLikeAgentMessage(item)) {
-      state.finalAnswerMessages.push(text);
-    }
-  }
-
-  function handleCodexRunnerEvent(ev, state, ensureSessionBridge) {
-    switch (ev.type) {
-      case 'thread.started':
-        state.threadId = ev.thread_id || state.threadId;
-        ensureSessionBridge(state.threadId);
-        break;
-      case 'item.completed': {
-        const item = ev.item || {};
-        if (item.type === 'agent_message') {
-          pushMessageParts(state, item);
-        }
-        if (item.type === 'reasoning' && item.text) state.reasonings.push(item.text.trim());
-        break;
-      }
-      case 'turn.completed':
-        state.usage = ev.usage || state.usage;
-        break;
-      case 'error':
-        state.logs.push(typeof ev.error === 'string' ? ev.error : JSON.stringify(ev.error));
-        break;
-      default:
-        break;
-    }
-  }
-
-  function handleClaudeRunnerEvent(ev, state, ensureSessionBridge) {
-    const type = normalizeRunnerEventType(ev?.type || '');
-    const sessionId = extractRunnerSessionId(ev);
-    if (sessionId) {
-      state.threadId = sessionId;
-      ensureSessionBridge(sessionId);
-    }
-
-    if (type === 'system_init' || type === 'init') return;
-
-    if (type === 'assistant' || type === 'assistant_message') {
-      const item = ev?.message && typeof ev.message === 'object' ? ev.message : ev;
-      pushMessageParts(state, item);
-      state.usage = item?.usage || ev?.usage || state.usage;
-      return;
-    }
-
-    if (type === 'result') {
-      state.usage = ev?.usage || ev?.result?.usage || state.usage;
-      const resultText = firstNonEmptyString(
-        typeof ev?.result === 'string' ? ev.result : '',
-        typeof ev?.response === 'string' ? ev.response : '',
-        typeof ev?.content === 'string' ? ev.content : '',
-      );
-      if (resultText && !state.finalAnswerMessages.length) {
-        pushMessageParts(state, { type: 'agent_message', phase: 'final_answer', text: resultText });
-      }
-      if (ev?.subtype === 'error' || ev?.is_error) {
-        state.logs.push(firstNonEmptyString(ev?.error, ev?.message, JSON.stringify(ev?.result || 'error')) || 'Claude result error');
-      }
-      return;
-    }
-
-    if (type.includes('reasoning')) {
-      const text = extractAgentMessageText(ev?.message && typeof ev.message === 'object' ? ev.message : ev);
-      if (text) state.reasonings.push(text);
-      return;
-    }
-
-    if (type === 'error') {
-      state.logs.push(typeof ev.error === 'string' ? ev.error : JSON.stringify(ev.error));
-    }
-  }
-
   return {
     runCodex,
+    buildSessionRunnerArgs,
   };
+}
+
+function handleCodexRunnerEvent(ev, state, ensureSessionBridge) {
+  switch (ev.type) {
+    case 'thread.created':
+    case 'thread.resumed':
+      state.threadId = ev.thread_id || state.threadId;
+      if (state.threadId) ensureSessionBridge(state.threadId);
+      break;
+    case 'assistant.message.delta':
+    case 'assistant.message': {
+      const text = extractAgentMessageText(ev);
+      if (!text) break;
+      if (isFinalAnswerLikeAgentMessage(ev)) state.finalAnswerMessages.push(text);
+      else state.messages.push(text);
+      break;
+    }
+    case 'reasoning.delta':
+    case 'reasoning': {
+      const text = String(ev.text || '').trim();
+      if (text) state.reasonings.push(text);
+      break;
+    }
+    case 'usage':
+      state.usage = ev;
+      break;
+    default:
+      break;
+  }
+}
+
+function handleClaudeRunnerEvent(ev, state, ensureSessionBridge) {
+  switch (ev.type) {
+    case 'session.created':
+    case 'session.resumed':
+      state.threadId = ev.session_id || state.threadId;
+      if (state.threadId) ensureSessionBridge(state.threadId);
+      break;
+    case 'message':
+    case 'assistant': {
+      const text = extractClaudeText(ev);
+      if (!text) break;
+      state.messages.push(text);
+      break;
+    }
+    case 'result': {
+      const text = extractClaudeText(ev);
+      if (text) state.finalAnswerMessages.push(text);
+      if (ev.session_id) {
+        state.threadId = ev.session_id;
+        ensureSessionBridge(state.threadId);
+      }
+      if (ev.usage) state.usage = ev.usage;
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function extractClaudeText(ev) {
+  if (!ev || typeof ev !== 'object') return '';
+  if (typeof ev.text === 'string') return ev.text.trim();
+  if (typeof ev.message === 'string') return ev.message.trim();
+  if (Array.isArray(ev.content)) {
+    return ev.content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item?.type === 'text') return item.text || '';
+        return '';
+      })
+      .join('\n')
+      .trim();
+  }
+  return '';
+}
+
+function buildRunnerError({ provider, code, signal, logs }) {
+  if (signal) return `${provider} exited via signal ${signal}`;
+  if (typeof code === 'number') return `${provider} exited with code ${code}`;
+  if (logs.length) return logs[logs.length - 1];
+  return `${provider} run failed`;
 }

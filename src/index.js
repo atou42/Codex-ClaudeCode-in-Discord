@@ -42,7 +42,7 @@ import {
 import { createRunnerExecutor } from './runner-executor.js';
 import { createOnboardingFlow } from './onboarding-flow.js';
 import { createSessionCommandActions } from './session-command-actions.js';
-import { createSessionStore, ensureDir, ensureGitRepo } from './session-store.js';
+import { createSessionStore, ensureDir } from './session-store.js';
 import { createSessionProgressBridgeFactory } from './session-progress-bridge.js';
 import {
   buildSlashCommands,
@@ -51,6 +51,7 @@ import {
   slashRef as slashRefBase,
 } from './slash-command-surface.js';
 import { createTextCommandHandler } from './text-command-handler.js';
+import { createWorkspaceRuntime } from './workspace-runtime.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -145,6 +146,12 @@ const CONFIG_POLICY = parseConfigAllowlist(
 );
 
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.join(ROOT, 'workspaces');
+const WORKSPACE_LOCK_ROOT = path.join(DATA_DIR, 'workspace-locks');
+const SHARED_DEFAULT_WORKSPACE_DIR = resolveConfiguredWorkspaceDir(process.env.DEFAULT_WORKSPACE_DIR);
+const PROVIDER_DEFAULT_WORKSPACE_OVERRIDES = {
+  codex: resolveConfiguredWorkspaceDir(process.env.CODEX__DEFAULT_WORKSPACE_DIR),
+  claude: resolveConfiguredWorkspaceDir(process.env.CLAUDE__DEFAULT_WORKSPACE_DIR),
+};
 const DEFAULT_PROVIDER = BOT_PROVIDER || normalizeProvider(process.env.DEFAULT_PROVIDER || process.env.CLI_PROVIDER || 'codex');
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || null;
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || 'safe').toLowerCase() === 'dangerous' ? 'dangerous' : 'safe';
@@ -308,12 +315,17 @@ const sessionStore = createSessionStore({
   normalizeSessionCompactStrategy,
   normalizeSessionCompactEnabled,
   normalizeSessionCompactTokenLimit,
+  resolveDefaultWorkspace: resolveProviderDefaultWorkspace,
 });
-const { getSession, saveDb, ensureWorkspace } = sessionStore;
+const { getSession, saveDb, ensureWorkspace, getWorkspaceBinding, listSessions: listStoredSessions } = sessionStore;
 
 const commandActions = createSessionCommandActions({
   saveDb,
   ensureWorkspace,
+  getWorkspaceBinding,
+  listStoredSessions,
+  resolveProviderDefaultWorkspace,
+  setProviderDefaultWorkspace,
   clearSessionId,
   getSessionId,
   setSessionId,
@@ -321,7 +333,6 @@ const commandActions = createSessionCommandActions({
   getProviderShortName,
   resolveTimeoutSetting,
   resolveProcessLinesSetting,
-  ensureGitRepo,
   listRecentSessions,
   humanAge,
 });
@@ -337,6 +348,11 @@ const {
   cancelAllChannelWork,
   getRuntimeSnapshot,
 } = channelRuntimeStore;
+
+const { acquireWorkspace, readLock: readWorkspaceLock } = createWorkspaceRuntime({
+  lockRoot: WORKSPACE_LOCK_ROOT,
+  ensureDir,
+});
 
 let enqueuePrompt;
 let runCodex;
@@ -620,14 +636,52 @@ async function handleInteractionCreate(interaction) {
       }
 
       case 'setdir': {
-        const p = interaction.options.getString('path');
-        const resolved = resolvePath(p);
-        if (!fs.existsSync(resolved)) {
-          await respond({ content: `❌ 目录不存在：\`${resolved}\``, flags: 64 });
+        const action = parseWorkspaceCommandAction(interaction.options.getString('path'));
+        if (!action || action.type === 'invalid') {
+          await respond({ content: formatWorkspaceSetHelp(getSessionLanguage(session)), flags: 64 });
           break;
         }
-        commandActions.setWorkspaceDir(session, resolved);
-        await respond(`✅ workspace → \`${resolved}\`（会话已重置）`);
+        if (action.type === 'status') {
+          await respond({ content: formatWorkspaceReport(key, session), flags: 64 });
+          break;
+        }
+        if (action.type === 'clear') {
+          const result = commandActions.clearWorkspaceDir(session, key);
+          await respond({ content: formatWorkspaceUpdateReport(key, session, result), flags: 64 });
+          break;
+        }
+        const resolved = resolvePath(action.value);
+        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+          await respond({ content: `❌ 目录不存在或不是目录：\`${resolved}\``, flags: 64 });
+          break;
+        }
+        const result = commandActions.setWorkspaceDir(session, key, resolved);
+        await respond({ content: formatWorkspaceUpdateReport(key, session, result), flags: 64 });
+        break;
+      }
+
+      case 'setdefaultdir': {
+        const action = parseWorkspaceCommandAction(interaction.options.getString('path'));
+        if (!action || action.type === 'invalid') {
+          await respond({ content: formatDefaultWorkspaceSetHelp(getSessionLanguage(session)), flags: 64 });
+          break;
+        }
+        if (action.type === 'status') {
+          await respond({ content: formatWorkspaceReport(key, session), flags: 64 });
+          break;
+        }
+        if (action.type === 'clear') {
+          const result = commandActions.setDefaultWorkspaceDir(session, null);
+          await respond({ content: formatDefaultWorkspaceUpdateReport(key, session, result), flags: 64 });
+          break;
+        }
+        const resolved = resolvePath(action.value);
+        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+          await respond({ content: `❌ 目录不存在或不是目录：\`${resolved}\``, flags: 64 });
+          break;
+        }
+        const result = commandActions.setDefaultWorkspaceDir(session, resolved);
+        await respond({ content: formatDefaultWorkspaceUpdateReport(key, session, result), flags: 64 });
         break;
       }
 
@@ -1168,6 +1222,11 @@ const handleCommand = createTextCommandHandler({
   formatStatusReport,
   formatQueueReport,
   formatDoctorReport,
+  formatWorkspaceReport,
+  formatWorkspaceSetHelp,
+  formatWorkspaceUpdateReport,
+  formatDefaultWorkspaceSetHelp,
+  formatDefaultWorkspaceUpdateReport,
   formatOnboardingConfigHelp,
   formatOnboardingConfigReport,
   formatOnboardingDisabledMessage,
@@ -1195,6 +1254,7 @@ const handleCommand = createTextCommandHandler({
   parseCompactConfigFromText,
   parseConfigKey,
   parseReasoningEffortInput,
+  parseWorkspaceCommandAction,
   getEffectiveSecurityProfile,
   resolveTimeoutSetting,
   resolveProcessLinesSetting,
@@ -1203,9 +1263,6 @@ const handleCommand = createTextCommandHandler({
   isReasoningEffortSupported,
   cancelChannelWork,
   resolvePath,
-  ensureGitRepo,
-  listRecentSessions,
-  humanAge,
   safeError,
 });
 
@@ -1223,10 +1280,15 @@ try {
 
 function formatRuntimePhaseLabel(phase, language = 'en') {
   const value = String(phase || '').trim().toLowerCase();
-  if (language === 'en') return value || 'unknown';
+  if (language === 'en') {
+    if (value === 'workspace') return 'waiting for workspace';
+    return value || 'unknown';
+  }
   switch (value) {
     case 'starting':
       return '启动中';
+    case 'workspace':
+      return '等待工作目录';
     case 'compact':
       return '上下文压缩';
     case 'exec':
@@ -1323,6 +1385,7 @@ function formatStatusReport(key, session, channel = null) {
   const modeDesc = session.mode === 'dangerous'
     ? (lang === 'en' ? 'dangerous (no sandbox, full access)' : 'dangerous（无沙盒，全权限）')
     : (lang === 'en' ? 'safe (sandboxed, no network)' : 'safe（沙盒隔离，无网络）');
+  const workspaceLines = getWorkspaceStatusLines(key, session, lang);
 
   if (lang === 'en') {
     return [
@@ -1331,6 +1394,7 @@ function formatStatusReport(key, session, channel = null) {
       `• model: ${session.model || `${defaults.model} _(config.toml)_`}`,
       `• mode: ${modeDesc}`,
       `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
+      ...workspaceLines,
       `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)} (${formatSettingSourceLabel(compactSetting.source, lang)})`,
       `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'} (${formatSettingSourceLabel(compactEnabled.source, lang)})`,
       `• compact token limit: ${compactThreshold.tokens} (${formatSettingSourceLabel(compactThreshold.source, lang)})`,
@@ -1350,6 +1414,7 @@ function formatStatusReport(key, session, channel = null) {
     `• model: ${session.model || `${defaults.model} _(config.toml)_`}`,
     `• mode: ${modeDesc}`,
     `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
+    ...workspaceLines,
     `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)}（${formatSettingSourceLabel(compactSetting.source, lang)}）`,
     `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'}（${formatSettingSourceLabel(compactEnabled.source, lang)}）`,
     `• compact token limit: ${compactThreshold.tokens}（${formatSettingSourceLabel(compactThreshold.source, lang)}）`,
@@ -1475,11 +1540,15 @@ function formatDoctorReport(key, session = null, channel = null) {
   const compactEnabled = resolveCompactEnabledSetting(session);
   const compactThreshold = resolveCompactThresholdSetting(session);
   const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
+  const workspaceBinding = getWorkspaceBinding(session, key);
+  const workspaceLock = readWorkspaceLock(workspaceBinding.workspaceDir);
   return [
     '🩺 **Bot Doctor**',
     `• bot mode: ${formatBotModeLabel()}`,
     `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
     `• cli: ${formatCliHealth(cliHealth)}`,
+    `• workspace: \`${workspaceBinding.workspaceDir}\` (${workspaceBinding.source})`,
+    `• workspace serialization: ${workspaceLock.owner ? 'busy' : 'idle'}`,
     `• runtime: ${formatRuntimeLabel(runtime)}`,
     `• queued prompts: ${runtime.queued}`,
     `• security profile: ${formatSecurityProfileDisplay(security)}`,
@@ -1950,8 +2019,10 @@ function formatHelpReport(session) {
       !BOT_PROVIDER ? '• `!provider <codex|claude|status>` — switch provider for current channel' : null,
       '',
       '**Workspace**',
-      '• `!setdir <path>` — set workspace (resets session)',
-      '• `!cd <path>` — alias of `!setdir`',
+      '• `!setdir <path|default|status>` — set or clear current thread workspace',
+      '• `!cd <...>` — alias of `!setdir`',
+      '• `!setdefaultdir <path|clear|status>` — set provider default workspace',
+      `• \`${slashRef('setdir')} path:<...>\` / \`${slashRef('setdefaultdir')} path:<...>\` — workspace controls`,
       '',
       '**Model & Runtime**',
       '• `!model <name|default>` — set model override',
@@ -1989,8 +2060,10 @@ function formatHelpReport(session) {
     !BOT_PROVIDER ? '• `!provider <codex|claude|status>` — 切换当前频道 provider' : null,
     '',
     '**工作目录**',
-    '• `!setdir <path>` — 设置工作目录（会清空旧会话）',
-    '• `!cd <path>` — 同 !setdir 的别名',
+    '• `!setdir <path|default|status>` — 设置或清除当前 thread 的 workspace',
+    '• `!cd <...>` — 同 `!setdir` 的别名',
+    '• `!setdefaultdir <path|clear|status>` — 设置当前 provider 的默认 workspace',
+    `• \`${slashRef('setdir')} path:<...>\` / \`${slashRef('setdefaultdir')} path:<...>\` — workspace 控制`,
     '',
     '**模型 & 执行**',
     '• `!model <name|default>` — 切换模型（如 gpt-5.3-codex, o3）',
@@ -2359,8 +2432,17 @@ async function handlePrompt(message, key, prompt, channelState) {
 
   const session = getSession(key);
   const workspaceDir = ensureWorkspace(session, key);
+  const language = normalizeUiLanguage(getSessionLanguage(session));
+  let workspaceLock = null;
 
-  // Show typing indicator (refreshes every 8s until cleared)
+  setActiveRun(channelState, message, prompt, null, 'workspace');
+  if (channelState.activeRun) {
+    channelState.activeRun.lastProgressText = language === 'en'
+      ? `Waiting for workspace lock: ${workspaceDir}`
+      : `等待 workspace 锁：${workspaceDir}`;
+    channelState.activeRun.lastProgressAt = Date.now();
+  }
+
   await message.channel.sendTyping();
   const typingInterval = setInterval(() => {
     message.channel.sendTyping().catch(() => {});
@@ -2374,7 +2456,52 @@ async function handlePrompt(message, key, prompt, channelState) {
   await progress?.start();
   let progressOutcome = { ok: false, cancelled: false, timedOut: false, error: '' };
 
+  const releaseWorkspaceLock = () => {
+    if (!workspaceLock?.acquired || typeof workspaceLock.release !== 'function') return;
+    try {
+      workspaceLock.release();
+    } catch (err) {
+      console.warn(`Failed to release workspace lock: ${safeError(err)}`);
+    }
+    workspaceLock = null;
+  };
+
   try {
+    workspaceLock = await acquireWorkspace(
+      workspaceDir,
+      {
+        key,
+        provider: getSessionProvider(session),
+        messageId: message.id,
+        sessionId: getSessionId(session),
+        sessionName: session.name || null,
+      },
+      {
+        isAborted: () => Boolean(channelState.cancelRequested || channelState.activeRun?.cancelRequested),
+        onWait: ({ owner }) => {
+          if (channelState.activeRun) {
+            channelState.activeRun.lastProgressText = language === 'en'
+              ? `Workspace busy: ${workspaceDir}`
+              : `workspace 正忙：${workspaceDir}`;
+            channelState.activeRun.lastProgressAt = Date.now();
+          }
+          return safeReply(message, formatWorkspaceBusyReport(session, workspaceDir, owner)).catch(() => {});
+        },
+      },
+    );
+
+    if (workspaceLock?.aborted || channelState.cancelRequested) {
+      progressOutcome = { ok: false, cancelled: true, timedOut: false, error: 'cancelled by user' };
+      return { ok: false, cancelled: true };
+    }
+
+    if (channelState.activeRun) {
+      channelState.activeRun.lastProgressText = language === 'en'
+        ? `Workspace lock acquired: ${workspaceDir}`
+        : `已获取 workspace 锁：${workspaceDir}`;
+      channelState.activeRun.lastProgressAt = Date.now();
+    }
+
     let promptToRun = prompt;
     const preNotes = [];
     if (shouldCompactSession(session)) {
@@ -2424,7 +2551,6 @@ async function handlePrompt(message, key, prompt, channelState) {
       result.notes.unshift(...preNotes);
     }
 
-    // If resume failed, auto-reset once and retry fresh session.
     if (!result.ok && getSessionId(session) && !result.cancelled && !result.timedOut) {
       const previous = getSessionId(session);
       clearSessionId(session);
@@ -2459,6 +2585,8 @@ async function handlePrompt(message, key, prompt, channelState) {
     if (sessionDirty) {
       saveDb();
     }
+
+    releaseWorkspaceLock();
 
     if (!result.ok) {
       if (result.cancelled) {
@@ -2516,6 +2644,7 @@ async function handlePrompt(message, key, prompt, channelState) {
     progressOutcome = { ok: false, cancelled: false, timedOut: false, error: safeError(err) };
     throw err;
   } finally {
+    releaseWorkspaceLock();
     clearInterval(typingInterval);
     await progress?.finish(progressOutcome);
   }
@@ -2544,11 +2673,11 @@ const { startSessionProgressBridge } = createSessionProgressBridgeFactory({
   defaultTimeoutMs: CODEX_TIMEOUT_MS,
   defaultModel: DEFAULT_MODEL,
   ensureDir,
-  ensureGitRepo,
   normalizeProvider,
   getSessionProvider,
   getProviderBin,
   getSessionId,
+  getProviderDefaultWorkspace: resolveProviderDefaultWorkspace,
   resolveTimeoutSetting,
   resolveCompactStrategySetting,
   resolveCompactEnabledSetting,
@@ -3043,6 +3172,220 @@ function parseProviderInput(value) {
   return null;
 }
 
+function parseWorkspaceCommandAction(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return { type: 'invalid' };
+  const lower = raw.toLowerCase();
+  if (['status', 'state', 'show', '查看', '状态'].includes(lower)) return { type: 'status' };
+  if (['default', 'inherit', 'clear', 'reset', '跟随默认', '清除'].includes(lower)) return { type: 'clear' };
+  return { type: 'set', value: raw };
+}
+
+function getProviderDefaultWorkspaceEnvKey(provider) {
+  return `${normalizeProvider(provider).toUpperCase()}__DEFAULT_WORKSPACE_DIR`;
+}
+
+function resolveProviderDefaultWorkspace(provider) {
+  const normalizedProvider = normalizeProvider(provider);
+  const scopedWorkspaceDir = PROVIDER_DEFAULT_WORKSPACE_OVERRIDES[normalizedProvider] || null;
+  if (scopedWorkspaceDir) {
+    return {
+      provider: normalizedProvider,
+      workspaceDir: scopedWorkspaceDir,
+      source: 'provider-scoped env',
+      envKey: getProviderDefaultWorkspaceEnvKey(normalizedProvider),
+    };
+  }
+  if (SHARED_DEFAULT_WORKSPACE_DIR) {
+    return {
+      provider: normalizedProvider,
+      workspaceDir: SHARED_DEFAULT_WORKSPACE_DIR,
+      source: 'shared env',
+      envKey: 'DEFAULT_WORKSPACE_DIR',
+    };
+  }
+  return {
+    provider: normalizedProvider,
+    workspaceDir: null,
+    source: 'unset',
+    envKey: getProviderDefaultWorkspaceEnvKey(normalizedProvider),
+  };
+}
+
+function setProviderDefaultWorkspace(provider, workspaceDir) {
+  const normalizedProvider = normalizeProvider(provider);
+  const envKey = getProviderDefaultWorkspaceEnvKey(normalizedProvider);
+  const normalizedWorkspaceDir = resolveConfiguredWorkspaceDir(workspaceDir);
+  PROVIDER_DEFAULT_WORKSPACE_OVERRIDES[normalizedProvider] = normalizedWorkspaceDir;
+  process.env[envKey] = normalizedWorkspaceDir || '';
+  persistEnvUpdates(ENV_FILE, { [envKey]: normalizedWorkspaceDir || '' });
+  return resolveProviderDefaultWorkspace(normalizedProvider);
+}
+
+function formatWorkspaceSourceLabel(source, language = 'zh') {
+  const value = String(source || '').trim().toLowerCase();
+  if (language === 'en') {
+    if (value === 'thread override') return 'thread override';
+    if (value === 'provider default') return 'provider default';
+    if (value === 'legacy fallback') return 'legacy fallback';
+    return value || 'unknown';
+  }
+  if (value === 'thread override') return 'thread 覆盖';
+  if (value === 'provider default') return 'provider 默认';
+  if (value === 'legacy fallback') return 'legacy 回退';
+  return value || '未知';
+}
+
+function formatDefaultWorkspaceSourceLabel(source, envKey = null, language = 'zh') {
+  const suffix = envKey ? `, ${envKey}` : '';
+  const value = String(source || '').trim().toLowerCase();
+  if (language === 'en') {
+    if (value === 'provider-scoped env') return `provider-scoped env${suffix}`;
+    if (value === 'shared env') return `shared env${suffix}`;
+    if (value === 'unset') return `unset${suffix}`;
+    return `${value || 'unknown'}${suffix}`;
+  }
+  if (value === 'provider-scoped env') return `provider 专属 env${suffix}`;
+  if (value === 'shared env') return `共享 env${suffix}`;
+  if (value === 'unset') return `未设置${suffix}`;
+  return `${value || '未知'}${suffix}`;
+}
+
+function formatWorkspaceDefaultDisplay(binding, language = 'zh') {
+  if (binding.defaultWorkspaceDir) {
+    return `\`${binding.defaultWorkspaceDir}\` (${formatDefaultWorkspaceSourceLabel(binding.defaultSource, binding.defaultEnvKey, language)})`;
+  }
+  if (language === 'en') {
+    return `(unset; ${binding.defaultEnvKey || 'DEFAULT_WORKSPACE_DIR'})`;
+  }
+  return `（未设置；${binding.defaultEnvKey || 'DEFAULT_WORKSPACE_DIR'}）`;
+}
+
+function getWorkspaceStatusLines(key, session, language = 'zh') {
+  const binding = getWorkspaceBinding(session, key);
+  if (language === 'en') {
+    return [
+      `• workspace: \`${binding.workspaceDir}\` (${formatWorkspaceSourceLabel(binding.source, language)})`,
+      `• provider default workspace: ${formatWorkspaceDefaultDisplay(binding, language)}`,
+    ];
+  }
+  return [
+    `• workspace: \`${binding.workspaceDir}\`（${formatWorkspaceSourceLabel(binding.source, language)}）`,
+    `• provider 默认 workspace: ${formatWorkspaceDefaultDisplay(binding, language)}`,
+  ];
+}
+
+function formatWorkspaceReport(key, session) {
+  const language = normalizeUiLanguage(getSessionLanguage(session));
+  const lines = getWorkspaceStatusLines(key, session, language);
+  if (language === 'en') {
+    return [
+      '📁 **Workspace**',
+      ...lines,
+      '• session rule: Codex clears session on workspace change; Claude keeps session when possible.',
+    ].join('\n');
+  }
+  return [
+    '📁 **工作目录**',
+    ...lines,
+    '• session 规则：Codex 在 workspace 变化时会清空 session；Claude 尽量保留当前 session。',
+  ].join('\n');
+}
+
+function formatWorkspaceSetHelp(language = 'zh') {
+  if (language === 'en') {
+    return [
+      'Usage: `!setdir <path|default|status>`',
+      `Slash: \`${slashRef('setdir')} path:<path|default|status>\``,
+      'Examples: `!setdir ~/GitHub/my-repo`, `!setdir default`, `!setdir status`',
+    ].join('\n');
+  }
+  return [
+    '用法：`!setdir <path|default|status>`',
+    `Slash：\`${slashRef('setdir')} path:<path|default|status>\``,
+    '示例：`!setdir ~/GitHub/my-repo`、`!setdir default`、`!setdir status`',
+  ].join('\n');
+}
+
+function formatDefaultWorkspaceSetHelp(language = 'zh') {
+  if (language === 'en') {
+    return [
+      'Usage: `!setdefaultdir <path|clear|status>`',
+      `Slash: \`${slashRef('setdefaultdir')} path:<path|clear|status>\``,
+      'Examples: `!setdefaultdir ~/GitHub`, `!setdefaultdir clear`, `!setdefaultdir status`',
+    ].join('\n');
+  }
+  return [
+    '用法：`!setdefaultdir <path|clear|status>`',
+    `Slash：\`${slashRef('setdefaultdir')} path:<path|clear|status>\``,
+    '示例：`!setdefaultdir ~/GitHub`、`!setdefaultdir clear`、`!setdefaultdir status`',
+  ].join('\n');
+}
+
+function formatWorkspaceUpdateReport(key, session, result) {
+  const language = normalizeUiLanguage(getSessionLanguage(session));
+  const lines = getWorkspaceStatusLines(key, session, language);
+  if (language === 'en') {
+    return [
+      result.clearedOverride ? '✅ Cleared thread workspace override' : '✅ Workspace updated',
+      ...lines,
+      result.sessionReset
+        ? '• session: reset because Codex cannot resume into a different workspace'
+        : '• session: kept',
+    ].join('\n');
+  }
+  return [
+    result.clearedOverride ? '✅ 已清除当前 thread 的 workspace 覆盖' : '✅ workspace 已更新',
+    ...lines,
+    result.sessionReset
+      ? '• session: 已重置（Codex 不能在不同 workspace 中继续同一个 session）'
+      : '• session: 已保留',
+  ].join('\n');
+}
+
+function formatDefaultWorkspaceUpdateReport(key, session, result) {
+  const language = normalizeUiLanguage(getSessionLanguage(session));
+  const lines = getWorkspaceStatusLines(key, session, language);
+  if (language === 'en') {
+    return [
+      result.defaultWorkspaceDir ? '✅ Provider default workspace updated' : '✅ Provider default workspace cleared',
+      ...lines,
+      `• affected threads: ${result.affectedThreads}`,
+      `• reset sessions: ${result.resetSessions}`,
+    ].join('\n');
+  }
+  return [
+    result.defaultWorkspaceDir ? '✅ provider 默认 workspace 已更新' : '✅ provider 默认 workspace 已清除',
+    ...lines,
+    `• 受影响 threads: ${result.affectedThreads}`,
+    `• 重置 sessions: ${result.resetSessions}`,
+  ].join('\n');
+}
+
+function formatWorkspaceBusyReport(session, workspaceDir, owner = null) {
+  const language = normalizeUiLanguage(getSessionLanguage(session));
+  const ownerProvider = owner?.provider ? `\`${owner.provider}\`` : null;
+  const ownerKey = owner?.key ? `\`${owner.key}\`` : null;
+  const acquiredAtMs = owner?.acquiredAt ? Date.parse(owner.acquiredAt) : NaN;
+  const age = Number.isFinite(acquiredAtMs) ? humanAge(Math.max(0, Date.now() - acquiredAtMs)) : null;
+  if (language === 'en') {
+    return [
+      '⏳ Workspace is busy; waiting for exclusive access.',
+      `• workspace: \`${workspaceDir}\``,
+      ownerProvider ? `• owner provider: ${ownerProvider}` : null,
+      ownerKey ? `• owner channel: ${ownerKey}` : null,
+      age ? `• lock age: ${age}` : null,
+    ].filter(Boolean).join('\n');
+  }
+  return [
+    '⏳ workspace 正忙，正在等待独占执行。',
+    `• workspace: \`${workspaceDir}\``,
+    ownerProvider ? `• 当前持有 provider: ${ownerProvider}` : null,
+    ownerKey ? `• 当前持有频道: ${ownerKey}` : null,
+    age ? `• 锁已持有: ${age}` : null,
+  ].filter(Boolean).join('\n');
+}
+
 function formatBotModeLabel() {
   if (!BOT_PROVIDER) {
     return 'shared (provider can switch per channel)';
@@ -3443,9 +3786,22 @@ function renderMissingDiscordTokenHint({ botProvider = null, env = process.env }
   return 'Missing DISCORD_TOKEN in environment';
 }
 
+function resolveConfiguredWorkspaceDir(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  return resolvePath(raw);
+}
+
 function resolvePath(input) {
-  if (path.isAbsolute(input)) return path.normalize(input);
-  return path.resolve(process.cwd(), input);
+  const raw = String(input || '').trim();
+  if (!raw) return path.resolve(process.cwd());
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (raw === '~' && home) return home;
+  if (home && (raw.startsWith('~/') || raw.startsWith('~\\'))) {
+    return path.join(home, raw.slice(2));
+  }
+  if (path.isAbsolute(raw)) return path.normalize(raw);
+  return path.resolve(process.cwd(), raw);
 }
 
 function safeError(err) {

@@ -1,7 +1,60 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { normalizeSlashCommandName, slashName, slashRef } from '../src/slash-command-surface.js';
+import { buildSlashCommands, normalizeSlashCommandName, slashName, slashRef } from '../src/slash-command-surface.js';
+
+class MockSlashCommandBuilder {
+  constructor() {
+    this.data = { options: [] };
+  }
+
+  setName(name) {
+    this.data.name = name;
+    return this;
+  }
+
+  setDescription(description) {
+    this.data.description = description;
+    return this;
+  }
+
+  addStringOption(configure) {
+    const option = new MockSlashOptionBuilder();
+    configure(option);
+    this.data.options.push(option.data);
+    return this;
+  }
+
+  toJSON() {
+    return this.data;
+  }
+}
+
+class MockSlashOptionBuilder {
+  constructor() {
+    this.data = { choices: [] };
+  }
+
+  setName(name) {
+    this.data.name = name;
+    return this;
+  }
+
+  setDescription(description) {
+    this.data.description = description;
+    return this;
+  }
+
+  setRequired(required) {
+    this.data.required = required;
+    return this;
+  }
+
+  addChoices(...choices) {
+    this.data.choices.push(...choices);
+    return this;
+  }
+}
 
 test('slashName applies prefix and truncates to Discord limit', () => {
   assert.equal(slashName('status', 'cx'), 'cx_status');
@@ -17,4 +70,16 @@ test('normalizeSlashCommandName strips configured prefix only', () => {
 test('slashRef renders clickable command reference', () => {
   assert.equal(slashRef('progress', 'cx'), '/cx_progress');
   assert.equal(slashRef('progress', ''), '/progress');
+});
+
+test('buildSlashCommands includes workspace commands', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'cx',
+    botProvider: null,
+  }).map((command) => command.toJSON());
+
+  const names = commands.map((command) => command.name);
+  assert.ok(names.includes('cx_setdir'));
+  assert.ok(names.includes('cx_setdefaultdir'));
 });

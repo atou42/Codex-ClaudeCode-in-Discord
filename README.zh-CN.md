@@ -8,7 +8,7 @@
 
 - Slash 命令（不需要 `!` 前缀）
 - 按线程持久化会话（重启后可恢复）
-- 每线程独立 workspace 目录（隔离文件操作）
+- 灵活 workspace 模型：thread 覆盖、provider 默认目录，以及 legacy 每线程回退目录
 - 运行时自愈：Discord/运行时出现瞬时故障后自动退避重登
 - 两种模式：
   - `safe` -> `codex exec --full-auto`（沙箱模式）
@@ -56,7 +56,8 @@ Git hooks 说明：
 然后在你的 Discord 服务器邀请 Bot，并使用以下 slash 命令。下面示例使用的是 Codex / shared 模式默认前缀 `cx_`；独立 Claude bot 默认前缀改为 `cc_`，并且两者都可通过 `SLASH_PREFIX`、`CODEX__SLASH_PREFIX`、`CLAUDE__SLASH_PREFIX` 覆盖：
 
 - `/cx_status` - 查看当前线程配置
-- `/cx_setdir <path>` - 设置当前线程的 workspace 目录
+- `/cx_setdir <path|default|status>` - 设置或清除当前线程的 workspace
+- `/cx_setdefaultdir <path|clear|status>` - 设置当前 provider 的默认 workspace
 - `/cx_model <name|default>` - 设置模型覆盖
 - `/cx_effort <high|medium|low|default>` - 设置推理强度
 - `/cx_effort <xhigh|high|medium|low|default>` - 设置 reasoning effort
@@ -96,9 +97,9 @@ npm run start:claude
 关键项：
 
 - `ALLOWED_CHANNEL_IDS` / `ALLOWED_USER_IDS`：限制可用范围（推荐）
-- 共享 `.env` key：只放 Discord / 运行时配置（`ALLOWED_*`、`WORKSPACE_ROOT`、代理等）
-- `CODEX__*`：同一个 `.env` 里的 Codex bot 分组（通常只需要 `CODEX__DISCORD_TOKEN`，以及按需填写 `CODEX__DEFAULT_MODEL`、`CODEX__DEFAULT_MODE`、`CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`、`CODEX__CODEX_BIN`）
-- `CLAUDE__*`：同一个 `.env` 里的 Claude bot 分组（通常只需要 `CLAUDE__DISCORD_TOKEN`，以及按需填写 `CLAUDE__DEFAULT_MODEL`、`CLAUDE__DEFAULT_MODE`、`CLAUDE__CLAUDE_BIN`）
+- 共享 `.env` key：只放 Discord / 运行时配置（`ALLOWED_*`、`WORKSPACE_ROOT`、`DEFAULT_WORKSPACE_DIR`、代理等）
+- `CODEX__*`：同一个 `.env` 里的 Codex bot 分组（通常只需要 `CODEX__DISCORD_TOKEN`，以及按需填写 `CODEX__DEFAULT_MODEL`、`CODEX__DEFAULT_MODE`、`CODEX__DEFAULT_WORKSPACE_DIR`、`CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`、`CODEX__CODEX_BIN`）
+- `CLAUDE__*`：同一个 `.env` 里的 Claude bot 分组（通常只需要 `CLAUDE__DISCORD_TOKEN`，以及按需填写 `CLAUDE__DEFAULT_MODEL`、`CLAUDE__DEFAULT_MODE`、`CLAUDE__DEFAULT_WORKSPACE_DIR`、`CLAUDE__CLAUDE_BIN`）
 - `BOT_PROVIDER`：留空表示共享模式；设为 `codex` / `claude` 可把当前 bot 实例锁到单一 provider；`npm run start:codex` / `npm run start:claude` 会自动设置
 - `ENV_FILE`：仍可选配额外 overlay 文件，但常规使用现在就是单个分组 `.env`
 - `DISCORD_TOKEN_CODEX` / `DISCORD_TOKEN_CLAUDE`：旧的单文件回退方案，保留兼容
@@ -114,7 +115,9 @@ npm run start:claude
 - `DEFAULT_UI_LANGUAGE`：新频道默认提示语言（`zh` 或 `en`，默认 `zh`）
 - `ONBOARDING_ENABLED_DEFAULT`：新频道 onboarding 默认开关（`true` 或 `false`，默认 `true`）
 - `DEFAULT_MODE`：`safe` 或 `dangerous`；独立 bot 建议分别写成 `CODEX__DEFAULT_MODE` / `CLAUDE__DEFAULT_MODE`
-- `WORKSPACE_ROOT`：按线程创建目录的根路径
+- `DEFAULT_WORKSPACE_DIR`：两个 provider 共用的默认 workspace（可选）
+- `CODEX__DEFAULT_WORKSPACE_DIR` / `CLAUDE__DEFAULT_WORKSPACE_DIR`：provider 级默认 workspace
+- `WORKSPACE_ROOT`：仅在未配置 thread 覆盖与 provider 默认目录时，作为 legacy 回退目录根路径
 - `CODEX_BIN`：codex 命令/路径（默认 `codex`）
 - `CLAUDE_BIN`：claude 命令/路径（默认 `claude`）
 - `CODEX_TIMEOUT_MS`：单次 codex 运行硬超时（毫秒），`0` 表示禁用超时

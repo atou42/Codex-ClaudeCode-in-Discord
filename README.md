@@ -10,8 +10,9 @@ A tiny Discord bot that bridges **Codex CLI** or **Claude Code** into Discord.
 
 - Slash commands (no `!` required)
 - Thread-level session persistence (restart-safe)
-- Per-thread workspace directory (keeps file ops isolated)
+- Flexible workspace model: thread override, provider default, plus legacy per-thread fallback
 - Self-healing runtime: auto relogin with backoff after transient Discord/runtime failures
+- Workspace-level serialization so the same workspace is never executed concurrently across channels/bots
 - Two modes:
   - `safe` → `codex exec --full-auto` (sandboxed)
   - `dangerous` → `--dangerously-bypass-approvals-and-sandbox` (full access)
@@ -58,7 +59,8 @@ Git hooks note:
 Then in your Discord server, invite the bot, and use these slash commands. Examples below use the default Codex/shared prefix `cx_`; a dedicated Claude bot defaults to `cc_`, and both can be overridden with `SLASH_PREFIX`, `CODEX__SLASH_PREFIX`, or `CLAUDE__SLASH_PREFIX`:
 
 - `/cx_status` — show current thread config
-- `/cx_setdir <path>` — set workspace dir for current thread
+- `/cx_setdir <path|default|status>` — set or clear workspace for current thread
+- `/cx_setdefaultdir <path|clear|status>` — set provider default workspace
 - `/cx_model <name|default>` — set model override
 - `/cx_effort <high|medium|low|default>` — set reasoning effort
 - `/cx_effort <xhigh|high|medium|low|default>` — set reasoning effort
@@ -98,9 +100,9 @@ See `.env.example`.
 Important knobs:
 
 - `ALLOWED_CHANNEL_IDS` / `ALLOWED_USER_IDS`: lock the bot down (recommended)
-- Shared `.env` keys: Discord/runtime settings only (`ALLOWED_*`, `WORKSPACE_ROOT`, proxy, etc.)
-- `CODEX__*`: Codex bot section in the same `.env` (normally `CODEX__DISCORD_TOKEN`, plus optional `CODEX__DEFAULT_MODEL`, `CODEX__DEFAULT_MODE`, `CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`, `CODEX__CODEX_BIN`)
-- `CLAUDE__*`: Claude bot section in the same `.env` (normally `CLAUDE__DISCORD_TOKEN`, plus optional `CLAUDE__DEFAULT_MODEL`, `CLAUDE__DEFAULT_MODE`, `CLAUDE__CLAUDE_BIN`)
+- Shared `.env` keys: Discord/runtime settings only (`ALLOWED_*`, `WORKSPACE_ROOT`, `DEFAULT_WORKSPACE_DIR`, proxy, etc.)
+- `CODEX__*`: Codex bot section in the same `.env` (normally `CODEX__DISCORD_TOKEN`, plus optional `CODEX__DEFAULT_MODEL`, `CODEX__DEFAULT_MODE`, `CODEX__DEFAULT_WORKSPACE_DIR`, `CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`, `CODEX__CODEX_BIN`)
+- `CLAUDE__*`: Claude bot section in the same `.env` (normally `CLAUDE__DISCORD_TOKEN`, plus optional `CLAUDE__DEFAULT_MODEL`, `CLAUDE__DEFAULT_MODE`, `CLAUDE__DEFAULT_WORKSPACE_DIR`, `CLAUDE__CLAUDE_BIN`)
 - `BOT_PROVIDER`: leave empty for shared mode, or set `codex` / `claude` to lock one bot instance to a single provider; `npm run start:codex` / `npm run start:claude` set this automatically
 - `ENV_FILE`: optional extra overlay file if you really need one, but the normal setup is now a single grouped `.env`
 - `DISCORD_TOKEN_CODEX` / `DISCORD_TOKEN_CLAUDE`: legacy fallback for older single-file setups
@@ -116,7 +118,9 @@ Important knobs:
 - `DEFAULT_UI_LANGUAGE`: default bot message language for new channels (`zh` or `en`, default `zh`)
 - `ONBOARDING_ENABLED_DEFAULT`: onboarding default for new channels (`true` or `false`, default `true`)
 - `DEFAULT_MODE`: `safe` or `dangerous`; for dedicated bots keep this under `CODEX__DEFAULT_MODE` / `CLAUDE__DEFAULT_MODE`
-- `WORKSPACE_ROOT`: where per-thread folders are created
+- `DEFAULT_WORKSPACE_DIR`: optional shared default workspace for both providers
+- `CODEX__DEFAULT_WORKSPACE_DIR` / `CLAUDE__DEFAULT_WORKSPACE_DIR`: provider-specific default workspace roots
+- `WORKSPACE_ROOT`: legacy fallback root used only when neither thread override nor provider default is configured
 - `CODEX_BIN`: codex command/path (default `codex`)
 - `CLAUDE_BIN`: claude command/path (default `claude`)
 - `CODEX_TIMEOUT_MS`: hard timeout per codex run (ms). `0` disables timeout.

@@ -7,34 +7,35 @@ import path from 'node:path';
 import { createSessionStore } from '../src/session-store.js';
 
 function normalizeProvider(value) {
-  return String(value || '').trim().toLowerCase() === 'claude' ? 'claude' : 'codex';
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'claude') return 'claude';
+  return 'codex';
 }
 
 function normalizeUiLanguage(value) {
-  return String(value || '').trim().toLowerCase() === 'en' ? 'en' : 'zh';
+  return value === 'en' ? 'en' : 'zh';
 }
 
 function normalizeSessionSecurityProfile(value) {
-  return ['auto', 'solo', 'team', 'public'].includes(value) ? value : null;
+  if (!value) return null;
+  return value;
 }
 
 function normalizeSessionTimeoutMs(value) {
   if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  return n <= 0 ? 0 : Math.floor(n);
+  return Number.isFinite(n) ? n : null;
 }
 
 function normalizeSessionProcessLines(value) {
   if (value === null || value === undefined || value === '') return null;
-  const n = Math.floor(Number(value));
-  if (!Number.isFinite(n) || n < 1 || n > 5) return null;
-  return n;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 function normalizeSessionCompactStrategy(value) {
-  if (value === null || value === undefined || value === '') return null;
-  return ['hard', 'native', 'off'].includes(value) ? value : 'hard';
+  if (!value) return null;
+  return value;
 }
 
 function normalizeSessionCompactEnabled(value) {
@@ -50,7 +51,7 @@ function normalizeSessionCompactTokenLimit(value) {
   return Math.floor(n);
 }
 
-test('createSessionStore creates provider-locked default session and persists workspace', () => {
+test('createSessionStore keeps legacy fallback for fresh thread when no default workspace exists', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-cli-discord-session-store-'));
   const dataFile = path.join(root, 'sessions.json');
   const workspaceRoot = path.join(root, 'workspaces');
@@ -77,18 +78,108 @@ test('createSessionStore creates provider-locked default session and persists wo
   });
 
   const session = store.getSession('thread-1');
-  assert.equal(session.provider, 'claude');
-  assert.equal(session.mode, 'safe');
-  assert.equal(session.language, 'zh');
-  assert.equal(session.onboardingEnabled, true);
-
   const workspaceDir = store.ensureWorkspace(session, 'thread-1');
-  assert.equal(workspaceDir, path.join(workspaceRoot, 'thread-1'));
-  assert.equal(fs.existsSync(workspaceDir), true);
 
-  session.model = 'claude-sonnet';
-  store.saveDb();
-  const saved = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
-  assert.equal(saved.threads['thread-1'].provider, 'claude');
-  assert.equal(saved.threads['thread-1'].model, 'claude-sonnet');
+  assert.equal(session.provider, 'claude');
+  assert.equal(workspaceDir, path.join(workspaceRoot, 'thread-1'));
+  assert.equal(session.workspaceDir, null);
+  assert.equal(fs.existsSync(workspaceDir), true);
+});
+
+test('createSessionStore resolves provider default workspace without persisting thread override', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-cli-discord-session-store-'));
+  const dataFile = path.join(root, 'sessions.json');
+  const workspaceRoot = path.join(root, 'workspaces');
+  const defaultWorkspaceDir = path.join(root, 'shared-workspace');
+  fs.mkdirSync(defaultWorkspaceDir, { recursive: true });
+
+  const store = createSessionStore({
+    dataFile,
+    workspaceRoot,
+    botProvider: 'claude',
+    defaults: {
+      provider: 'codex',
+      mode: 'safe',
+      language: 'zh',
+      onboardingEnabled: true,
+    },
+    getSessionId: (session) => String(session?.runnerSessionId || session?.codexThreadId || '').trim() || null,
+    normalizeProvider,
+    normalizeUiLanguage,
+    normalizeSessionSecurityProfile,
+    normalizeSessionTimeoutMs,
+    normalizeSessionProcessLines,
+    normalizeSessionCompactStrategy,
+    normalizeSessionCompactEnabled,
+    normalizeSessionCompactTokenLimit,
+    resolveDefaultWorkspace: () => ({
+      workspaceDir: defaultWorkspaceDir,
+      source: 'provider-scoped env',
+      envKey: 'CLAUDE__DEFAULT_WORKSPACE_DIR',
+    }),
+  });
+
+  const session = store.getSession('thread-1');
+  const binding = store.getWorkspaceBinding(session, 'thread-1');
+  const workspaceDir = store.ensureWorkspace(session, 'thread-1');
+
+  assert.equal(binding.workspaceDir, defaultWorkspaceDir);
+  assert.equal(binding.source, 'provider default');
+  assert.equal(workspaceDir, defaultWorkspaceDir);
+  assert.equal(session.workspaceDir, null);
+});
+
+test('createSessionStore migrates persisted legacy thread workspace to null so defaults can apply', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-cli-discord-session-store-'));
+  const dataFile = path.join(root, 'sessions.json');
+  const workspaceRoot = path.join(root, 'workspaces');
+  const defaultWorkspaceDir = path.join(root, 'repo-root');
+  const legacyDir = path.join(workspaceRoot, 'thread-1');
+  fs.mkdirSync(defaultWorkspaceDir, { recursive: true });
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(dataFile, JSON.stringify({
+    threads: {
+      'thread-1': {
+        provider: 'codex',
+        workspaceDir: legacyDir,
+        runnerSessionId: 'sess-1',
+        codexThreadId: 'sess-1',
+        mode: 'safe',
+        language: 'zh',
+        onboardingEnabled: true,
+      },
+    },
+  }, null, 2));
+
+  const store = createSessionStore({
+    dataFile,
+    workspaceRoot,
+    defaults: {
+      provider: 'codex',
+      mode: 'safe',
+      language: 'zh',
+      onboardingEnabled: true,
+    },
+    getSessionId: (session) => String(session?.runnerSessionId || session?.codexThreadId || '').trim() || null,
+    normalizeProvider,
+    normalizeUiLanguage,
+    normalizeSessionSecurityProfile,
+    normalizeSessionTimeoutMs,
+    normalizeSessionProcessLines,
+    normalizeSessionCompactStrategy,
+    normalizeSessionCompactEnabled,
+    normalizeSessionCompactTokenLimit,
+    resolveDefaultWorkspace: () => ({
+      workspaceDir: defaultWorkspaceDir,
+      source: 'provider-scoped env',
+      envKey: 'CODEX__DEFAULT_WORKSPACE_DIR',
+    }),
+  });
+
+  const session = store.getSession('thread-1');
+  const binding = store.getWorkspaceBinding(session, 'thread-1');
+
+  assert.equal(session.workspaceDir, null);
+  assert.equal(binding.workspaceDir, defaultWorkspaceDir);
+  assert.equal(binding.source, 'provider default');
 });

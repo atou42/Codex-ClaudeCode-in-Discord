@@ -1,6 +1,18 @@
+function hasWorkspaceChanged(previousDir, nextDir) {
+  return String(previousDir || '') !== String(nextDir || '');
+}
+
+function shouldResetSessionForWorkspaceChange(provider, previousDir, nextDir) {
+  return provider === 'codex' && hasWorkspaceChanged(previousDir, nextDir);
+}
+
 export function createSessionCommandActions({
   saveDb,
   ensureWorkspace,
+  getWorkspaceBinding = () => ({ workspaceDir: null, source: 'legacy fallback' }),
+  listStoredSessions = () => [],
+  resolveProviderDefaultWorkspace = () => ({ workspaceDir: null, source: 'unset', envKey: null }),
+  setProviderDefaultWorkspace = () => ({ workspaceDir: null, source: 'unset', envKey: null }),
   clearSessionId,
   getSessionId,
   setSessionId,
@@ -8,7 +20,6 @@ export function createSessionCommandActions({
   getProviderShortName,
   resolveTimeoutSetting,
   resolveProcessLinesSetting,
-  ensureGitRepo,
   listRecentSessions,
   humanAge,
 } = {}) {
@@ -107,12 +118,100 @@ export function createSessionCommandActions({
     return { label: session.name };
   }
 
-  function setWorkspaceDir(session, resolvedPath) {
-    ensureGitRepo(resolvedPath);
+  function setWorkspaceDir(session, key, resolvedPath) {
+    const provider = getSessionProvider(session);
+    const previousBinding = getWorkspaceBinding(session, key);
     session.workspaceDir = resolvedPath;
-    clearSessionId(session);
+    const nextBinding = getWorkspaceBinding(session, key);
+    const sessionReset = shouldResetSessionForWorkspaceChange(provider, previousBinding.workspaceDir, nextBinding.workspaceDir);
+    if (sessionReset) clearSessionId(session);
     saveDb();
-    return { workspaceDir: session.workspaceDir };
+    return {
+      provider,
+      workspaceDir: nextBinding.workspaceDir,
+      source: nextBinding.source,
+      previousWorkspaceDir: previousBinding.workspaceDir,
+      sessionReset,
+      sessionId: getSessionId(session),
+    };
+  }
+
+  function clearWorkspaceDir(session, key) {
+    const provider = getSessionProvider(session);
+    const previousBinding = getWorkspaceBinding(session, key);
+    session.workspaceDir = null;
+    const nextBinding = getWorkspaceBinding(session, key);
+    const sessionReset = shouldResetSessionForWorkspaceChange(provider, previousBinding.workspaceDir, nextBinding.workspaceDir);
+    if (sessionReset) clearSessionId(session);
+    saveDb();
+    return {
+      provider,
+      workspaceDir: nextBinding.workspaceDir,
+      source: nextBinding.source,
+      previousWorkspaceDir: previousBinding.workspaceDir,
+      sessionReset,
+      sessionId: getSessionId(session),
+      clearedOverride: true,
+    };
+  }
+
+  function setDefaultWorkspaceDir(session, resolvedPath) {
+    const provider = getSessionProvider(session);
+    const previousDefault = resolveProviderDefaultWorkspace(provider);
+    const trackedSessions = listStoredSessions({ provider });
+    const beforeBindings = new Map(
+      trackedSessions.map(({ key, session: storedSession }) => [key, getWorkspaceBinding(storedSession, key)]),
+    );
+
+    const nextDefault = setProviderDefaultWorkspace(provider, resolvedPath);
+
+    let affectedThreads = 0;
+    let resetSessions = 0;
+    let currentThreadChanged = false;
+    let currentSessionReset = false;
+
+    if (provider === 'codex') {
+      for (const { key, session: storedSession } of trackedSessions) {
+        const before = beforeBindings.get(key);
+        const after = getWorkspaceBinding(storedSession, key);
+        if (!hasWorkspaceChanged(before?.workspaceDir, after.workspaceDir)) continue;
+        affectedThreads += 1;
+        currentThreadChanged ||= storedSession === session;
+        if (getSessionId(storedSession)) {
+          clearSessionId(storedSession);
+          resetSessions += 1;
+          if (storedSession === session) currentSessionReset = true;
+        }
+      }
+      if (affectedThreads > 0 || resetSessions > 0) {
+        saveDb();
+      }
+    } else {
+      const currentKey = trackedSessions.find(({ session: storedSession }) => storedSession === session)?.key || null;
+      if (currentKey) {
+        const before = beforeBindings.get(currentKey);
+        const after = getWorkspaceBinding(session, currentKey);
+        currentThreadChanged = hasWorkspaceChanged(before?.workspaceDir, after.workspaceDir);
+      }
+      affectedThreads = trackedSessions.filter(({ key, session: storedSession }) => {
+        const before = beforeBindings.get(key);
+        const after = getWorkspaceBinding(storedSession, key);
+        return hasWorkspaceChanged(before?.workspaceDir, after.workspaceDir);
+      }).length;
+    }
+
+    return {
+      provider,
+      defaultWorkspaceDir: nextDefault.workspaceDir,
+      defaultSource: nextDefault.source,
+      defaultEnvKey: nextDefault.envKey,
+      previousDefaultWorkspaceDir: previousDefault.workspaceDir,
+      previousDefaultSource: previousDefault.source,
+      affectedThreads,
+      resetSessions,
+      currentThreadChanged,
+      currentSessionReset,
+    };
   }
 
   function resetSession(session) {
@@ -152,6 +251,8 @@ export function createSessionCommandActions({
     bindSession,
     renameSession,
     setWorkspaceDir,
+    clearWorkspaceDir,
+    setDefaultWorkspaceDir,
     resetSession,
     formatRecentSessionsReport,
   };

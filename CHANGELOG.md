@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.1] - 2026-03-07
+
+### Added
+- Provider-level default workspace support via `DEFAULT_WORKSPACE_DIR`, `CODEX__DEFAULT_WORKSPACE_DIR`, and `CLAUDE__DEFAULT_WORKSPACE_DIR`.
+- Runtime workspace controls for both text and slash commands: `!setdir`, `!setdefaultdir`, `/setdir`, and `/setdefaultdir`.
+- Cross-process workspace serialization using lock files, so the same workspace is no longer executed concurrently from multiple channels/bots.
+- Regression tests for workspace resolution, provider default migration, and workspace lock behavior.
+
+### Changed
+- Workspace resolution now prefers thread override → provider default → legacy `WORKSPACE_ROOT/<threadId>` fallback.
+- Claude runs now receive the provider default workspace as an extra `--add-dir` when different from the current working directory, making parent/sibling navigation less restrictive.
+- Status/help/doctor output now shows effective workspace, workspace source, and serialization state.
+- `WORKSPACE_ROOT` is now documented as a legacy fallback root rather than the primary recommended workspace model.
+
+### Fixed
+- Stop auto-creating or auto-initializing Git repositories when the effective workspace is an existing shared directory such as `~/GitHub`.
+- Keep Claude sessions when switching workspace where possible, while still resetting Codex sessions when a real workspace change makes resume unsafe.
+- Allow cancellation while a task is blocked waiting on a busy workspace lock.
+
 ## [0.3.0] - 2026-03-07
 
 ### Added
