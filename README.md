@@ -1,6 +1,8 @@
-# codex-cli-discord
+# Codex-ClaudeCode-in-Discord
 
-A tiny Discord bot that bridges **Codex CLI** or **Claude Code** into Discord.
+A Discord bot that lets you direct **Codex CLI** and **Claude Code** from inside Discord.
+
+> This project is a standalone Discord bot / bridge. It is **not** an OpenClaw plugin, and it does **not** depend on OpenClaw to run.
 
 [中文文档](./README.zh-CN.md)
 
@@ -43,8 +45,8 @@ A tiny Discord bot that bridges **Codex CLI** or **Claude Code** into Discord.
 ## Quickstart
 
 ```bash
-git clone <YOUR_REPO_URL>
-cd codex-cli-discord
+git clone https://github.com/atou42/Codex-ClaudeCode-in-Discord.git
+cd Codex-ClaudeCode-in-Discord
 cp .env.example .env
 npm install
 npm run setup-hooks

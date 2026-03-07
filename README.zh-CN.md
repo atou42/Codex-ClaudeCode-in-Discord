@@ -1,6 +1,8 @@
-# codex-cli-discord
+# Codex-ClaudeCode-in-Discord
 
-一个轻量的 Discord Bot，用于把 **Codex CLI** 或 **Claude Code** 桥接到 Discord 中。
+一个让你可以直接在 Discord 里指挥 **Codex CLI** 和 **Claude Code** 的 Discord Bot。
+
+> 这是一个独立运行的 Discord Bot / bridge，**不是** OpenClaw 插件，也**不依赖** OpenClaw 才能运行。
 
 **设计原则：**1 个 Discord **线程/频道 = 1 个 CLI 会话**（按当前 provider 自动续聊）。
 
@@ -40,8 +42,8 @@
 ## 快速开始
 
 ```bash
-git clone <YOUR_REPO_URL>
-cd codex-cli-discord
+git clone https://github.com/atou42/Codex-ClaudeCode-in-Discord.git
+cd Codex-ClaudeCode-in-Discord
 cp .env.example .env
 npm install
 npm run setup-hooks
