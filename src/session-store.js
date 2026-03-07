@@ -16,6 +16,12 @@ export function ensureGitRepo(dir) {
   spawnSync('git', ['init'], { cwd: dir, stdio: 'ignore' });
 }
 
+function normalizeWorkspaceDir(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  return path.resolve(raw);
+}
+
 export function createSessionStore({
   dataFile,
   workspaceRoot,
@@ -30,6 +36,7 @@ export function createSessionStore({
   normalizeSessionCompactStrategy,
   normalizeSessionCompactEnabled,
   normalizeSessionCompactTokenLimit,
+  resolveDefaultWorkspace = () => ({ workspaceDir: null, source: 'unset', envKey: null }),
 } = {}) {
   let db = loadDb(dataFile);
 
@@ -92,6 +99,10 @@ export function createSessionStore({
       session.codexThreadId = normalizedSessionId;
       migrated = true;
     }
+    if (session.workspaceDir === undefined) {
+      session.workspaceDir = null;
+      migrated = true;
+    }
     if (session.effort === undefined) {
       session.effort = null;
       migrated = true;
@@ -145,6 +156,18 @@ export function createSessionStore({
       migrated = true;
     }
 
+    const normalizedWorkspaceDir = normalizeWorkspaceDir(session.workspaceDir);
+    if (session.workspaceDir !== normalizedWorkspaceDir) {
+      session.workspaceDir = normalizedWorkspaceDir;
+      migrated = true;
+    }
+
+    const legacyWorkspaceDir = normalizeWorkspaceDir(path.join(workspaceRoot, key));
+    if (session.workspaceDir && legacyWorkspaceDir && session.workspaceDir === legacyWorkspaceDir) {
+      session.workspaceDir = null;
+      migrated = true;
+    }
+
     const normalizedLanguage = normalizeUiLanguage(session.language);
     if (session.language !== normalizedLanguage) {
       session.language = normalizedLanguage;
@@ -191,20 +214,79 @@ export function createSessionStore({
     return session;
   }
 
-  function ensureWorkspace(session, key) {
-    if (!session.workspaceDir) {
-      session.workspaceDir = path.join(workspaceRoot, key);
-      saveDb();
+  function getWorkspaceBinding(session, key) {
+    const provider = normalizeProvider(session?.provider || defaults.provider);
+    const defaultBinding = resolveDefaultWorkspace(provider) || {};
+    const defaultWorkspaceDir = normalizeWorkspaceDir(defaultBinding.workspaceDir);
+    const legacyWorkspaceDir = normalizeWorkspaceDir(path.join(workspaceRoot, key));
+    const explicitWorkspaceDir = normalizeWorkspaceDir(session?.workspaceDir);
+
+    if (explicitWorkspaceDir) {
+      return {
+        provider,
+        workspaceDir: explicitWorkspaceDir,
+        source: 'thread override',
+        defaultWorkspaceDir,
+        defaultSource: defaultBinding.source || 'unset',
+        defaultEnvKey: defaultBinding.envKey || null,
+        legacyWorkspaceDir,
+      };
     }
-    ensureDir(session.workspaceDir);
-    ensureGitRepo(session.workspaceDir);
-    return session.workspaceDir;
+
+    if (defaultWorkspaceDir) {
+      return {
+        provider,
+        workspaceDir: defaultWorkspaceDir,
+        source: 'provider default',
+        defaultWorkspaceDir,
+        defaultSource: defaultBinding.source || 'unset',
+        defaultEnvKey: defaultBinding.envKey || null,
+        legacyWorkspaceDir,
+      };
+    }
+
+    return {
+      provider,
+      workspaceDir: legacyWorkspaceDir,
+      source: 'legacy fallback',
+      defaultWorkspaceDir: null,
+      defaultSource: defaultBinding.source || 'unset',
+      defaultEnvKey: defaultBinding.envKey || null,
+      legacyWorkspaceDir,
+    };
+  }
+
+  function ensureWorkspace(session, key) {
+    const binding = getWorkspaceBinding(session, key);
+    if (binding.source === 'legacy fallback') {
+      ensureDir(binding.workspaceDir);
+      return binding.workspaceDir;
+    }
+
+    if (!fs.existsSync(binding.workspaceDir)) {
+      throw new Error(`Workspace directory does not exist: ${binding.workspaceDir}`);
+    }
+    const stat = fs.statSync(binding.workspaceDir);
+    if (!stat.isDirectory()) {
+      throw new Error(`Workspace path is not a directory: ${binding.workspaceDir}`);
+    }
+    return binding.workspaceDir;
+  }
+
+  function listSessions({ provider = null } = {}) {
+    db.threads ||= {};
+    const normalizedProvider = provider ? normalizeProvider(provider) : null;
+    return Object.entries(db.threads)
+      .map(([key, session]) => ({ key, session }))
+      .filter(({ session }) => !normalizedProvider || normalizeProvider(session?.provider || defaults.provider) === normalizedProvider);
   }
 
   return {
     getSession,
     saveDb,
     ensureWorkspace,
+    getWorkspaceBinding,
+    listSessions,
   };
 }
 

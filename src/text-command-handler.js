@@ -1,18 +1,21 @@
 import fs from 'node:fs';
 
+function isExistingDirectory(dir) {
+  try {
+    return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 export function createTextCommandHandler({
   botProvider = null,
   enableConfigCmd = false,
   getSession,
   saveDb,
-  ensureWorkspace,
-  clearSessionId,
-  getSessionId,
-  setSessionId,
   getSessionProvider,
   getSessionLanguage,
   getProviderDisplayName,
-  getProviderShortName,
   commandActions = {},
   isOnboardingEnabled,
   safeReply,
@@ -20,6 +23,11 @@ export function createTextCommandHandler({
   formatStatusReport,
   formatQueueReport,
   formatDoctorReport,
+  formatWorkspaceReport,
+  formatWorkspaceSetHelp,
+  formatWorkspaceUpdateReport,
+  formatDefaultWorkspaceSetHelp,
+  formatDefaultWorkspaceUpdateReport,
   formatOnboardingConfigHelp,
   formatOnboardingConfigReport,
   formatOnboardingDisabledMessage,
@@ -39,6 +47,7 @@ export function createTextCommandHandler({
   formatReasoningEffortHelp,
   formatReasoningEffortUnsupported,
   parseProviderInput,
+  parseWorkspaceCommandAction,
   parseOnboardingConfigAction,
   parseUiLanguageInput,
   parseSecurityProfileInput,
@@ -55,9 +64,6 @@ export function createTextCommandHandler({
   isReasoningEffortSupported,
   cancelChannelWork,
   resolvePath,
-  ensureGitRepo,
-  listRecentSessions,
-  humanAge,
   safeError,
 } = {}) {
   return async function handleCommand(message, key, content) {
@@ -212,16 +218,60 @@ export function createTextCommandHandler({
       case '!cd':
       case '!setdir': {
         if (!arg) {
-          await safeReply(message, '用法：`!setdir <path>`\n例：`!setdir ~/GitHub/my-project`');
+          await safeReply(message, formatWorkspaceSetHelp(getSessionLanguage(session)));
           return;
         }
-        const resolved = resolvePath(arg);
-        if (!fs.existsSync(resolved)) {
-          await safeReply(message, `❌ 目录不存在：\`${resolved}\`\n要新建的话先 mkdir。`);
+        const action = parseWorkspaceCommandAction(arg);
+        if (!action || action.type === 'invalid') {
+          await safeReply(message, formatWorkspaceSetHelp(getSessionLanguage(session)));
           return;
         }
-        commandActions.setWorkspaceDir(session, resolved);
-        await safeReply(message, `✅ workspace → \`${resolved}\`\n会话已重置（新目录 = 新上下文）。`);
+        if (action.type === 'status') {
+          await safeReply(message, formatWorkspaceReport(key, session));
+          return;
+        }
+        if (action.type === 'clear') {
+          const result = commandActions.clearWorkspaceDir(session, key);
+          await safeReply(message, formatWorkspaceUpdateReport(key, session, result));
+          return;
+        }
+        const resolved = resolvePath(action.value);
+        if (!isExistingDirectory(resolved)) {
+          await safeReply(message, `❌ 目录不存在或不是目录：\`${resolved}\``);
+          return;
+        }
+        const result = commandActions.setWorkspaceDir(session, key, resolved);
+        await safeReply(message, formatWorkspaceUpdateReport(key, session, result));
+        break;
+      }
+
+      case '!setdefaultdir':
+      case '!defaultdir': {
+        if (!arg) {
+          await safeReply(message, formatDefaultWorkspaceSetHelp(getSessionLanguage(session)));
+          return;
+        }
+        const action = parseWorkspaceCommandAction(arg);
+        if (!action || action.type === 'invalid') {
+          await safeReply(message, formatDefaultWorkspaceSetHelp(getSessionLanguage(session)));
+          return;
+        }
+        if (action.type === 'status') {
+          await safeReply(message, formatWorkspaceReport(key, session));
+          return;
+        }
+        if (action.type === 'clear') {
+          const result = commandActions.setDefaultWorkspaceDir(session, null);
+          await safeReply(message, formatDefaultWorkspaceUpdateReport(key, session, result));
+          return;
+        }
+        const resolved = resolvePath(action.value);
+        if (!isExistingDirectory(resolved)) {
+          await safeReply(message, `❌ 目录不存在或不是目录：\`${resolved}\``);
+          return;
+        }
+        const result = commandActions.setDefaultWorkspaceDir(session, resolved);
+        await safeReply(message, formatDefaultWorkspaceUpdateReport(key, session, result));
         break;
       }
 

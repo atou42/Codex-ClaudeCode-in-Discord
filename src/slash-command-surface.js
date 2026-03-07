@@ -25,8 +25,12 @@ export function buildSlashCommands({ SlashCommandBuilder, slashPrefix = '', botP
     new SlashCommandBuilder().setName(slashName('sessions', slashPrefix)).setDescription('列出最近的 provider sessions'),
     new SlashCommandBuilder()
       .setName(slashName('setdir', slashPrefix))
-      .setDescription('设置当前 thread 的工作目录')
-      .addStringOption(o => o.setName('path').setDescription('绝对路径，如 ~/GitHub/my-project').setRequired(true)),
+      .setDescription('设置当前 thread 的工作目录（支持 status/default/clear）')
+      .addStringOption(o => o.setName('path').setDescription('绝对路径，或 status/default/clear').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName(slashName('setdefaultdir', slashPrefix))
+      .setDescription('设置当前 provider 的默认工作目录（支持 status/clear）')
+      .addStringOption(o => o.setName('path').setDescription('绝对路径，或 status/clear').setRequired(true)),
     !botProvider && new SlashCommandBuilder()
       .setName(slashName('provider', slashPrefix))
       .setDescription('切换当前频道使用的 CLI provider')

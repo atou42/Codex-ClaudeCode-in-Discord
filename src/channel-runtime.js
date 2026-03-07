@@ -46,11 +46,13 @@ export function createChannelRuntimeStore({
 
     let cancelledRunning = false;
     let pid = null;
-    if (state.activeRun?.child) {
+    if (state.activeRun) {
       state.activeRun.cancelRequested = true;
       cancelledRunning = true;
-      pid = state.activeRun.child.pid ?? null;
-      stopChildProcess(state.activeRun.child);
+      pid = state.activeRun.child?.pid ?? null;
+      if (state.activeRun.child) {
+        stopChildProcess(state.activeRun.child);
+      }
     }
 
     return {
@@ -108,7 +110,6 @@ export function stopChildProcess(child, killGraceMs = 3000) {
     try {
       if (!child.killed) child.kill('SIGKILL');
     } catch {
-      // ignore
     }
   }, killGraceMs).unref?.();
 }
