@@ -157,6 +157,7 @@ const SHARED_DEFAULT_WORKSPACE_DIR = resolveConfiguredWorkspaceDir(process.env.D
 const PROVIDER_DEFAULT_WORKSPACE_OVERRIDES = {
   codex: resolveConfiguredWorkspaceDir(process.env.CODEX__DEFAULT_WORKSPACE_DIR),
   claude: resolveConfiguredWorkspaceDir(process.env.CLAUDE__DEFAULT_WORKSPACE_DIR),
+  gemini: resolveConfiguredWorkspaceDir(process.env.GEMINI__DEFAULT_WORKSPACE_DIR),
 };
 const DEFAULT_PROVIDER = BOT_PROVIDER || normalizeProvider(process.env.DEFAULT_PROVIDER || process.env.CLI_PROVIDER || 'codex');
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || null;
@@ -167,6 +168,7 @@ const ONBOARDING_ENABLED_BY_DEFAULT = ONBOARDING_ENABLED_DEFAULT === null ? true
 const CODEX_TIMEOUT_MS = normalizeTimeoutMs(process.env.CODEX_TIMEOUT_MS, 0);
 const CODEX_BIN = (process.env.CODEX_BIN || 'codex').trim() || 'codex';
 const CLAUDE_BIN = (process.env.CLAUDE_BIN || 'claude').trim() || 'claude';
+const GEMINI_BIN = (process.env.GEMINI_BIN || 'gemini').trim() || 'gemini';
 const SHOW_REASONING = String(process.env.SHOW_REASONING || 'false').toLowerCase() === 'true';
 const DEBUG_EVENTS = String(process.env.DEBUG_EVENTS || 'false').toLowerCase() === 'true';
 const PROGRESS_UPDATES_ENABLED = String(process.env.PROGRESS_UPDATES_ENABLED || 'true').toLowerCase() !== 'false';
@@ -253,7 +255,11 @@ function getCodexDefaults() {
 }
 
 function normalizeProvider(value) {
-  return String(value || '').trim().toLowerCase() === 'claude' ? 'claude' : 'codex';
+  const raw = String(value || '').trim().toLowerCase();
+  if (['codex', 'openai'].includes(raw)) return 'codex';
+  if (['claude', 'anthropic'].includes(raw)) return 'claude';
+  if (['gemini', 'google'].includes(raw)) return 'gemini';
+  return 'codex';
 }
 
 function getSessionProvider(session) {
@@ -261,23 +267,58 @@ function getSessionProvider(session) {
 }
 
 function getProviderDisplayName(provider) {
-  return normalizeProvider(provider) === 'claude' ? 'Claude Code' : 'Codex';
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return 'Claude Code';
+    case 'gemini':
+      return 'Gemini CLI';
+    default:
+      return 'Codex CLI';
+  }
 }
 
 function getProviderShortName(provider) {
-  return normalizeProvider(provider) === 'claude' ? 'Claude' : 'Codex';
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return 'Claude';
+    case 'gemini':
+      return 'Gemini';
+    default:
+      return 'Codex';
+  }
 }
 
 function getProviderDefaultBin(provider) {
-  return normalizeProvider(provider) === 'claude' ? 'claude' : 'codex';
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return 'claude';
+    case 'gemini':
+      return 'gemini';
+    default:
+      return 'codex';
+  }
 }
 
 function getProviderBin(provider) {
-  return normalizeProvider(provider) === 'claude' ? CLAUDE_BIN : CODEX_BIN;
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return CLAUDE_BIN;
+    case 'gemini':
+      return GEMINI_BIN;
+    default:
+      return CODEX_BIN;
+  }
 }
 
 function getProviderBinEnvName(provider) {
-  return normalizeProvider(provider) === 'claude' ? 'CLAUDE_BIN' : 'CODEX_BIN';
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return 'CLAUDE_BIN';
+    case 'gemini':
+      return 'GEMINI_BIN';
+    default:
+      return 'CODEX_BIN';
+  }
 }
 
 function getSessionId(session) {
@@ -1138,6 +1179,28 @@ function formatSessionStatusLabel(session) {
 }
 
 function formatPermissionsLabel(session, language = 'en') {
+  const provider = getSessionProvider(session);
+  const normalizedProvider = normalizeProvider(provider);
+  if (normalizedProvider === 'gemini') {
+    if (session.mode === 'dangerous') {
+      return language === 'en'
+        ? 'full access (--yolo)'
+        : '完全权限（--yolo）';
+    }
+    return language === 'en'
+      ? 'sandboxed (--sandbox --approval-mode default)'
+      : '沙盒模式（--sandbox --approval-mode default）';
+  }
+  if (normalizedProvider === 'claude') {
+    if (session.mode === 'dangerous') {
+      return language === 'en'
+        ? 'full access (--dangerously-skip-permissions)'
+        : '完全权限（--dangerously-skip-permissions）';
+    }
+    return language === 'en'
+      ? 'auto-edit (--permission-mode acceptEdits)'
+      : '自动编辑（--permission-mode acceptEdits）';
+  }
   if (session.mode === 'dangerous') {
     return language === 'en'
       ? 'full access (--dangerously-bypass-approvals-and-sandbox)'
@@ -1146,6 +1209,18 @@ function formatPermissionsLabel(session, language = 'en') {
   return language === 'en'
     ? 'sandboxed (--full-auto)'
     : '沙盒模式（--full-auto）';
+}
+
+function formatProviderDefaultLabel(provider, value, language = 'en') {
+  const source = value?.source || 'provider';
+  const model = value?.value || '(unknown)';
+  if (source === 'config.toml') {
+    return `${model} _(config.toml)_`;
+  }
+  if (language === 'en') {
+    return `${model} _(provider default)_`;
+  }
+  return `${model} _(provider 默认)_`;
 }
 
 function formatStatusReport(key, session, channel = null) {
@@ -1168,9 +1243,9 @@ function formatStatusReport(key, session, channel = null) {
     return [
       '🧭 **Current Status**',
       `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
-      `• model: ${session.model || `${defaults.model} _(config.toml)_`}`,
+      `• model: ${session.model || formatProviderDefaultLabel(provider, defaults, lang)}`,
       `• mode: ${modeDesc}`,
-      `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
+      `• effort: ${session.effort || formatProviderDefaultLabel(provider, { value: defaults.effort, source: defaults.source }, lang)}`,
       ...workspaceLines,
       `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)} (${formatSettingSourceLabel(compactSetting.source, lang)})`,
       `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'} (${formatSettingSourceLabel(compactEnabled.source, lang)})`,
@@ -1188,9 +1263,9 @@ function formatStatusReport(key, session, channel = null) {
   return [
     '🧭 **当前状态**',
     `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
-    `• model: ${session.model || `${defaults.model} _(config.toml)_`}`,
+    `• model: ${session.model || formatProviderDefaultLabel(provider, defaults, lang)}`,
     `• mode: ${modeDesc}`,
-    `• effort: ${session.effort || `${defaults.effort} _(config.toml)_`}`,
+    `• effort: ${session.effort || formatProviderDefaultLabel(provider, { value: defaults.effort, source: defaults.source }, lang)}`,
     ...workspaceLines,
     `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)}（${formatSettingSourceLabel(compactSetting.source, lang)}）`,
     `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'}（${formatSettingSourceLabel(compactEnabled.source, lang)}）`,
@@ -1601,8 +1676,10 @@ function parseReasoningEffortInput(value, { allowDefault = false } = {}) {
 
 function isReasoningEffortSupported(provider, effort) {
   if (!effort) return true;
-  if (normalizeProvider(provider) === 'claude' && effort === 'xhigh') return false;
-  return true;
+  const normalizedProvider = normalizeProvider(provider);
+  if (normalizedProvider === 'codex') return true;
+  if (normalizedProvider === 'claude') return effort !== 'xhigh';
+  return false;
 }
 
 function formatReasoningEffortHelp(language) {
@@ -1612,6 +1689,12 @@ function formatReasoningEffortHelp(language) {
 }
 
 function formatReasoningEffortUnsupported(provider, language) {
+  if (normalizeProvider(provider) === 'gemini') {
+    if (language === 'en') {
+      return `⚠️ Reasoning effort is not currently supported for Gemini CLI. Current provider: ${getProviderDisplayName(provider)}.`;
+    }
+    return `⚠️ Gemini CLI 当前不支持 reasoning effort。当前 provider：${getProviderDisplayName(provider)}。`;
+  }
   if (language === 'en') {
     return `⚠️ \`xhigh\` is currently only supported for Codex CLI. Current provider: ${getProviderDisplayName(provider)}.`;
   }
@@ -1701,12 +1784,12 @@ function formatTimeoutConfigReport(language, timeoutSetting, changed) {
   const label = `${formatTimeoutLabel(timeoutSetting.timeoutMs)} (${timeoutSetting.source})`;
   if (language === 'en') {
     return changed
-      ? `✅ Codex timeout set to ${label}`
-      : `ℹ️ Codex timeout is ${label}`;
+      ? `✅ Runner timeout set to ${label}`
+      : `ℹ️ Runner timeout is ${label}`;
   }
   return changed
-    ? `✅ Codex 超时已设置为 ${label}`
-    : `ℹ️ 当前 Codex 超时为 ${label}`;
+    ? `✅ Runner 超时已设置为 ${label}`
+    : `ℹ️ 当前 Runner 超时为 ${label}`;
 }
 
 function formatHelpReport(session) {
@@ -1735,7 +1818,7 @@ function formatHelpReport(session) {
       `• \`${slashRef('reset')}\` / \`!reset\` — clear session context and extra config overrides`,
       '• `!resume <session_id>` — bind existing provider session',
       '• `!sessions` — list recent provider sessions',
-      !BOT_PROVIDER ? '• `!provider <codex|claude|status>` — switch provider for current channel' : null,
+      !BOT_PROVIDER ? '• `!provider <codex|claude|gemini|status>` — switch provider for current channel' : null,
       '',
       '**Workspace**',
       '• `!setdir <path|default|status>` — set or clear current thread workspace',
@@ -1776,7 +1859,7 @@ function formatHelpReport(session) {
     `• \`${slashRef('reset')}\` / \`!reset\` — 清空会话与额外配置，下条消息新开上下文`,
     '• `!resume <session_id>` — 继承一个已有的 provider session',
     '• `!sessions` — 列出最近的 provider sessions',
-    !BOT_PROVIDER ? '• `!provider <codex|claude|status>` — 切换当前频道 provider' : null,
+    !BOT_PROVIDER ? '• `!provider <codex|claude|gemini|status>` — 切换当前频道 provider' : null,
     '',
     '**工作目录**',
     '• `!setdir <path|default|status>` — 设置或清除当前 thread 的 workspace',
@@ -2407,6 +2490,7 @@ const { startSessionProgressBridge } = createSessionProgressBridgeFactory({
   startSessionProgressBridge,
   extractAgentMessageText,
   isFinalAnswerLikeAgentMessage,
+  readGeminiSessionState,
 }));
 
 function shouldCompactSession(session) {
@@ -2808,14 +2892,24 @@ function buildSpawnEnv(env) {
 }
 
 function getProviderDefaults(provider) {
-  if (normalizeProvider(provider) === 'claude') {
-    return { model: '(provider default)', effort: '(provider default)' };
+  if (normalizeProvider(provider) !== 'codex') {
+    return { model: '(provider default)', effort: '(provider default)', source: 'provider' };
   }
-  return getCodexDefaults();
+  return {
+    ...getCodexDefaults(),
+    source: 'config.toml',
+  };
 }
 
 function getCliHealth(provider = DEFAULT_PROVIDER) {
-  return normalizeProvider(provider) === 'claude' ? getClaudeCliHealth() : getCodexCliHealth();
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return getClaudeCliHealth();
+    case 'gemini':
+      return getGeminiCliHealth();
+    default:
+      return getCodexCliHealth();
+  }
 }
 
 function getCliHealthForBin({ bin, envKey }) {
@@ -2860,6 +2954,10 @@ function getClaudeCliHealth() {
   return getCliHealthForBin({ bin: CLAUDE_BIN, envKey: 'CLAUDE_BIN' });
 }
 
+function getGeminiCliHealth() {
+  return getCliHealthForBin({ bin: GEMINI_BIN, envKey: 'GEMINI_BIN' });
+}
+
 function formatCliHealth(health, language = 'zh') {
   if (health.ok) return `✅ \`${health.bin}\` (${health.version})`;
   if (isCliNotFound(health.error)) {
@@ -2888,6 +2986,7 @@ function parseProviderInput(value) {
   if (!raw) return null;
   if (['codex', 'openai'].includes(raw)) return 'codex';
   if (['claude', 'anthropic'].includes(raw)) return 'claude';
+  if (['gemini', 'google'].includes(raw)) return 'gemini';
   return null;
 }
 
@@ -3002,13 +3101,13 @@ function formatWorkspaceReport(key, session) {
     return [
       '📁 **Workspace**',
       ...lines,
-      '• session rule: Codex clears session on workspace change; Claude keeps session when possible.',
+      '• session rule: Codex and Gemini clear session on workspace change; Claude keeps session when possible.',
     ].join('\n');
   }
   return [
     '📁 **工作目录**',
     ...lines,
-    '• session 规则：Codex 在 workspace 变化时会清空 session；Claude 尽量保留当前 session。',
+    '• session 规则：Codex / Gemini 在 workspace 变化时会清空 session；Claude 尽量保留当前 session。',
   ].join('\n');
 }
 
@@ -3045,12 +3144,13 @@ function formatDefaultWorkspaceSetHelp(language = 'zh') {
 function formatWorkspaceUpdateReport(key, session, result) {
   const language = normalizeUiLanguage(getSessionLanguage(session));
   const lines = getWorkspaceStatusLines(key, session, language);
+  const providerShortName = getProviderShortName(getSessionProvider(session));
   if (language === 'en') {
     return [
       result.clearedOverride ? '✅ Cleared thread workspace override' : '✅ Workspace updated',
       ...lines,
       result.sessionReset
-        ? '• session: reset because Codex cannot resume into a different workspace'
+        ? `• session: reset because ${providerShortName} cannot resume into a different workspace`
         : '• session: kept',
     ].join('\n');
   }
@@ -3058,7 +3158,7 @@ function formatWorkspaceUpdateReport(key, session, result) {
     result.clearedOverride ? '✅ 已清除当前 thread 的 workspace 覆盖' : '✅ workspace 已更新',
     ...lines,
     result.sessionReset
-      ? '• session: 已重置（Codex 不能在不同 workspace 中继续同一个 session）'
+      ? `• session: 已重置（${providerShortName} 不能在不同 workspace 中继续同一个 session）`
       : '• session: 已保留',
   ].join('\n');
 }
@@ -3193,9 +3293,14 @@ async function isAllowedInteractionChannel(interaction) {
 }
 
 function listRecentSessions({ provider = DEFAULT_PROVIDER, workspaceDir = '', limit = 10 } = {}) {
-  return normalizeProvider(provider) === 'claude'
-    ? listRecentClaudeSessions(limit, workspaceDir)
-    : listRecentCodexSessions(limit);
+  switch (normalizeProvider(provider)) {
+    case 'claude':
+      return listRecentClaudeSessions(limit, workspaceDir);
+    case 'gemini':
+      return listRecentGeminiSessions(limit, workspaceDir);
+    default:
+      return listRecentCodexSessions(limit);
+  }
 }
 
 function listRecentCodexSessions(limit = 10) {
@@ -3244,6 +3349,38 @@ function listRecentClaudeSessions(limit = 10, workspaceDir = '') {
       }
     })
     .filter(Boolean)
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, limit);
+}
+
+function listRecentGeminiSessions(limit = 10, workspaceDir = '') {
+  const roots = getGeminiSearchRoots(workspaceDir);
+  if (!roots.length) return [];
+
+  const latestById = new Map();
+  for (const root of roots) {
+    for (const file of findGeminiSessionFiles(root)) {
+      const snapshot = readGeminiSessionFile(file);
+      const id = String(snapshot?.sessionId || '').trim();
+      if (!id) continue;
+
+      let mtime = Date.parse(String(snapshot?.lastUpdated || snapshot?.startTime || ''));
+      if (!Number.isFinite(mtime)) {
+        try {
+          mtime = fs.statSync(file).mtimeMs;
+        } catch {
+          mtime = 0;
+        }
+      }
+
+      const prev = latestById.get(id);
+      if (!prev || mtime > prev.mtime) {
+        latestById.set(id, { id, mtime });
+      }
+    }
+  }
+
+  return [...latestById.values()]
     .sort((a, b) => b.mtime - a.mtime)
     .slice(0, limit);
 }
@@ -3319,10 +3456,52 @@ function findLatestClaudeSessionFileBySessionId(sessionId, workspaceDir = '', no
   return latest;
 }
 
+function findLatestGeminiSessionFileBySessionId(sessionId, workspaceDir = '', notOlderThanMs = 0) {
+  const targetId = String(sessionId || '').trim().toLowerCase();
+  if (!targetId) return null;
+
+  let latest = null;
+  for (const root of getGeminiSearchRoots(workspaceDir)) {
+    for (const file of findGeminiSessionFiles(root)) {
+      const snapshot = readGeminiSessionFile(file);
+      const id = String(snapshot?.sessionId || '').trim().toLowerCase();
+      if (!id || id !== targetId) continue;
+
+      let stat = null;
+      try {
+        stat = fs.statSync(file);
+      } catch {
+        continue;
+      }
+      if (!stat?.isFile()) continue;
+      if (notOlderThanMs > 0 && stat.mtimeMs < notOlderThanMs) continue;
+
+      if (!latest || stat.mtimeMs > latest.mtimeMs) {
+        latest = { file, mtimeMs: stat.mtimeMs, sizeBytes: stat.size };
+      }
+    }
+    if (latest) return latest;
+  }
+
+  return latest;
+}
+
 function getCodexSessionsDir() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   if (!home) return '';
   return path.join(home, '.codex', 'sessions');
+}
+
+function getGeminiRootDir() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) return '';
+  return path.join(home, '.gemini');
+}
+
+function getGeminiTmpDir() {
+  const root = getGeminiRootDir();
+  if (!root) return '';
+  return path.join(root, 'tmp');
 }
 
 function getClaudeProjectsDir() {
@@ -3342,6 +3521,77 @@ function encodeClaudeProjectPath(workspaceDir = '') {
   const raw = String(workspaceDir || '').trim();
   if (!raw) return '';
   return path.resolve(raw).replace(/[\\/]/g, '-');
+}
+
+function getGeminiProjectDir(workspaceDir = '') {
+  const tmpRoot = getGeminiTmpDir();
+  const slug = resolveGeminiProjectSlug(workspaceDir);
+  if (!tmpRoot || !slug) return '';
+  return path.join(tmpRoot, slug);
+}
+
+function resolveGeminiProjectSlug(workspaceDir = '') {
+  const raw = String(workspaceDir || '').trim();
+  if (!raw) return '';
+  const normalizedWorkspace = path.resolve(raw);
+
+  const projects = readGeminiProjectsMap();
+  const direct = projects.get(normalizedWorkspace);
+  if (direct) return direct;
+
+  const tmpRoot = getGeminiTmpDir();
+  if (!tmpRoot || !fs.existsSync(tmpRoot)) return '';
+  try {
+    const entries = fs.readdirSync(tmpRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(tmpRoot, entry.name);
+      const projectRootFile = path.join(fullPath, '.project_root');
+      const projectRoot = safeReadText(projectRootFile);
+      if (projectRoot && path.resolve(projectRoot) === normalizedWorkspace) {
+        return entry.name;
+      }
+    }
+  } catch {
+  }
+
+  return '';
+}
+
+function readGeminiProjectsMap() {
+  const file = path.join(getGeminiRootDir(), 'projects.json');
+  const parsed = readJsonFile(file);
+  const projects = parsed?.projects && typeof parsed.projects === 'object' ? parsed.projects : {};
+  const out = new Map();
+  for (const [workspacePath, slug] of Object.entries(projects)) {
+    const normalizedWorkspace = String(workspacePath || '').trim();
+    const normalizedSlug = String(slug || '').trim();
+    if (!normalizedWorkspace || !normalizedSlug) continue;
+    out.set(path.resolve(normalizedWorkspace), normalizedSlug);
+  }
+  return out;
+}
+
+function getGeminiSearchRoots(workspaceDir = '') {
+  const roots = [];
+  const preferredRoot = getGeminiProjectDir(workspaceDir);
+  if (preferredRoot && fs.existsSync(preferredRoot)) roots.push(preferredRoot);
+
+  const tmpRoot = getGeminiTmpDir();
+  if (!tmpRoot || !fs.existsSync(tmpRoot)) return roots;
+
+  try {
+    const entries = fs.readdirSync(tmpRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(tmpRoot, entry.name);
+      if (!fs.existsSync(path.join(fullPath, '.project_root'))) continue;
+      if (!roots.includes(fullPath)) roots.push(fullPath);
+    }
+  } catch {
+  }
+
+  return roots;
 }
 
 function findFilesRecursive(root, predicate) {
@@ -3380,6 +3630,12 @@ function findClaudeSessionFiles(root) {
   return findFilesRecursive(root, (name) => /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/i.test(name));
 }
 
+function findGeminiSessionFiles(root) {
+  const chatsDir = path.join(root, 'chats');
+  if (!fs.existsSync(chatsDir)) return [];
+  return findFilesRecursive(chatsDir, (name) => /^session-.*\.json$/i.test(name));
+}
+
 function parseSessionIdFromRolloutFile(filename) {
   const match = filename.match(/^rollout-.*-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i);
   return match?.[1] || null;
@@ -3388,6 +3644,54 @@ function parseSessionIdFromRolloutFile(filename) {
 function parseClaudeSessionIdFromFile(filename) {
   const match = String(filename || '').match(/^([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i);
   return match?.[1] || null;
+}
+
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function safeReadText(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+function readGeminiSessionFile(filePath) {
+  return readJsonFile(filePath);
+}
+
+function readGeminiSessionState({ sessionId, workspaceDir = '' } = {}) {
+  const match = findLatestGeminiSessionFileBySessionId(sessionId, workspaceDir);
+  if (!match?.file) return null;
+
+  const snapshot = readGeminiSessionFile(match.file);
+  if (!snapshot || typeof snapshot !== 'object') return null;
+
+  const assistantMessages = Array.isArray(snapshot.messages)
+    ? snapshot.messages
+      .filter((item) => item && typeof item === 'object' && String(item.type || '').trim().toLowerCase() === 'gemini')
+      .map((item) => String(item.content || '').trim())
+      .filter(Boolean)
+    : [];
+
+  const finalAnswer = assistantMessages.at(-1) || '';
+  const messages = finalAnswer ? assistantMessages.slice(0, -1) : assistantMessages;
+  const lastAssistant = Array.isArray(snapshot.messages)
+    ? [...snapshot.messages].reverse().find((item) => item && typeof item === 'object' && String(item.type || '').trim().toLowerCase() === 'gemini')
+    : null;
+
+  return {
+    messages,
+    finalAnswer,
+    usage: lastAssistant?.tokens && typeof lastAssistant.tokens === 'object' ? lastAssistant.tokens : null,
+    file: match.file,
+  };
 }
 
 function truncate(text, max) {
@@ -3494,13 +3798,15 @@ function renderMissingDiscordTokenHint({ botProvider = null, env = process.env }
 
   const hasCodexScopedToken = Boolean(String(env.CODEX__DISCORD_TOKEN || env.DISCORD_TOKEN_CODEX || '').trim());
   const hasClaudeScopedToken = Boolean(String(env.CLAUDE__DISCORD_TOKEN || env.DISCORD_TOKEN_CLAUDE || '').trim());
+  const hasGeminiScopedToken = Boolean(String(env.GEMINI__DISCORD_TOKEN || env.DISCORD_TOKEN_GEMINI || '').trim());
 
-  if (hasCodexScopedToken || hasClaudeScopedToken) {
+  if (hasCodexScopedToken || hasClaudeScopedToken || hasGeminiScopedToken) {
     const availableProviders = [
       hasCodexScopedToken ? 'codex' : null,
       hasClaudeScopedToken ? 'claude' : null,
+      hasGeminiScopedToken ? 'gemini' : null,
     ].filter(Boolean).join(', ');
-    return `Missing DISCORD_TOKEN in shared mode. Found provider-scoped tokens for: ${availableProviders}. Start with npm run start:codex / npm run start:claude, or add a shared DISCORD_TOKEN.`;
+    return `Missing DISCORD_TOKEN in shared mode. Found provider-scoped tokens for: ${availableProviders}. Start with npm run start:codex / npm run start:claude / npm run start:gemini, or add a shared DISCORD_TOKEN.`;
   }
 
   return 'Missing DISCORD_TOKEN in environment';

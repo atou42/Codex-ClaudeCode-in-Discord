@@ -7,9 +7,14 @@ export function createSessionProgressBridgeFactory({
   findLatestClaudeSessionFileBySessionId,
 } = {}) {
   function startSessionProgressBridge({ provider, threadId, workspaceDir, onEvent }) {
-    return normalizeProvider(provider) === 'claude'
-      ? startClaudeSessionProgressBridge({ threadId, workspaceDir, onEvent })
-      : startCodexSessionProgressBridge({ threadId, onEvent });
+    const normalizedProvider = normalizeProvider(provider);
+    if (normalizedProvider === 'claude') {
+      return startClaudeSessionProgressBridge({ threadId, workspaceDir, onEvent });
+    }
+    if (normalizedProvider === 'gemini') {
+      return () => {};
+    }
+    return startCodexSessionProgressBridge({ threadId, onEvent });
   }
 
   function startCodexSessionProgressBridge({ threadId, onEvent }) {

@@ -102,3 +102,16 @@ test('buildSlashCommands exposes browse keyword in workspace option descriptions
   assert.match(setdir.options[0].description, /browse/);
   assert.match(setdefaultdir.options[0].description, /browse/);
 });
+
+test('buildSlashCommands exposes gemini as provider choice', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'cx',
+    botProvider: null,
+  }).map((command) => command.toJSON());
+
+  const provider = commands.find((command) => command.name === 'cx_provider');
+  const choices = provider.options[0].choices.map((choice) => choice.value);
+
+  assert.deepEqual(choices, ['codex', 'claude', 'gemini', 'status']);
+});

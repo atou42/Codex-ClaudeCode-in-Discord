@@ -287,7 +287,7 @@ export function createSlashCommandRouter({
   registerSlashHandlers(handlers, ['model'], async ({ interaction, session, respond }) => {
     const name = interaction.options.getString('name');
     const { model } = commandActions.setModel(session, name);
-    await respond(`✅ model = ${model || '(default)'}`);
+    await respond(`✅ model = ${model || '(provider default)'}`);
   });
 
   registerSlashHandlers(handlers, ['effort'], async ({ interaction, session, respond }) => {
@@ -302,10 +302,18 @@ export function createSlashCommandRouter({
     }
 
     const { effort } = commandActions.setReasoningEffort(session, level);
-    await respond(`✅ effort = ${effort || '(default)'}`);
+    await respond(`✅ effort = ${effort || '(provider default)'}`);
   });
 
   registerSlashHandlers(handlers, ['compact'], async ({ interaction, session, respond }) => {
+    const provider = getSessionProvider(session);
+    if (provider !== 'codex') {
+      await respond({
+        content: `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`${slashRef('compact')}\` 仅支持 Codex CLI。`,
+        flags: 64,
+      });
+      return;
+    }
     const language = getSessionLanguage(session);
     const parsed = parseCompactConfigAction(
       interaction.options.getString('key'),

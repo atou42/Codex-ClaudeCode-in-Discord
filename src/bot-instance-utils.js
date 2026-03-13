@@ -3,6 +3,7 @@ export function parseOptionalProvider(value) {
   if (!raw) return null;
   if (['codex', 'openai'].includes(raw)) return 'codex';
   if (['claude', 'anthropic'].includes(raw)) return 'claude';
+  if (['gemini', 'google'].includes(raw)) return 'gemini';
   return null;
 }
 
@@ -43,5 +44,6 @@ export function describeBotMode(provider = null) {
 export function getDefaultSlashPrefix(provider = null) {
   const lockedProvider = parseOptionalProvider(provider);
   if (lockedProvider === 'claude') return 'cc';
+  if (lockedProvider === 'gemini') return 'gm';
   return 'cx';
 }

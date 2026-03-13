@@ -15,6 +15,7 @@ test('parseOptionalProvider accepts empty shared mode', () => {
   assert.equal(parseOptionalProvider(null), null);
   assert.equal(parseOptionalProvider('codex'), 'codex');
   assert.equal(parseOptionalProvider('anthropic'), 'claude');
+  assert.equal(parseOptionalProvider('google'), 'gemini');
   assert.equal(parseOptionalProvider('unknown'), null);
 });
 
@@ -23,10 +24,12 @@ test('resolveProviderScopedEnv prefers provider-scoped key then fallback', () =>
     DISCORD_TOKEN: 'shared-token',
     DISCORD_TOKEN_CODEX: 'codex-token',
     DISCORD_TOKEN_CLAUDE: 'claude-token',
+    DISCORD_TOKEN_GEMINI: 'gemini-token',
   };
 
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'codex', env), 'codex-token');
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'claude', env), 'claude-token');
+  assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'gemini', env), 'gemini-token');
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', null, env), 'shared-token');
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'unknown', env), 'shared-token');
 });
@@ -51,6 +54,7 @@ test('describeBotMode reflects shared and locked modes', () => {
   assert.equal(describeBotMode(null), 'shared');
   assert.equal(describeBotMode('codex'), 'locked:codex');
   assert.equal(describeBotMode('claude'), 'locked:claude');
+  assert.equal(describeBotMode('gemini'), 'locked:gemini');
 });
 
 test('getDefaultSlashPrefix uses provider-aware defaults', () => {
@@ -58,4 +62,6 @@ test('getDefaultSlashPrefix uses provider-aware defaults', () => {
   assert.equal(getDefaultSlashPrefix('codex'), 'cx');
   assert.equal(getDefaultSlashPrefix('claude'), 'cc');
   assert.equal(getDefaultSlashPrefix('anthropic'), 'cc');
+  assert.equal(getDefaultSlashPrefix('gemini'), 'gm');
+  assert.equal(getDefaultSlashPrefix('google'), 'gm');
 });

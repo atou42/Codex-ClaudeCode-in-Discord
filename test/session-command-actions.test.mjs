@@ -109,6 +109,41 @@ test('createSessionCommandActions.setWorkspaceDir keeps claude session when work
   assert.equal(saveCount, 1);
 });
 
+test('createSessionCommandActions.setWorkspaceDir resets gemini session when workspace changes', () => {
+  let saveCount = 0;
+  const defaultState = { value: '/shared' };
+  const actions = createSessionCommandActions({
+    saveDb: () => {
+      saveCount += 1;
+    },
+    ensureWorkspace: () => '/shared',
+    getWorkspaceBinding: createWorkspaceBindingResolver(defaultState),
+    clearSessionId: (session) => {
+      session.runnerSessionId = null;
+      session.codexThreadId = null;
+    },
+    getSessionId: (session) => session.runnerSessionId,
+    setSessionId: () => {},
+    getSessionProvider: (session) => session.provider || 'codex',
+    getProviderShortName: (provider) => {
+      if (provider === 'claude') return 'Claude';
+      if (provider === 'gemini') return 'Gemini';
+      return 'Codex';
+    },
+    resolveTimeoutSetting: () => ({ timeoutMs: 60000, source: 'session override' }),
+    listRecentSessions: () => [],
+    humanAge: () => '0s',
+  });
+  const session = { provider: 'gemini', workspaceDir: '/old', runnerSessionId: 'sess-1', codexThreadId: 'sess-1' };
+
+  const result = actions.setWorkspaceDir(session, 'thread-1', '/new/project');
+
+  assert.equal(result.workspaceDir, '/new/project');
+  assert.equal(result.sessionReset, true);
+  assert.equal(session.runnerSessionId, null);
+  assert.equal(saveCount, 1);
+});
+
 test('createSessionCommandActions.setDefaultWorkspaceDir clears affected codex sessions', () => {
   let saveCount = 0;
   const defaultState = { value: '/shared-a' };

@@ -80,3 +80,21 @@ test('createTextCommandHandler switches to a fresh session without retry hint', 
   assert.equal(session.lastInputTokens, null);
   assert.deepEqual(replies, ['🆕 已切换到新会话。\n下一条普通消息会开启新的上下文。']);
 });
+
+test('createTextCommandHandler rejects compact for non-codex providers', async () => {
+  const replies = [];
+  const session = { provider: 'gemini' };
+
+  const handleCommand = createTextCommandHandler({
+    getSession: () => session,
+    getSessionProvider: (currentSession) => currentSession.provider,
+    getProviderDisplayName: (provider) => provider === 'gemini' ? 'Gemini CLI' : provider,
+    safeReply: async (_message, payload) => {
+      replies.push(payload);
+    },
+  });
+
+  await handleCommand(createMessage(), 'thread-1', '!compact status');
+
+  assert.deepEqual(replies, ['⚠️ 当前 provider = `gemini` (Gemini CLI)，`!compact` 仅支持 Codex CLI。']);
+});

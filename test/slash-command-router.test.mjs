@@ -105,6 +105,7 @@ function createRouterState() {
   });
 
   return {
+    session,
     replies,
     router,
     getBrowseCalls: () => [...browseCalls],
@@ -182,4 +183,25 @@ test('parseCommandActionButtonId decodes command buttons', () => {
   });
   assert.equal(parseCommandActionButtonId('cmd:retry:123456789'), null);
   assert.equal(parseCommandActionButtonId('cmd:unknown:123456789'), null);
+});
+
+test('createSlashCommandRouter rejects compact for non-codex providers', async () => {
+  const state = createRouterState();
+  state.session.provider = 'gemini';
+  const interaction = createInteraction('cx_compact');
+  interaction.options.getString = (name) => (name === 'key' ? 'status' : null);
+
+  const handled = await state.router({
+    interaction,
+    commandName: 'compact',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(state.replies, [{
+    content: '⚠️ 当前 provider = `gemini` (gemini)，`/cx_compact` 仅支持 Codex CLI。',
+    flags: 64,
+  }]);
 });

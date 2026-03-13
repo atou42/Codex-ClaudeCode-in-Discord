@@ -1,14 +1,31 @@
 export function normalizeCliProvider(value) {
   const raw = String(value || '').trim().toLowerCase();
-  return raw === 'claude' ? 'claude' : 'codex';
+  if (['codex', 'openai'].includes(raw)) return 'codex';
+  if (['claude', 'anthropic'].includes(raw)) return 'claude';
+  if (['gemini', 'google'].includes(raw)) return 'gemini';
+  return 'codex';
 }
 
 export function getProviderDisplayName(provider) {
-  return normalizeCliProvider(provider) === 'claude' ? 'Claude Code' : 'Codex CLI';
+  switch (normalizeCliProvider(provider)) {
+    case 'claude':
+      return 'Claude Code';
+    case 'gemini':
+      return 'Gemini CLI';
+    default:
+      return 'Codex CLI';
+  }
 }
 
 export function getProviderShortName(provider) {
-  return normalizeCliProvider(provider) === 'claude' ? 'Claude' : 'Codex';
+  switch (normalizeCliProvider(provider)) {
+    case 'claude':
+      return 'Claude';
+    case 'gemini':
+      return 'Gemini';
+    default:
+      return 'Codex';
+  }
 }
 
 export function providerSupportsConfigOverrides(provider) {
@@ -40,6 +57,14 @@ export function buildRunnerArgs({
       mode,
       model,
       effort,
+    });
+  }
+  if (normalizedProvider === 'gemini') {
+    return buildGeminiArgs({
+      sessionId,
+      prompt,
+      mode,
+      model,
     });
   }
 
@@ -108,5 +133,25 @@ function buildClaudeArgs({
   if (sessionId) args.push('--resume', sessionId);
 
   args.push('--allowedTools', 'default', '--', prompt);
+  return args;
+}
+
+function buildGeminiArgs({
+  sessionId,
+  prompt,
+  mode,
+  model,
+}) {
+  const args = ['--output-format', 'stream-json'];
+
+  if (mode === 'dangerous') {
+    args.push('--yolo');
+  } else {
+    args.push('--sandbox', '--approval-mode', 'default');
+  }
+
+  if (model) args.push('--model', model);
+  if (sessionId) args.push('--resume', sessionId);
+  args.push('--prompt', prompt);
   return args;
 }

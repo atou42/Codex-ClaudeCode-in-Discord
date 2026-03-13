@@ -2,8 +2,12 @@ function hasWorkspaceChanged(previousDir, nextDir) {
   return String(previousDir || '') !== String(nextDir || '');
 }
 
+function providerBindsSessionsToWorkspace(provider) {
+  return provider !== 'claude';
+}
+
 function shouldResetSessionForWorkspaceChange(provider, previousDir, nextDir) {
-  return provider === 'codex' && hasWorkspaceChanged(previousDir, nextDir);
+  return providerBindsSessionsToWorkspace(provider) && hasWorkspaceChanged(previousDir, nextDir);
 }
 
 export function createSessionCommandActions({
@@ -173,7 +177,7 @@ export function createSessionCommandActions({
     let currentThreadChanged = false;
     let currentSessionReset = false;
 
-    if (provider === 'codex') {
+    if (providerBindsSessionsToWorkspace(provider)) {
       for (const { key, session: storedSession } of trackedSessions) {
         const before = beforeBindings.get(key);
         const after = getWorkspaceBinding(storedSession, key);

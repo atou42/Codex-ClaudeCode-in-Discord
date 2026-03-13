@@ -115,6 +115,8 @@ function formatMaybePath(dir, language, source = null) {
 }
 
 function formatImpactLine({ mode, language, provider, changed }) {
+  const workspaceBoundProvider = provider !== 'claude';
+  const providerLabel = provider === 'gemini' ? 'Gemini' : 'Codex';
   if (!changed) {
     return language === 'en'
       ? '• impact: no change'
@@ -122,20 +124,20 @@ function formatImpactLine({ mode, language, provider, changed }) {
   }
 
   if (mode === 'default') {
-    if (provider === 'codex') {
+    if (workspaceBoundProvider) {
       return language === 'en'
-        ? '• impact: may reset Codex sessions in affected threads'
-        : '• 影响：可能重置受影响 thread 的 Codex session';
+        ? `• impact: may reset ${providerLabel} sessions in affected threads`
+        : `• 影响：可能重置受影响 thread 的 ${providerLabel} session`;
     }
     return language === 'en'
       ? '• impact: updates provider default workspace'
       : '• 影响：会更新 provider 默认 workspace';
   }
 
-  if (provider === 'codex') {
+  if (workspaceBoundProvider) {
     return language === 'en'
-      ? '• impact: resets current Codex session if applied'
-      : '• 影响：应用后会重置当前 Codex session';
+      ? `• impact: resets current ${providerLabel} session if applied`
+      : `• 影响：应用后会重置当前 ${providerLabel} session`;
   }
   return language === 'en'
     ? '• impact: keeps current Claude session when possible'

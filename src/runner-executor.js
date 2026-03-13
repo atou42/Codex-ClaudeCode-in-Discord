@@ -34,6 +34,7 @@ export function createRunnerExecutor({
   startSessionProgressBridge,
   extractAgentMessageText,
   isFinalAnswerLikeAgentMessage,
+  readGeminiSessionState = () => null,
 } = {}) {
   async function runCodex({ session, workspaceDir, prompt, onSpawn, wasCancelled, onEvent, onLog }) {
     ensureDir(workspaceDir);
@@ -104,9 +105,14 @@ export function createRunnerExecutor({
   }
 
   function buildSessionRunnerArgs({ provider, session, workspaceDir, prompt, additionalWorkspaceDirs = [] }) {
-    return normalizeProvider(provider) === 'claude'
-      ? buildClaudeArgs({ session, workspaceDir, prompt, additionalWorkspaceDirs })
-      : buildCodexArgs({ session, workspaceDir, prompt });
+    switch (normalizeProvider(provider)) {
+      case 'claude':
+        return buildClaudeArgs({ session, workspaceDir, prompt, additionalWorkspaceDirs });
+      case 'gemini':
+        return buildGeminiArgs({ session, prompt });
+      default:
+        return buildCodexArgs({ session, workspaceDir, prompt });
+    }
   }
 
   function buildCodexArgs({ session, workspaceDir, prompt }) {
@@ -167,6 +173,23 @@ export function createRunnerExecutor({
     return args;
   }
 
+  function buildGeminiArgs({ session, prompt }) {
+    const args = ['--output-format', 'stream-json'];
+    const model = session.model || defaultModel;
+    const sessionId = getSessionId(session);
+
+    if (session.mode === 'dangerous') {
+      args.push('--yolo');
+    } else {
+      args.push('--sandbox', '--approval-mode', 'default');
+    }
+
+    if (model) args.push('--model', model);
+    if (sessionId) args.push('--resume', sessionId);
+    args.push('--prompt', prompt);
+    return args;
+  }
+
   function spawnRunner({ provider, args, cwd, workspaceDir }, options = {}) {
     return new Promise((resolve) => {
       const bin = getProviderBin(provider);
@@ -187,6 +210,7 @@ export function createRunnerExecutor({
       const meta = {
         claudeSawAgentToolUse: false,
         claudeStopReason: '',
+        geminiDeltaBuffer: '',
       };
       let usage = null;
       let threadId = null;
@@ -269,8 +293,11 @@ export function createRunnerExecutor({
 
       const handleEvent = (ev) => {
         const state = { messages, finalAnswerMessages, reasonings, logs, usage, threadId, meta };
-        if (normalizeProvider(provider) === 'claude') {
+        const normalizedProvider = normalizeProvider(provider);
+        if (normalizedProvider === 'claude') {
           handleClaudeRunnerEvent(ev, state, ensureSessionBridge);
+        } else if (normalizedProvider === 'gemini') {
+          handleGeminiRunnerEvent(ev, state, ensureSessionBridge);
         } else {
           handleCodexRunnerEvent(ev, state, ensureSessionBridge, {
             extractAgentMessageText,
@@ -310,6 +337,25 @@ export function createRunnerExecutor({
 
       child.on('close', (code, signal) => {
         flushRemainders();
+        if (normalizeProvider(provider) === 'gemini') {
+          const sessionState = readGeminiSessionState({
+            sessionId: threadId,
+            workspaceDir,
+          });
+          if (sessionState?.usage) {
+            usage = sessionState.usage;
+          }
+          if (Array.isArray(sessionState?.messages) && messages.length === 0) {
+            messages.push(...sessionState.messages);
+          }
+          const finalAnswer = String(sessionState?.finalAnswer || '').trim();
+          if (finalAnswer && finalAnswerMessages.length === 0) {
+            finalAnswerMessages.push(finalAnswer);
+          } else if (finalAnswerMessages.length === 0) {
+            const buffered = String(meta.geminiDeltaBuffer || '').trim();
+            if (buffered) finalAnswerMessages.push(buffered);
+          }
+        }
         const cancelled = Boolean(timedOut || options.wasCancelled?.());
         const ok = !cancelled && code === 0;
         finish({
@@ -389,6 +435,33 @@ function handleCodexRunnerEvent(ev, state, ensureSessionBridge, {
 }
 
 export { handleCodexRunnerEvent };
+
+function handleGeminiRunnerEvent(ev, state, ensureSessionBridge) {
+  switch (String(ev?.type || '').trim().toLowerCase()) {
+    case 'init':
+      state.threadId = ev.session_id || ev.sessionId || state.threadId;
+      if (state.threadId) ensureSessionBridge(state.threadId);
+      break;
+    case 'message': {
+      if (String(ev.role || '').trim().toLowerCase() !== 'assistant') break;
+      const text = String(ev.content || '');
+      if (!text) break;
+      if (ev.delta === true) {
+        state.meta.geminiDeltaBuffer = `${state.meta.geminiDeltaBuffer || ''}${text}`;
+      } else {
+        state.messages.push(text.trim());
+      }
+      break;
+    }
+    case 'result':
+      state.usage = ev.stats && typeof ev.stats === 'object' ? ev.stats : ev;
+      break;
+    default:
+      break;
+  }
+}
+
+export { handleGeminiRunnerEvent };
 
 function handleClaudeRunnerEvent(ev, state, ensureSessionBridge) {
   switch (ev.type) {

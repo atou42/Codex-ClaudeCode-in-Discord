@@ -58,6 +58,7 @@ function buildSlashCommandEntries({ botProvider = null } = {}) {
           .addChoices(
             { name: 'codex', value: 'codex' },
             { name: 'claude', value: 'claude' },
+            { name: 'gemini', value: 'gemini' },
             { name: 'status', value: 'status' },
           ));
       },

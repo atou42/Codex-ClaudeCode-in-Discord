@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  createRunnerExecutor,
   buildClaudeRecoveryPrompt,
   handleCodexRunnerEvent,
+  handleGeminiRunnerEvent,
   shouldAutoRecoverClaudeResult,
 } from '../src/runner-executor.js';
 import {
@@ -93,6 +95,94 @@ test('handleCodexRunnerEvent keeps commentary item.completed out of final answer
 
   assert.deepEqual(state.messages, ['我先看一下代码结构。']);
   assert.deepEqual(state.finalAnswerMessages, []);
+});
+
+test('handleGeminiRunnerEvent captures init, delta messages, and result stats', () => {
+  const state = {
+    messages: [],
+    finalAnswerMessages: [],
+    reasonings: [],
+    logs: [],
+    usage: null,
+    threadId: null,
+    meta: {
+      geminiDeltaBuffer: '',
+    },
+  };
+  const bridges = [];
+
+  handleGeminiRunnerEvent({
+    type: 'init',
+    session_id: 'gemini-session-123',
+  }, state, (threadId) => bridges.push(threadId));
+
+  handleGeminiRunnerEvent({
+    type: 'message',
+    role: 'assistant',
+    content: 'I will inspect the repo.',
+    delta: true,
+  }, state, () => {});
+
+  handleGeminiRunnerEvent({
+    type: 'result',
+    stats: {
+      input_tokens: 18,
+      output_tokens: 7,
+    },
+  }, state, () => {});
+
+  assert.deepEqual(bridges, ['gemini-session-123']);
+  assert.equal(state.threadId, 'gemini-session-123');
+  assert.equal(state.meta.geminiDeltaBuffer, 'I will inspect the repo.');
+  assert.deepEqual(state.usage, {
+    input_tokens: 18,
+    output_tokens: 7,
+  });
+});
+
+test('createRunnerExecutor builds gemini args instead of codex args', () => {
+  const executor = createRunnerExecutor({
+    spawnEnv: process.env,
+    ensureDir: () => {},
+    normalizeProvider: (value) => value,
+    getSessionProvider: (session) => session.provider,
+    getProviderBin: () => 'gemini',
+    getSessionId: (session) => session.runnerSessionId,
+    resolveTimeoutSetting: () => ({ timeoutMs: 0 }),
+    resolveCompactStrategySetting: () => ({ strategy: 'hard' }),
+    resolveCompactEnabledSetting: () => ({ enabled: false }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 0 }),
+    normalizeTimeoutMs: (value) => Number(value || 0),
+    safeError: (err) => String(err?.message || err),
+    stopChildProcess: () => {},
+    startSessionProgressBridge: () => () => {},
+    extractAgentMessageText,
+    isFinalAnswerLikeAgentMessage,
+  });
+
+  const args = executor.buildSessionRunnerArgs({
+    provider: 'gemini',
+    session: {
+      provider: 'gemini',
+      mode: 'dangerous',
+      model: 'gemini-2.5-pro',
+      runnerSessionId: 'sess-gm-1',
+    },
+    workspaceDir: '/tmp/workspace',
+    prompt: 'summarize the repo',
+  });
+
+  assert.deepEqual(args, [
+    '--output-format',
+    'stream-json',
+    '--yolo',
+    '--model',
+    'gemini-2.5-pro',
+    '--resume',
+    'sess-gm-1',
+    '--prompt',
+    'summarize the repo',
+  ]);
 });
 
 test('shouldAutoRecoverClaudeResult detects agent handoff early exit', () => {

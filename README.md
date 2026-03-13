@@ -1,6 +1,6 @@
 # Codex-ClaudeCode-in-Discord
 
-一个独立运行、让你可以直接在 Discord 里指挥 **Codex CLI** 和 **Claude Code** 的 Discord Bot。
+一个独立运行、让你可以直接在 Discord 里指挥 **Codex CLI**、**Claude Code** 和 **Gemini CLI** 的 Discord Bot。
 
 > 这是一个独立运行的 Discord Bot / bridge，**不是** OpenClaw 插件，也**不依赖** OpenClaw 才能运行。
 
@@ -31,7 +31,7 @@
   - `/onboarding` 可用按钮分步引导并可直接配置关键项，`!onboarding` 提供文本版兜底
   - 支持按线程配置 onboarding 开关（on/off/status）与消息提示语言（zh/en，默认 zh）
   - 支持按线程覆盖 security profile（`auto|solo|team|public`）
-  - 支持按线程覆盖 codex timeout（`毫秒|off|status`）
+  - 支持按线程覆盖 runner timeout（`毫秒|off|status`）
 
 ## 前置条件
 
@@ -39,10 +39,11 @@
 - 安装你计划使用的 CLI
   - Codex：当前 shell 可直接执行 `codex`，或在 `.env` 设置 `CODEX_BIN=/absolute/path/to/codex`
   - Claude：当前 shell 可直接执行 `claude`，或在 `.env` 设置 `CLAUDE_BIN=/absolute/path/to/claude`
+  - Gemini：当前 shell 可直接执行 `gemini`，或在 `.env` 设置 `GEMINI_BIN=/absolute/path/to/gemini`
 - 如果 CLI 自己需要登录，请先在 CLI 内完成；这个项目不通过 `.env` 管 provider auth
 - 一个或两个 Discord Application/Bot Token
   - 共享模式：一个 bot token 即可
-  - 独立模式：Codex / Claude 分别使用不同 bot token
+  - 独立模式：Codex / Claude / Gemini 可分别使用不同 bot token
 
 ## 快速开始
 
@@ -60,7 +61,7 @@ Git hooks 说明：
 - clone 后（或重新 clone 后）执行一次 `npm run setup-hooks`
 - pre-commit 原子性检查基于 Node，可在 macOS/Linux/Windows 上工作（不依赖 bash）
 
-然后在你的 Discord 服务器邀请 Bot，并使用以下 slash 命令。下面示例使用的是 Codex / shared 模式默认前缀 `cx_`；独立 Claude bot 默认前缀改为 `cc_`，并且两者都可通过 `SLASH_PREFIX`、`CODEX__SLASH_PREFIX`、`CLAUDE__SLASH_PREFIX` 覆盖：
+然后在你的 Discord 服务器邀请 Bot，并使用以下 slash 命令。下面示例使用的是 Codex / shared 模式默认前缀 `cx_`；独立 Claude bot 默认前缀是 `cc_`，独立 Gemini bot 默认前缀是 `gm_`，并且都可通过 `SLASH_PREFIX`、`CODEX__SLASH_PREFIX`、`CLAUDE__SLASH_PREFIX`、`GEMINI__SLASH_PREFIX` 覆盖：
 
 - `/cx_status` - 查看当前线程配置
 - `/cx_setdir <path|default|status>` - 设置或清除当前线程的 workspace
@@ -73,20 +74,20 @@ Git hooks 说明：
 - `/cx_name <label>` - 命名会话（用于显示）
 - `/cx_new` - 切到新会话，但保留当前频道配置
 - `/cx_reset` - 清空当前线程会话与额外配置
-- `/cx_resume <session_id>` - 绑定已有 Codex 会话 ID
-- `/cx_sessions` - 列出本地最近 Codex 会话
+- `/cx_resume <session_id>` - 绑定已有 provider 会话 ID
+- `/cx_sessions` - 列出本地最近 provider 会话
 - `/cx_queue` - 查看当前频道运行中/排队任务数量
 - `/cx_doctor` - 查看 Bot 运行/安全体检信息
 - `/cx_onboarding` - 交互式新用户引导（分步按钮，ephemeral）
 - `/cx_onboarding_config <on|off|status>` - 配置当前频道 onboarding 是否可用
 - `/cx_language <中文|English>` - 设置当前频道消息提示语言
 - `/cx_profile <auto|solo|team|public|status>` - 设置或查看当前频道 security profile 覆盖
-- `/cx_timeout <毫秒|off|status>` - 设置当前频道 codex timeout 覆盖
+- `/cx_timeout <毫秒|off|status>` - 设置当前频道 runner timeout 覆盖
 - `/cx_progress` - 查看当前运行任务的最新进度快照
 - `/cx_abort` - 中断当前运行并清空队列
 - `/cx_cancel` - 中断当前运行并清空队列
 
-如果你希望 **Codex 和 Claude 绑定不同 Discord bot**，现在改成只用一个 `.env`，但在文件里分段分组：
+如果你希望 **Codex / Claude / Gemini 绑定不同 Discord bot**，现在改成只用一个 `.env`，但在文件里分段分组：
 
 ```bash
 # 首次准备
@@ -95,9 +96,10 @@ cp .env.example .env
 # 启动两个独立 bot
 npm run start:codex
 npm run start:claude
+npm run start:gemini
 ```
 
-共享配置继续用普通 key，只放 Discord / 运行时配置；Codex / Claude 专属配置放在同一个 `.env` 里的 `CODEX__*` / `CLAUDE__*` 段落里。实际通常只需要各自的 `DISCORD_TOKEN`，以及按需填写 `DEFAULT_MODEL`、`DEFAULT_MODE`、CLI 路径。锁定实例后会自动使用独立状态文件（`data/sessions.codex.json`、`data/sessions.claude.json`）和独立进程锁，因此不会串频道/串会话上下文。
+共享配置继续用普通 key，只放 Discord / 运行时配置；Codex / Claude / Gemini 专属配置放在同一个 `.env` 里的 `CODEX__*` / `CLAUDE__*` / `GEMINI__*` 段落里。实际通常只需要各自的 `DISCORD_TOKEN`，以及按需填写 `DEFAULT_MODEL`、`DEFAULT_MODE`、CLI 路径。锁定实例后会自动使用独立状态文件（`data/sessions.codex.json`、`data/sessions.claude.json`、`data/sessions.gemini.json`）和独立进程锁，因此不会串频道/串会话上下文。
 
 ## 配置（.env）
 
@@ -109,9 +111,10 @@ npm run start:claude
 - 共享 `.env` key：只放 Discord / 运行时配置（`ALLOWED_*`、`WORKSPACE_ROOT`、`DEFAULT_WORKSPACE_DIR`、代理等）
 - `CODEX__*`：同一个 `.env` 里的 Codex bot 分组（通常只需要 `CODEX__DISCORD_TOKEN`，以及按需填写 `CODEX__DEFAULT_MODEL`、`CODEX__DEFAULT_MODE`、`CODEX__DEFAULT_WORKSPACE_DIR`、`CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT`、`CODEX__CODEX_BIN`）
 - `CLAUDE__*`：同一个 `.env` 里的 Claude bot 分组（通常只需要 `CLAUDE__DISCORD_TOKEN`，以及按需填写 `CLAUDE__DEFAULT_MODEL`、`CLAUDE__DEFAULT_MODE`、`CLAUDE__DEFAULT_WORKSPACE_DIR`、`CLAUDE__CLAUDE_BIN`）
-- `BOT_PROVIDER`：留空表示共享模式；设为 `codex` / `claude` 可把当前 bot 实例锁到单一 provider；`npm run start:codex` / `npm run start:claude` 会自动设置
+- `GEMINI__*`：同一个 `.env` 里的 Gemini bot 分组（通常只需要 `GEMINI__DISCORD_TOKEN`，以及按需填写 `GEMINI__DEFAULT_MODEL`、`GEMINI__DEFAULT_MODE`、`GEMINI__DEFAULT_WORKSPACE_DIR`、`GEMINI__GEMINI_BIN`）
+- `BOT_PROVIDER`：留空表示共享模式；设为 `codex` / `claude` / `gemini` 可把当前 bot 实例锁到单一 provider；`npm run start:codex` / `npm run start:claude` / `npm run start:gemini` 会自动设置
 - `ENV_FILE`：仍可选配额外 overlay 文件，但常规使用现在就是单个分组 `.env`
-- `DISCORD_TOKEN_CODEX` / `DISCORD_TOKEN_CLAUDE`：旧的单文件回退方案，保留兼容
+- `DISCORD_TOKEN_CODEX` / `DISCORD_TOKEN_CLAUDE` / `DISCORD_TOKEN_GEMINI`：旧的单文件回退方案，保留兼容
 - provider 登录/鉴权不属于这个项目的配置面；除非你明确需要，否则不要把 CLI 自己的 secret 塞进这个 `.env`
 - `SECURITY_PROFILE`：`auto | solo | team | public`
   - `auto`：DM -> `solo`；服务器内若 `@everyone` 可见频道则 `public`；否则 `team`
@@ -120,15 +123,16 @@ npm run start:claude
 - `ENABLE_CONFIG_CMD`：是否启用 `!config`（默认 `false`）
 - `CONFIG_ALLOWLIST`：`!config key=value` 允许的 key（逗号分隔，或 `*` 表示全部允许）
 - `SLASH_PREFIX`：shared / 全局 slash 前缀；shared 模式默认 `cx`（例如 `/cx_status`）
-- `CODEX__SLASH_PREFIX` / `CLAUDE__SLASH_PREFIX`：独立 bot 的 slash 前缀覆盖；默认分别是 Codex=`cx`、Claude=`cc`
+- `CODEX__SLASH_PREFIX` / `CLAUDE__SLASH_PREFIX` / `GEMINI__SLASH_PREFIX`：独立 bot 的 slash 前缀覆盖；默认分别是 Codex=`cx`、Claude=`cc`、Gemini=`gm`
 - `DEFAULT_UI_LANGUAGE`：新频道默认提示语言（`zh` 或 `en`，默认 `zh`）
 - `ONBOARDING_ENABLED_DEFAULT`：新频道 onboarding 默认开关（`true` 或 `false`，默认 `true`）
-- `DEFAULT_MODE`：`safe` 或 `dangerous`；独立 bot 建议分别写成 `CODEX__DEFAULT_MODE` / `CLAUDE__DEFAULT_MODE`
-- `DEFAULT_WORKSPACE_DIR`：两个 provider 共用的默认 workspace（可选）
-- `CODEX__DEFAULT_WORKSPACE_DIR` / `CLAUDE__DEFAULT_WORKSPACE_DIR`：provider 级默认 workspace
+- `DEFAULT_MODE`：`safe` 或 `dangerous`；独立 bot 建议分别写成 `CODEX__DEFAULT_MODE` / `CLAUDE__DEFAULT_MODE` / `GEMINI__DEFAULT_MODE`
+- `DEFAULT_WORKSPACE_DIR`：所有 provider 共用的默认 workspace（可选）
+- `CODEX__DEFAULT_WORKSPACE_DIR` / `CLAUDE__DEFAULT_WORKSPACE_DIR` / `GEMINI__DEFAULT_WORKSPACE_DIR`：provider 级默认 workspace
 - `WORKSPACE_ROOT`：仅在未配置 thread 覆盖与 provider 默认目录时，作为 legacy 回退目录根路径
 - `CODEX_BIN`：codex 命令/路径（默认 `codex`）
 - `CLAUDE_BIN`：claude 命令/路径（默认 `claude`）
+- `GEMINI_BIN`：gemini 命令/路径（默认 `gemini`）
 - `CODEX_TIMEOUT_MS`：单次 codex 运行硬超时（毫秒），`0` 表示禁用超时
 - `PROGRESS_UPDATES_ENABLED`：是否启用频道实时进度更新（默认 `true`）
 - `PROGRESS_UPDATE_INTERVAL_MS`：进度消息心跳刷新间隔
@@ -255,7 +259,7 @@ CODEX_BIN=C:\\Users\\<you>\\AppData\\Local\\Programs\\Codex\\codex.exe
 ```
 3. 重启 Bot 进程。
 
-你也可以执行 `/cx_status`（或当前生效前缀 + `_status`，例如默认 Claude bot 用 `/cc_status`）查看 Bot 输出中的 codex-cli 健康状态。
+你也可以执行 `/cx_status`（或当前生效前缀 + `_status`，例如默认 Claude bot 用 `/cc_status`、Gemini bot 用 `/gm_status`）查看 Bot 输出中的当前 provider CLI 健康状态。
 
 ## 代理 / Clash 配置（可选）
 
@@ -280,7 +284,7 @@ INSECURE_TLS=1
 
 ## 独立运行说明
 
-这个仓库本身就是一个独立运行的 Discord Bot，用来在 Discord 里指挥 Codex CLI 和 Claude Code。
+这个仓库本身就是一个独立运行的 Discord Bot，用来在 Discord 里指挥 Codex CLI、Claude Code 和 Gemini CLI。
 
 - 不需要安装 OpenClaw
 - 不需要安装任何插件

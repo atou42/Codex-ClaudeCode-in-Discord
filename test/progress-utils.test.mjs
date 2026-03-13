@@ -303,6 +303,34 @@ test('summarizeCodexEvent handles Claude assistant message events', () => {
   assert.equal(summary, 'agent message: 我先检查当前工作区，再继续实现。');
 });
 
+test('summarizeCodexEvent handles Gemini init and message events', () => {
+  const initSummary = summarizeCodexEvent({
+    type: 'init',
+    session_id: 'gemini-session-123',
+  }, { previewChars: 180 });
+  const messageSummary = summarizeCodexEvent({
+    type: 'message',
+    role: 'assistant',
+    content: '我先读取 README，再继续接线。',
+    delta: true,
+  }, { previewChars: 180 });
+
+  assert.equal(initSummary, 'session started: gemini-session-123');
+  assert.equal(messageSummary, 'agent message: 我先读取 README，再继续接线。');
+});
+
+test('summarizeCodexEvent handles Gemini tool_use and extracts file path detail', () => {
+  const summary = summarizeCodexEvent({
+    type: 'tool_use',
+    tool_name: 'read_file',
+    parameters: {
+      file_path: '/tmp/app.js',
+    },
+  }, { previewChars: 180 });
+
+  assert.equal(summary, 'tool read_file started: file_path: /tmp/app.js');
+});
+
 test('extractRawProgressTextFromEvent reads Claude assistant commentary messages', () => {
   const ev = {
     type: 'assistant/message',
@@ -317,6 +345,27 @@ test('extractRawProgressTextFromEvent reads Claude assistant commentary messages
 
   const raw = extractRawProgressTextFromEvent(ev);
   assert.equal(raw, '正在比对 Claude 与 Codex 的事件格式。');
+});
+
+test('extractRawProgressTextFromEvent reads Gemini assistant commentary messages', () => {
+  const raw = extractRawProgressTextFromEvent({
+    type: 'message',
+    role: 'assistant',
+    content: '正在读取 Gemini session 文件并同步最终答案。',
+    delta: true,
+  });
+
+  assert.equal(raw, '正在读取 Gemini session 文件并同步最终答案。');
+});
+
+test('extractCompletedStepFromEvent recognizes Gemini tool_result completion', () => {
+  const step = extractCompletedStepFromEvent({
+    type: 'tool_result',
+    tool_id: 'read_file_12345',
+    status: 'success',
+  }, { previewChars: 180 });
+
+  assert.equal(step, 'tool read_file');
 });
 
 test('appendRecentActivity can keep full raw text without truncation', () => {

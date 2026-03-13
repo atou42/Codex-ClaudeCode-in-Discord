@@ -143,6 +143,16 @@ function extractToolCallArguments(item) {
   return raw && typeof raw === 'object' ? raw : null;
 }
 
+function extractDirectToolName(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const direct = normalizeWhitespace(raw.tool_name || raw.name || raw.tool?.name || '');
+  if (direct) return direct;
+  const toolId = normalizeWhitespace(raw.tool_id || '');
+  if (!toolId) return null;
+  const match = toolId.match(/^([a-z0-9_]+?)(?:_\d.*)?$/i);
+  return normalizeWhitespace(match?.[1] || toolId) || null;
+}
+
 function summarizeKnownArgObject(args, options = {}) {
   if (!args || typeof args !== 'object') return '';
 
@@ -152,7 +162,7 @@ function summarizeKnownArgObject(args, options = {}) {
   const command = extractCommandPreview(args, options);
   if (command) return `run: ${command}`;
 
-  const scalarKeys = ['query', 'q', 'url', 'pattern', 'location', 'ticker', 'path', 'team', 'ref_id', 'name', 'title'];
+  const scalarKeys = ['query', 'q', 'url', 'pattern', 'location', 'ticker', 'path', 'file_path', 'team', 'ref_id', 'name', 'title'];
   for (const key of scalarKeys) {
     const value = normalizeWhitespace(args[key]);
     if (!value) continue;
@@ -177,6 +187,7 @@ function extractPayloadTextPreview(payload, options = {}) {
 
   const textCandidates = [];
   if (typeof payload.text === 'string') textCandidates.push(payload.text);
+  if (typeof payload.content === 'string') textCandidates.push(payload.content);
 
   if (Array.isArray(payload.content)) {
     for (const part of payload.content) {
@@ -314,6 +325,13 @@ export function summarizeCodexEvent(ev, options = {}) {
     return preview ? `agent message: ${preview}` : 'agent message';
   }
 
+  if (type === 'message') {
+    const role = normalizeEventType(ev.role || payload?.role || '');
+    if (role && role !== 'assistant') return prettifyEventType(rawType);
+    const preview = extractPayloadTextPreview(ev, opts) || extractDeltaTextPreview(ev, payload, opts);
+    return preview ? `agent message: ${preview}` : 'agent message';
+  }
+
   if (type.endsWith('_delta')) {
     const delta = extractDeltaTextPreview(ev, payload, opts);
     if (type.includes('reasoning')) {
@@ -329,6 +347,8 @@ export function summarizeCodexEvent(ev, options = {}) {
   switch (type) {
     case 'thread_started':
       return ev.thread_id ? `session started: ${ev.thread_id}` : 'session started';
+    case 'init':
+      return ev.session_id || ev.sessionId ? `session started: ${ev.session_id || ev.sessionId}` : 'session started';
     case 'system_init':
       return ev.session_id ? `session started: ${ev.session_id}` : 'session started';
     case 'message_start':
@@ -347,7 +367,7 @@ export function summarizeCodexEvent(ev, options = {}) {
       return op ? `queue ${op}` : 'queue updated';
     }
     case 'result': {
-      const input = extractInputTokensFromUsage(ev.usage);
+      const input = extractInputTokensFromUsage(ev.usage || ev.stats);
       return input === null ? 'turn completed' : `turn completed (input tokens: ${input})`;
     }
     case 'system_init':
@@ -374,6 +394,16 @@ export function summarizeCodexEvent(ev, options = {}) {
         }
       }
       return `error: ${truncate(String(detail || 'unknown'), previewChars)}`;
+    }
+    case 'tool_use': {
+      const toolName = extractDirectToolName(ev) || 'tool';
+      const detail = summarizeKnownArgObject(ev.parameters || ev.args || ev, opts);
+      return detail ? `tool ${toolName} started: ${detail}` : `tool ${toolName} started`;
+    }
+    case 'tool_result': {
+      const toolName = extractDirectToolName(ev) || 'tool';
+      const phase = normalizeStatus(ev.status || '') || 'completed';
+      return `tool ${toolName} ${phase}`;
     }
     case 'item_started':
     case 'item_completed': {
@@ -523,6 +553,20 @@ export function extractRawProgressTextFromEvent(ev) {
     return text;
   }
 
+  if (type === 'message') {
+    const role = normalizeEventType(ev.role || payload?.role || '');
+    if (role && role !== 'assistant') return '';
+    const text = pickFirstRawText([
+      ev.content,
+      ev.message,
+      ev.text,
+      payload?.message,
+      payload?.text,
+    ]) || pickFirstRawTextFromContent(ev.content || payload?.content);
+    if (!text || isLowSignalProcessText(text)) return '';
+    return text;
+  }
+
   if (type.endsWith('_delta')) {
     if (type.includes('reasoning')) return '';
     if (!(type.includes('output_text') || type.includes('message') || type.includes('content_part') || type.includes('content_block'))) return '';
@@ -567,6 +611,20 @@ export function extractRawProgressTextFromEvent(ev) {
     }
     if (payloadType === 'reasoning') return '';
     if (payloadType === 'agent_message') return '';
+  }
+
+  if (type === 'tool_use') {
+    const toolName = extractDirectToolName(ev) || 'tool';
+    const detail = summarizeKnownArgObject(ev.parameters || ev.args || ev);
+    return detail ? `${toolName}: ${detail}` : `tool ${toolName}`;
+  }
+
+  if (type === 'tool_result') {
+    const status = normalizeStatus(ev.status || '');
+    if (status === 'completed') {
+      const toolName = extractDirectToolName(ev) || 'tool';
+      return `tool ${toolName}`;
+    }
   }
 
   return '';
@@ -769,6 +827,13 @@ export function extractCompletedStepFromEvent(ev, options = {}) {
     }
 
     return '';
+  }
+
+  if (type === 'tool_result') {
+    const status = normalizeStatus(ev.status || '');
+    if (status !== 'completed') return '';
+    const toolName = extractDirectToolName(ev) || 'tool';
+    return `tool ${toolName}`;
   }
 
   if (type.startsWith('web_search_') && isCompletedLikeEvent(type)) {

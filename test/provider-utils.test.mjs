@@ -12,7 +12,11 @@ import {
 
 test('normalizeCliProvider falls back to codex', () => {
   assert.equal(normalizeCliProvider('claude'), 'claude');
+  assert.equal(normalizeCliProvider('anthropic'), 'claude');
+  assert.equal(normalizeCliProvider('gemini'), 'gemini');
+  assert.equal(normalizeCliProvider('google'), 'gemini');
   assert.equal(normalizeCliProvider('CODEX'), 'codex');
+  assert.equal(normalizeCliProvider('openai'), 'codex');
   assert.equal(normalizeCliProvider('unknown'), 'codex');
   assert.equal(normalizeCliProvider(''), 'codex');
 });
@@ -20,15 +24,19 @@ test('normalizeCliProvider falls back to codex', () => {
 test('provider labels are readable', () => {
   assert.equal(getProviderDisplayName('claude'), 'Claude Code');
   assert.equal(getProviderDisplayName('codex'), 'Codex CLI');
+  assert.equal(getProviderDisplayName('gemini'), 'Gemini CLI');
   assert.equal(getProviderShortName('claude'), 'Claude');
   assert.equal(getProviderShortName('codex'), 'Codex');
+  assert.equal(getProviderShortName('gemini'), 'Gemini');
 });
 
 test('provider capabilities distinguish codex-only features', () => {
   assert.equal(providerSupportsConfigOverrides('codex'), true);
   assert.equal(providerSupportsConfigOverrides('claude'), false);
+  assert.equal(providerSupportsConfigOverrides('gemini'), false);
   assert.equal(providerSupportsNativeCompact('codex'), true);
   assert.equal(providerSupportsNativeCompact('claude'), false);
+  assert.equal(providerSupportsNativeCompact('gemini'), false);
 });
 
 test('buildRunnerArgs keeps codex resume behavior', () => {
@@ -96,6 +104,36 @@ test('buildRunnerArgs builds claude print stream command with prompt delimiter',
     '--allowedTools',
     'default',
     '--',
+    'run pwd',
+  ]);
+});
+
+test('buildRunnerArgs builds gemini stream-json command with provider-specific permissions', () => {
+  const args = buildRunnerArgs({
+    provider: 'gemini',
+    sessionId: 'ghi-789',
+    workspaceDir: '/tmp/work',
+    prompt: 'run pwd',
+    mode: 'safe',
+    model: 'gemini-2.5-pro',
+    effort: 'medium',
+    extraConfigs: ['ignored=true'],
+    compactStrategy: 'native',
+    compactOnThreshold: true,
+    modelAutoCompactTokenLimit: 999,
+  });
+
+  assert.deepEqual(args, [
+    '--output-format',
+    'stream-json',
+    '--sandbox',
+    '--approval-mode',
+    'default',
+    '--model',
+    'gemini-2.5-pro',
+    '--resume',
+    'ghi-789',
+    '--prompt',
     'run pwd',
   ]);
 });

@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 const provider = String(process.argv[2] || '').trim().toLowerCase();
 const mode = provider || 'shared';
 
-if (!['shared', 'codex', 'claude'].includes(mode)) {
-  console.error('Usage: node scripts/start-instance.mjs <shared|codex|claude>');
+if (!['shared', 'codex', 'claude', 'gemini'].includes(mode)) {
+  console.error('Usage: node scripts/start-instance.mjs <shared|codex|claude|gemini>');
   process.exit(1);
 }
 

@@ -101,7 +101,7 @@ export function createTextCommandHandler({
         }
         const requested = parseProviderInput(arg);
         if (!requested) {
-          await safeReply(message, '用法：`!provider <codex|claude|status>`');
+          await safeReply(message, '用法：`!provider <codex|claude|gemini|status>`');
           break;
         }
         const { previous } = commandActions.setProvider(session, requested);
@@ -324,7 +324,7 @@ export function createTextCommandHandler({
           return;
         }
         const { model } = commandActions.setModel(session, arg);
-        await safeReply(message, `✅ model = ${model || '(default from config.toml)'}`);
+        await safeReply(message, `✅ model = ${model || '(provider default)'}`);
         break;
       }
 
@@ -341,11 +341,16 @@ export function createTextCommandHandler({
           return;
         }
         const { effort } = commandActions.setReasoningEffort(session, parsed);
-        await safeReply(message, `✅ reasoning effort = ${effort || '(default from config.toml)'}`);
+        await safeReply(message, `✅ reasoning effort = ${effort || '(provider default)'}`);
         break;
       }
 
       case '!compact': {
+        const provider = getSessionProvider(session);
+        if (provider !== 'codex') {
+          await safeReply(message, `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`!compact\` 仅支持 Codex CLI。`);
+          break;
+        }
         const language = getSessionLanguage(session);
         const parsed = parseCompactConfigFromText(arg || 'status');
         if (!parsed || parsed.type === 'invalid') {
@@ -362,6 +367,11 @@ export function createTextCommandHandler({
       }
 
       case '!config': {
+        const provider = getSessionProvider(session);
+        if (provider !== 'codex') {
+          await safeReply(message, `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`!config\` 仅支持 Codex CLI。`);
+          return;
+        }
         if (!enableConfigCmd) {
           await safeReply(message, '⛔ `!config` 当前已禁用。可在 `.env` 设置 `ENABLE_CONFIG_CMD=true` 后重启。');
           return;
