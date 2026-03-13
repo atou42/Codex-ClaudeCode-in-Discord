@@ -1,8 +1,5 @@
 import { fileURLToPath } from 'node:url';
-import fs from 'node:fs';
 import path from 'node:path';
-import { ProxyAgent, setGlobalDispatcher } from 'undici';
-import { SocksProxyAgent } from 'socks-proxy-agent';
 import { safeReply, withDiscordNetworkRetry } from './discord-reply-utils.js';
 import { splitForDiscord } from './discord-message-splitter.js';
 import {
@@ -101,10 +98,16 @@ import {
 } from './slash-command-router.js';
 import { createTextCommandHandler } from './text-command-handler.js';
 import { createPromptOrchestrator } from './prompt-orchestrator.js';
-import { autoRepairProxyEnv } from './proxy-env.js';
 import { createDiscordAccessPolicy } from './discord-access-policy.js';
 import { createDiscordEntryHandlers } from './discord-entry-handlers.js';
 import * as discordMessageInput from './discord-message-input.js';
+import {
+  configureRuntimeProxy,
+  createDiscordClient,
+  normalizeSlashPrefix,
+  readCodexDefaults,
+  renderMissingDiscordTokenHint,
+} from './runtime-bootstrap.js';
 import { createRuntimePresentation } from './runtime-presentation.js';
 import {
   extractInputTokensFromUsage,
@@ -148,41 +151,14 @@ if (envState.loadedFiles.length) {
   console.log(`🔧 Loaded env files: ${rendered}${scoped}`);
 }
 
-const proxyRepair = autoRepairProxyEnv(ENV_FILE);
-if (proxyRepair.logs.length) {
-  for (const line of proxyRepair.logs) {
+const { logs: proxyLogs, restProxyAgent } = configureRuntimeProxy({
+  env: process.env,
+  envFilePath: ENV_FILE,
+});
+if (proxyLogs.length) {
+  for (const line of proxyLogs) {
     console.log(line);
   }
-}
-
-// Optional proxy setup
-//
-// If you're behind a corporate / Clash / MITM HTTP proxy:
-// - Set HTTP_PROXY for Discord REST (undici fetch)
-// - Set SOCKS_PROXY for Discord Gateway WebSocket (recommended)
-// - If your HTTP proxy does TLS MITM, set INSECURE_TLS=1 (NOT recommended)
-//
-// Note: SOCKS_PROXY for the Gateway requires a small patch to @discordjs/ws.
-// See README for the patch script.
-
-const HTTP_PROXY = process.env.HTTP_PROXY || null;
-const SOCKS_PROXY = process.env.SOCKS_PROXY || null;
-const INSECURE_TLS = String(process.env.INSECURE_TLS || '0') === '1';
-let restProxyAgent = null;
-
-if (HTTP_PROXY) {
-  if (INSECURE_TLS) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  restProxyAgent = new ProxyAgent({ uri: HTTP_PROXY });
-  setGlobalDispatcher(restProxyAgent);
-}
-
-if (SOCKS_PROXY) {
-  const socksAgent = new SocksProxyAgent(SOCKS_PROXY);
-  globalThis.__discordWsAgent = socksAgent;
-}
-
-if (HTTP_PROXY || SOCKS_PROXY) {
-  console.log(`🌐 Proxy: REST=${HTTP_PROXY || '(none)'} | WS=${SOCKS_PROXY || '(none)'} | INSECURE_TLS=${INSECURE_TLS}`);
 }
 
 const {
@@ -315,23 +291,6 @@ if (bootCliHealth.ok) {
   ].join('\n'));
 }
 
-// Read codex config.toml defaults for display
-function getCodexDefaults() {
-  try {
-    const home = process.env.HOME || process.env.USERPROFILE || '';
-    const configPath = path.join(home, '.codex', 'config.toml');
-    const raw = fs.readFileSync(configPath, 'utf-8');
-    const modelMatch = raw.match(/^model\s*=\s*"([^"]+)"/m);
-    const effortMatch = raw.match(/^model_reasoning_effort\s*=\s*"([^"]+)"/m);
-    return {
-      model: modelMatch?.[1] || '(unknown)',
-      effort: effortMatch?.[1] || '(unknown)',
-    };
-  } catch {
-    return { model: '(unknown)', effort: '(unknown)' };
-  }
-}
-
 const {
   clearSessionId,
   formatSessionIdLabel,
@@ -359,7 +318,7 @@ const {
   compactOnThreshold: COMPACT_ON_THRESHOLD,
   maxInputTokensBeforeCompact: MAX_INPUT_TOKENS_BEFORE_COMPACT,
   modelAutoCompactTokenLimit: MODEL_AUTO_COMPACT_TOKEN_LIMIT,
-  readCodexDefaults: getCodexDefaults,
+  readCodexDefaults,
   normalizeProvider,
 });
 
@@ -467,23 +426,12 @@ let enqueuePrompt;
 let runCodex;
 let discordLifecycle = null;
 const ONBOARDING_TOTAL_STEPS = 4;
-
-function createClient() {
-  const bot = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ],
-    partials: [Partials.Channel, Partials.Message],
-  });
-
-  if (restProxyAgent) {
-    bot.rest.setAgent(restProxyAgent);
-  }
-
-  return bot;
-}
+const createClient = () => createDiscordClient({
+  Client,
+  GatewayIntentBits,
+  Partials,
+  restProxyAgent,
+});
 
 // ── Slash Commands ──────────────────────────────────────────────
 
@@ -949,34 +897,3 @@ const { handlePrompt } = createPromptOrchestrator({
   getCurrentUserId: () => discordLifecycle?.getClient()?.user?.id,
   handlePrompt,
 }));
-
-function normalizeSlashPrefix(value) {
-  const raw = String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, '')
-    .replace(/^_+|_+$/g, '');
-  if (!raw) return '';
-  return raw.slice(0, 12);
-}
-
-function renderMissingDiscordTokenHint({ botProvider = null, env = process.env } = {}) {
-  if (botProvider) {
-    return `Missing Discord token in environment (${`DISCORD_TOKEN_${botProvider.toUpperCase()}`} or DISCORD_TOKEN)`;
-  }
-
-  const hasCodexScopedToken = Boolean(String(env.CODEX__DISCORD_TOKEN || env.DISCORD_TOKEN_CODEX || '').trim());
-  const hasClaudeScopedToken = Boolean(String(env.CLAUDE__DISCORD_TOKEN || env.DISCORD_TOKEN_CLAUDE || '').trim());
-  const hasGeminiScopedToken = Boolean(String(env.GEMINI__DISCORD_TOKEN || env.DISCORD_TOKEN_GEMINI || '').trim());
-
-  if (hasCodexScopedToken || hasClaudeScopedToken || hasGeminiScopedToken) {
-    const availableProviders = [
-      hasCodexScopedToken ? 'codex' : null,
-      hasClaudeScopedToken ? 'claude' : null,
-      hasGeminiScopedToken ? 'gemini' : null,
-    ].filter(Boolean).join(', ');
-    return `Missing DISCORD_TOKEN in shared mode. Found provider-scoped tokens for: ${availableProviders}. Start with npm run start:codex / npm run start:claude / npm run start:gemini, or add a shared DISCORD_TOKEN.`;
-  }
-
-  return 'Missing DISCORD_TOKEN in environment';
-}
