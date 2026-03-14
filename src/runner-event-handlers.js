@@ -111,22 +111,29 @@ export function handleClaudeRunnerEvent(event, state, ensureSessionBridge) {
     }
     case 'session.created':
     case 'session.resumed':
-      state.threadId = event.session_id || state.threadId;
+      state.threadId = event.session_id || event.sessionId || state.threadId;
       if (state.threadId) ensureSessionBridge(state.threadId);
       break;
     case 'message':
     case 'assistant': {
       const text = extractClaudeText(event);
       if (!text) break;
-      state.messages.push(text);
+      if (isClaudeFinalAnswerEvent(event)) appendUniqueText(state.finalAnswerMessages, text);
+      else appendUniqueText(state.messages, text);
+      const nextThreadId = event.session_id || event.sessionId || state.threadId;
+      if (nextThreadId && nextThreadId !== state.threadId) {
+        state.threadId = nextThreadId;
+        ensureSessionBridge(state.threadId);
+      }
       break;
     }
     case 'result': {
       const text = extractClaudeText(event);
-      if (text) state.finalAnswerMessages.push(text);
-      state.meta.claudeStopReason = event.stop_reason ?? '';
-      if (event.session_id) {
-        state.threadId = event.session_id;
+      if (text) appendUniqueText(state.finalAnswerMessages, text);
+      state.meta.claudeStopReason = extractClaudeStopReason(event);
+      const nextThreadId = event.session_id || event.sessionId || state.threadId;
+      if (nextThreadId) {
+        state.threadId = nextThreadId;
         ensureSessionBridge(state.threadId);
       }
       if (event.usage) state.usage = event.usage;
@@ -137,19 +144,81 @@ export function handleClaudeRunnerEvent(event, state, ensureSessionBridge) {
   }
 }
 
-function extractClaudeText(event) {
-  if (!event || typeof event !== 'object') return '';
-  if (typeof event.text === 'string') return event.text.trim();
-  if (typeof event.message === 'string') return event.message.trim();
-  if (Array.isArray(event.content)) {
-    return event.content
-      .map((item) => {
-        if (typeof item === 'string') return item;
-        if (item?.type === 'text') return item.text || '';
-        return '';
-      })
-      .join('\n')
-      .trim();
+function appendUniqueText(list, text) {
+  const next = String(text || '').trim();
+  if (!next) return;
+  const previous = String(list?.[list.length - 1] || '').trim();
+  if (normalizeComparableText(previous) === normalizeComparableText(next)) return;
+  list.push(next);
+}
+
+function normalizeComparableText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function collectClaudeTextParts(value) {
+  if (value === null || value === undefined) return [];
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text ? [text] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectClaudeTextParts(item));
+  }
+  if (typeof value !== 'object') return [];
+
+  const type = String(value.type || '').trim().toLowerCase();
+  if (type === 'tool_use' || type === 'tool_result' || type === 'server_tool_use' || type === 'thinking') {
+    return [];
+  }
+
+  const parts = [
+    ...collectClaudeTextParts(value.text),
+    ...collectClaudeTextParts(value.output_text),
+    ...collectClaudeTextParts(value.input_text),
+    ...collectClaudeTextParts(value.reasoning_text),
+  ];
+
+  if (typeof value.message === 'string') {
+    parts.push(...collectClaudeTextParts(value.message));
+  } else if (value.message && typeof value.message === 'object') {
+    parts.push(...collectClaudeTextParts(value.message));
+  }
+
+  if (Array.isArray(value.content)) {
+    parts.push(...collectClaudeTextParts(value.content));
+  }
+
+  return parts;
+}
+
+function extractClaudeStopReason(event) {
+  const candidates = [
+    event?.stop_reason,
+    event?.stopReason,
+    event?.message?.stop_reason,
+    event?.message?.stopReason,
+    event?.result?.stop_reason,
+    event?.result?.stopReason,
+  ];
+  for (const candidate of candidates) {
+    const text = String(candidate || '').trim();
+    if (text) return text;
   }
   return '';
+}
+
+function isClaudeFinalAnswerEvent(event) {
+  return extractClaudeStopReason(event).toLowerCase() === 'end_turn';
+}
+
+function extractClaudeText(event) {
+  if (!event || typeof event !== 'object') return '';
+  const parts = collectClaudeTextParts([
+    event.text,
+    event.message,
+    event.content,
+    event.result,
+  ]);
+  return parts.join('\n\n').trim();
 }

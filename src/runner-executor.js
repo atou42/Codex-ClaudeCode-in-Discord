@@ -173,7 +173,12 @@ export function createRunnerExecutor({
           provider,
           threadId: id,
           workspaceDir,
-          onEvent: options.onEvent,
+          onEvent: (ev) => {
+            if (normalizeProvider(provider) === 'claude') {
+              handleEvent(ev);
+            }
+            options.onEvent?.(ev);
+          },
         });
         progressBridgeThreadId = id;
       };

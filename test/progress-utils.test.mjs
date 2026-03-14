@@ -347,6 +347,22 @@ test('extractRawProgressTextFromEvent reads Claude assistant commentary messages
   assert.equal(raw, '正在比对 Claude 与 Codex 的事件格式。');
 });
 
+test('extractRawProgressTextFromEvent ignores Claude final answer from session file assistant events', () => {
+  const ev = {
+    type: 'assistant',
+    sessionId: '123',
+    message: {
+      type: 'message',
+      role: 'assistant',
+      stop_reason: 'end_turn',
+      content: [{ type: 'text', text: '这是最终答案，不应进入过程内容。' }],
+    },
+  };
+
+  const raw = extractRawProgressTextFromEvent(ev);
+  assert.equal(raw, '');
+});
+
 test('extractRawProgressTextFromEvent reads Gemini assistant commentary messages', () => {
   const raw = extractRawProgressTextFromEvent({
     type: 'message',

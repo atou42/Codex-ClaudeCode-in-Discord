@@ -491,6 +491,22 @@ function pickFirstRawTextFromContent(content) {
   return '';
 }
 
+function extractStopReason(ev, payload) {
+  const candidates = [
+    ev?.stop_reason,
+    ev?.stopReason,
+    payload?.stop_reason,
+    payload?.stopReason,
+    payload?.message?.stop_reason,
+    payload?.message?.stopReason,
+  ];
+  for (const candidate of candidates) {
+    const text = normalizeEventType(candidate);
+    if (text) return text;
+  }
+  return '';
+}
+
 function isLowSignalProcessText(text) {
   const normalized = normalizeWhitespace(text);
   if (!normalized) return true;
@@ -540,7 +556,9 @@ export function extractRawProgressTextFromEvent(ev) {
 
   if (type === 'assistant' || type === 'assistant_message') {
     const phase = normalizeEventType(payload?.phase || ev.phase || '');
+    const stopReason = extractStopReason(ev, payload);
     if (phase === 'final_answer') return '';
+    if (stopReason === 'end_turn') return '';
     const text = pickFirstRawText([
       payload?.message,
       payload?.text,
@@ -555,7 +573,9 @@ export function extractRawProgressTextFromEvent(ev) {
 
   if (type === 'message') {
     const role = normalizeEventType(ev.role || payload?.role || '');
+    const stopReason = extractStopReason(ev, payload);
     if (role && role !== 'assistant') return '';
+    if (stopReason === 'end_turn') return '';
     const text = pickFirstRawText([
       ev.content,
       ev.message,

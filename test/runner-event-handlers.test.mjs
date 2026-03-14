@@ -186,3 +186,60 @@ test('handleClaudeRunnerEvent captures tool use session id and final result text
   assert.deepEqual(state.usage, { input_tokens: 21, output_tokens: 8 });
   assert.deepEqual(bridges, ['claude-session-1', 'claude-session-1']);
 });
+
+test('handleClaudeRunnerEvent reads real Claude assistant session messages and separates final answer', () => {
+  const state = {
+    messages: [],
+    finalAnswerMessages: [],
+    reasonings: [],
+    logs: [],
+    usage: null,
+    threadId: null,
+    meta: {
+      claudeSawAgentToolUse: false,
+      claudeStopReason: '',
+    },
+  };
+  const bridges = [];
+
+  handleClaudeRunnerEvent({
+    type: 'assistant',
+    sessionId: 'claude-session-2',
+    message: {
+      role: 'assistant',
+      type: 'message',
+      stop_reason: 'tool_use',
+      content: [
+        { type: 'text', text: '我先检查一下这个问题的复现路径。' },
+        { type: 'tool_use', name: 'Bash' },
+      ],
+    },
+  }, state, (threadId) => bridges.push(threadId));
+
+  handleClaudeRunnerEvent({
+    type: 'assistant',
+    sessionId: 'claude-session-2',
+    message: {
+      role: 'assistant',
+      type: 'message',
+      stop_reason: 'end_turn',
+      content: [
+        { type: 'text', text: '结论：问题出在 Claude session 最终答案被误判成过程内容。' },
+      ],
+    },
+  }, state, (threadId) => bridges.push(threadId));
+
+  handleClaudeRunnerEvent({
+    type: 'result',
+    session_id: 'claude-session-2',
+    stop_reason: 'end_turn',
+    content: [
+      { type: 'text', text: '结论：问题出在 Claude session 最终答案被误判成过程内容。' },
+    ],
+  }, state, (threadId) => bridges.push(threadId));
+
+  assert.deepEqual(state.messages, ['我先检查一下这个问题的复现路径。']);
+  assert.deepEqual(state.finalAnswerMessages, ['结论：问题出在 Claude session 最终答案被误判成过程内容。']);
+  assert.equal(state.threadId, 'claude-session-2');
+  assert.deepEqual(bridges, ['claude-session-2', 'claude-session-2']);
+});
