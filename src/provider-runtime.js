@@ -5,6 +5,9 @@ import {
   getProviderBinEnvName,
   normalizeProvider,
 } from './provider-metadata.js';
+import {
+  getLaunchctlGuardBinDir,
+} from './launchctl-guard.js';
 
 function truncate(text, max) {
   const value = String(text || '');
@@ -17,10 +20,12 @@ export function buildSpawnEnv(env) {
   const home = out.HOME || out.USERPROFILE || '';
   const delimiter = path.delimiter;
   const rawPath = out.PATH || '';
-  const entries = rawPath.split(delimiter).filter(Boolean);
-  const seen = new Set(entries);
+  const entries = [];
+  const seen = new Set();
+  const guardBinDir = getLaunchctlGuardBinDir();
 
   const extras = [
+    guardBinDir,
     '/opt/homebrew/bin',
     '/usr/local/bin',
     '/usr/bin',
@@ -29,11 +34,18 @@ export function buildSpawnEnv(env) {
     home ? path.join(home, 'bin') : null,
   ].filter(Boolean);
 
+  const addPath = (currentPath) => {
+    if (!currentPath || seen.has(currentPath)) return;
+    entries.push(currentPath);
+    seen.add(currentPath);
+  };
+
   for (const currentPath of extras) {
-    if (!seen.has(currentPath)) {
-      entries.push(currentPath);
-      seen.add(currentPath);
-    }
+    addPath(currentPath);
+  }
+
+  for (const currentPath of rawPath.split(delimiter).filter(Boolean)) {
+    addPath(currentPath);
   }
 
   out.PATH = entries.join(delimiter);

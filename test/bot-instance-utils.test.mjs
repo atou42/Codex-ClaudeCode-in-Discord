@@ -22,14 +22,16 @@ test('parseOptionalProvider accepts empty shared mode', () => {
 test('resolveProviderScopedEnv prefers provider-scoped key then fallback', () => {
   const env = {
     DISCORD_TOKEN: 'shared-token',
+    CODEX__DISCORD_TOKEN: 'codex-prefixed-token',
     DISCORD_TOKEN_CODEX: 'codex-token',
     DISCORD_TOKEN_CLAUDE: 'claude-token',
+    GEMINI__DISCORD_TOKEN: 'gemini-prefixed-token',
     DISCORD_TOKEN_GEMINI: 'gemini-token',
   };
 
-  assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'codex', env), 'codex-token');
+  assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'codex', env), 'codex-prefixed-token');
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'claude', env), 'claude-token');
-  assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'gemini', env), 'gemini-token');
+  assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'gemini', env), 'gemini-prefixed-token');
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', null, env), 'shared-token');
   assert.equal(resolveProviderScopedEnv('DISCORD_TOKEN', 'unknown', env), 'shared-token');
 });
@@ -37,7 +39,7 @@ test('resolveProviderScopedEnv prefers provider-scoped key then fallback', () =>
 test('resolveDiscordToken uses provider-specific token in locked mode', () => {
   const env = {
     DISCORD_TOKEN: 'shared-token',
-    DISCORD_TOKEN_CLAUDE: 'claude-token',
+    CLAUDE__DISCORD_TOKEN: 'claude-token',
   };
 
   assert.equal(resolveDiscordToken({ botProvider: 'claude', env }), 'claude-token');

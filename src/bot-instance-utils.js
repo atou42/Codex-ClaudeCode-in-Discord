@@ -8,6 +8,10 @@ export { parseOptionalProvider };
 export function resolveProviderScopedEnv(envKey, provider = null, env = process.env) {
   const lockedProvider = parseOptionalProvider(provider);
   if (lockedProvider) {
+    const providerPrefixKey = `${lockedProvider.toUpperCase()}__${envKey}`;
+    const providerPrefixValue = String(env?.[providerPrefixKey] || '').trim();
+    if (providerPrefixValue) return providerPrefixValue;
+
     const scopedKey = `${envKey}_${lockedProvider.toUpperCase()}`;
     const scopedValue = String(env?.[scopedKey] || '').trim();
     if (scopedValue) return scopedValue;

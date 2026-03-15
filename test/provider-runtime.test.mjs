@@ -7,14 +7,18 @@ import {
   getProviderBin,
   isCliNotFound,
 } from '../src/provider-runtime.js';
+import {
+  getLaunchctlGuardBinDir,
+} from '../src/launchctl-guard.js';
 
-test('buildSpawnEnv appends common executable locations', () => {
+test('buildSpawnEnv prepends the launchctl guard and appends common executable locations', () => {
   const env = buildSpawnEnv({
     HOME: '/tmp/home',
     PATH: '/usr/bin',
   });
 
   const parts = env.PATH.split(':');
+  assert.equal(parts[0], getLaunchctlGuardBinDir());
   assert.ok(parts.includes('/usr/bin'));
   assert.ok(parts.includes('/tmp/home/.local/bin'));
   assert.ok(parts.includes('/opt/homebrew/bin'));

@@ -140,7 +140,10 @@ test('createPromptProgressReporterFactory seeds initial step and updates final p
 
   await harness.reporter.finish({ ok: true });
   assert.match(harness.edits[harness.edits.length - 1].content, /✅ \*\*Task Completed\*\*/);
+  assert.match(harness.edits[harness.edits.length - 1].content, /• phase: done/);
+  assert.match(harness.edits[harness.edits.length - 1].content, /• latest activity: Final response sent/);
   assert.deepEqual(harness.edits[harness.edits.length - 1].components, []);
+  assert.equal(harness.channelState.activeRun.phase, 'done');
   assert.equal(harness.cleared.length, 2);
 });
 

@@ -49,6 +49,15 @@ export function createDiscordEntryHandlers({
     );
   }
 
+  function describeInteraction(interaction) {
+    if (!interaction) return 'interaction';
+    const commandName = String(interaction.commandName || '').trim();
+    if (commandName) return `interaction:${commandName}`;
+    const customId = String(interaction.customId || '').trim();
+    if (customId) return `interaction:${customId}`;
+    return `interaction:${interaction.type || 'unknown'}`;
+  }
+
   async function handleMessageCreate(message, bot) {
     try {
       if (message.author.bot) return;
@@ -97,12 +106,36 @@ export function createDiscordEntryHandlers({
     const body = typeof payload === 'string' ? { content: payload } : payload;
     if (interaction.deferred && !interaction.replied) {
       const { flags: _ignoredFlags, ...editPayload } = body;
-      return interaction.editReply(editPayload);
+      return withDiscordNetworkRetry(
+        () => interaction.editReply(editPayload),
+        {
+          logger,
+          label: `${describeInteraction(interaction)} editReply`,
+          maxAttempts: 3,
+          baseDelayMs: 250,
+        },
+      );
     }
     if (interaction.replied) {
-      return interaction.followUp(body);
+      return withDiscordNetworkRetry(
+        () => interaction.followUp(body),
+        {
+          logger,
+          label: `${describeInteraction(interaction)} followUp`,
+          maxAttempts: 3,
+          baseDelayMs: 250,
+        },
+      );
     }
-    return interaction.reply(body);
+    return withDiscordNetworkRetry(
+      () => interaction.reply(body),
+      {
+        logger,
+        label: `${describeInteraction(interaction)} reply`,
+        maxAttempts: 3,
+        baseDelayMs: 250,
+      },
+    );
   }
 
   async function safeInteractionFailureReply(interaction, err) {
@@ -128,18 +161,19 @@ export function createDiscordEntryHandlers({
       const commandButton = interaction.isButton() ? parseCommandActionButtonId(interaction.customId) : null;
       const isOnboarding = interaction.isButton() && isOnboardingButtonId(interaction.customId);
       if (!isWorkspaceBrowser && !isOnboarding && !commandButton) return;
+      logger.log(`[interaction] kind=${interaction.isButton() ? 'button' : 'select'} id=${interaction.customId} user=${interaction.user?.tag || interaction.user?.id || 'unknown'} channel=${interaction.channelId || 'unknown'}`);
       try {
         if (!isAllowedUser(interaction.user.id)) {
-          await interaction.reply({ content: '⛔ 没有权限。', flags: 64 });
+          await sendInteractionResponse(interaction, { content: '⛔ 没有权限。', flags: 64 });
           return;
         }
         if (!(await isAllowedInteractionChannel(interaction))) {
-          await interaction.reply({ content: '⛔ 当前频道未开放。', flags: 64 });
+          await sendInteractionResponse(interaction, { content: '⛔ 当前频道未开放。', flags: 64 });
           return;
         }
         if (commandButton) {
           if (commandButton.userId !== interaction.user.id) {
-            await interaction.reply({ content: '⛔ 这组快捷按钮属于发起命令的用户。', flags: 64 });
+            await sendInteractionResponse(interaction, { content: '⛔ 这组快捷按钮属于发起命令的用户。', flags: 64 });
             return;
           }
           const handled = await routeSlashCommand({
@@ -148,7 +182,7 @@ export function createDiscordEntryHandlers({
             respond: (payload) => sendInteractionResponse(interaction, payload),
           });
           if (!handled) {
-            await interaction.reply({ content: '❌ 快捷按钮已失效，请重新执行 slash 命令。', flags: 64 });
+            await sendInteractionResponse(interaction, { content: '❌ 快捷按钮已失效，请重新执行 slash 命令。', flags: 64 });
           }
           return;
         }
@@ -158,19 +192,29 @@ export function createDiscordEntryHandlers({
         }
         await handleOnboardingButtonInteraction(interaction);
       } catch (err) {
+        logger.error(`interactionCreate component handler error (${describeInteraction(interaction)}):`, err);
         await safeInteractionFailureReply(interaction, err);
       }
       return;
     }
 
     if (!interaction.isChatInputCommand()) return;
+    logger.log(`[interaction] kind=chat-input cmd=${interaction.commandName} user=${interaction.user?.tag || interaction.user?.id || 'unknown'} channel=${interaction.channelId || 'unknown'}`);
     if (!isAllowedUser(interaction.user.id)) {
-      await interaction.reply({ content: '⛔ 没有权限。', flags: 64 });
+      await sendInteractionResponse(interaction, { content: '⛔ 没有权限。', flags: 64 });
       return;
     }
 
     try {
-      await interaction.deferReply({ flags: 64 });
+      await withDiscordNetworkRetry(
+        () => interaction.deferReply({ flags: 64 }),
+        {
+          logger,
+          label: `${describeInteraction(interaction)} deferReply`,
+          maxAttempts: 3,
+          baseDelayMs: 250,
+        },
+      );
       const respond = (payload) => sendInteractionResponse(interaction, payload);
 
       if (!(await isAllowedInteractionChannel(interaction))) {
@@ -188,6 +232,7 @@ export function createDiscordEntryHandlers({
         await respond({ content: `❌ 未知命令：\`${interaction.commandName}\``, flags: 64 });
       }
     } catch (err) {
+      logger.error(`interactionCreate chat-input handler error (${describeInteraction(interaction)}):`, err);
       await safeInteractionFailureReply(interaction, err);
     }
   }

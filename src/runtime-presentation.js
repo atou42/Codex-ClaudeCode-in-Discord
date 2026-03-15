@@ -16,6 +16,14 @@ import {
 } from './progress-milestones.js';
 import { humanAge as defaultHumanAge } from './runtime-utils.js';
 
+function truncateLine(value, max) {
+  const text = String(value || '');
+  const limit = Number(max);
+  if (!Number.isFinite(limit) || limit <= 0 || text.length <= limit) return text;
+  if (limit <= 3) return text.slice(0, limit);
+  return `${text.slice(0, limit - 3)}...`;
+}
+
 export function createRuntimePresentation({
   showReasoning = false,
   progressTextPreviewChars = 140,
@@ -76,7 +84,10 @@ export function createRuntimePresentation({
     const visible = Array.isArray(activities)
       ? activities
         .slice(-limit)
-        .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
+        .map((line) => truncateLine(
+          String(line || '').replace(/\s+/g, ' ').trim(),
+          Math.max(80, progressTextPreviewChars),
+        ))
         .filter(Boolean)
       : [];
     if (!visible.length) return [];

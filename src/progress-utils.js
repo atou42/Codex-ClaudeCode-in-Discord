@@ -547,11 +547,27 @@ export function extractRawProgressTextFromEvent(ev) {
   }
 
   if (type === 'stream_event' && ev.event && typeof ev.event === 'object') {
+    const nestedType = normalizeEventType(ev.event.type || '');
+    if (nestedType === 'content_block_delta' || nestedType === 'content_block_start') {
+      return '';
+    }
     return extractRawProgressTextFromEvent({
       ...ev.event,
       type: ev.event.type,
       session_id: ev.session_id || ev.sessionId,
     });
+  }
+
+  if (type === 'assistant') {
+    const content = Array.isArray(payload?.content) ? payload.content : Array.isArray(ev?.content) ? ev.content : [];
+    const hasClaudeMessageShape = payload && typeof payload === 'object'
+      && normalizeEventType(payload.type || '') === 'message'
+      && normalizeEventType(payload.role || '') === 'assistant';
+    const containsStructuredBlocks = content.some((part) => part && typeof part === 'object' && normalizeEventType(part.type || ''));
+    // Claude stream-json emits assistant snapshots before the trailing message_delta/result.
+    // They often contain the final answer body without a stop_reason yet, so they should not
+    // be treated as process content for the Discord progress card.
+    if (hasClaudeMessageShape && containsStructuredBlocks) return '';
   }
 
   if (type === 'assistant' || type === 'assistant_message') {

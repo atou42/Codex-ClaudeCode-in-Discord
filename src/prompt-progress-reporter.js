@@ -87,6 +87,25 @@ function normalizeActivityKey(value) {
   return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+function getFinalLatestStep({
+  ok = false,
+  cancelled = false,
+  timedOut = false,
+  latestStep = '',
+  language = 'en',
+} = {}) {
+  if (cancelled) {
+    return language === 'en' ? 'Task cancelled' : '任务已中断';
+  }
+  if (timedOut) {
+    return language === 'en' ? 'Task timed out' : '任务已超时';
+  }
+  if (ok) {
+    return language === 'en' ? 'Final response sent' : '最终结果已发送';
+  }
+  return String(latestStep || '').trim() || (language === 'en' ? 'Task failed' : '任务失败');
+}
+
 export function createPromptProgressReporterFactory({
   defaultUiLanguage = 'zh',
   progressUpdatesEnabled = true,
@@ -401,6 +420,16 @@ export function createPromptProgressReporterFactory({
       if (activityTimer) clearIntervalFn(activityTimer);
       while (pushOneActivity({ force: true })) {
         // Drain buffered activity lines into the final card.
+      }
+      latestStep = getFinalLatestStep({
+        ok,
+        cancelled,
+        timedOut,
+        latestStep,
+        language: lang,
+      });
+      if (channelState?.activeRun) {
+        channelState.activeRun.phase = 'done';
       }
       syncActiveRun();
       if (!progressMessage) return;

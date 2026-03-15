@@ -16,13 +16,19 @@ function createHarness(overrides = {}) {
     registerSlashCommands: [],
     enqueuePrompt: [],
     handleCommand: [],
+    logs: [],
     routeSlashCommand: [],
+    retries: [],
     workspaceBrowser: 0,
     onboarding: 0,
   };
 
   const handlers = createDiscordEntryHandlers({
-    logger: createLogger(),
+    logger: {
+      log: (...args) => calls.logs.push(['log', ...args]),
+      warn: (...args) => calls.logs.push(['warn', ...args]),
+      error: (...args) => calls.logs.push(['error', ...args]),
+    },
     registerSlashCommands: async (payload) => {
       calls.registerSlashCommands.push(payload);
     },
@@ -31,7 +37,10 @@ function createHarness(overrides = {}) {
     discordToken: 'token',
     restProxyAgent: { name: 'agent' },
     slashCommands: ['cmd'],
-    withDiscordNetworkRetry: async (fn) => fn(),
+    withDiscordNetworkRetry: async (fn, options = {}) => {
+      calls.retries.push(options);
+      return fn();
+    },
     safeReply: async () => {},
     safeError: (err) => err?.message || String(err),
     isIgnorableDiscordRuntimeError: (err) => Number(err?.code) === 10062,
@@ -142,6 +151,35 @@ test('handleInteractionCreate defers chat commands and reports unknown commands 
   assert.equal(calls.routeSlashCommand.length, 1);
   assert.equal(calls.routeSlashCommand[0].commandName, 'norm:ping');
   assert.deepEqual(edits, [{ content: '❌ 未知命令：`ping`' }]);
+  assert.equal(calls.retries[0].label, 'interaction:ping deferReply');
+  assert.equal(calls.retries[1].label, 'interaction:ping editReply');
+});
+
+test('handleInteractionCreate retries deferReply before routing slash command', async () => {
+  const { handlers, calls } = createHarness();
+  let attempts = 0;
+  const interaction = {
+    commandName: 'status',
+    user: { id: 'user-1', tag: 'demo#0001' },
+    deferred: false,
+    replied: false,
+    isButton: () => false,
+    isStringSelectMenu: () => false,
+    isChatInputCommand: () => true,
+    async deferReply() {
+      attempts += 1;
+      this.deferred = true;
+    },
+    async editReply() {},
+    async reply() {},
+    async followUp() {},
+  };
+
+  await handlers.handleInteractionCreate(interaction);
+
+  assert.equal(attempts, 1);
+  assert.equal(calls.routeSlashCommand.length, 1);
+  assert.equal(calls.logs[0][1], '[interaction] kind=chat-input cmd=status user=demo#0001 channel=unknown');
 });
 
 test('handleMessageCreate strips bot mention and enqueues prompt', async () => {

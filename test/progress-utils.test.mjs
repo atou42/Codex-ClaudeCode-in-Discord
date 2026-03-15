@@ -233,6 +233,26 @@ test('extractRawProgressTextFromEvent ignores final_answer from event_msg agent_
   assert.equal(raw, '');
 });
 
+test('extractRawProgressTextFromEvent ignores Claude assistant text snapshots before end_turn', () => {
+  const ev = {
+    type: 'assistant',
+    session_id: 'claude-session-1',
+    message: {
+      role: 'assistant',
+      type: 'message',
+      content: [
+        {
+          type: 'text',
+          text: '这个仓库是 gstack，由 Y Combinator 现任 CEO Garry Tan 创建。',
+        },
+      ],
+    },
+  };
+
+  const raw = extractRawProgressTextFromEvent(ev);
+  assert.equal(raw, '');
+});
+
 test('extractRawProgressTextFromEvent reads commentary from response_item assistant message', () => {
   const ev = {
     type: 'response_item',
@@ -415,7 +435,7 @@ test('summarizeCodexEvent unwraps Claude stream_event content_block_delta', () =
   assert.equal(summary, 'agent message: 正在检查 Claude stream 事件');
 });
 
-test('extractRawProgressTextFromEvent unwraps Claude stream_event content_block_delta', () => {
+test('extractRawProgressTextFromEvent suppresses Claude stream_event content_block_delta raw text', () => {
   const ev = {
     type: 'stream_event',
     session_id: '11111111-1111-4111-8111-111111111111',
@@ -429,7 +449,7 @@ test('extractRawProgressTextFromEvent unwraps Claude stream_event content_block_
   };
 
   const raw = extractRawProgressTextFromEvent(ev);
-  assert.equal(raw, '正在逐步输出目录路径');
+  assert.equal(raw, '');
 });
 
 test('summarizeCodexEvent renders Claude queue-operation events', () => {

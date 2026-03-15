@@ -1,0 +1,54 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+
+import {
+  classifyLaunchctlInvocation,
+  getSafeRestartScriptPath,
+} from '../../src/launchctl-guard.js';
+
+const argv = process.argv.slice(2);
+const decision = classifyLaunchctlInvocation(argv);
+const realBin = process.env.LAUNCHCTL_REAL_BIN || '/bin/launchctl';
+
+if (decision.action === 'block') {
+  const labels = decision.protectedLabels.join(', ');
+  const reason = decision.reason || `launchctl ${decision.verb || '(unknown)'}`;
+  process.stderr.write(
+    `agents-in-discord guard: refused ${reason} for protected bot service(s): ${labels}\n`,
+  );
+  process.stderr.write(
+    `Use ${getSafeRestartScriptPath()} <codex|claude|gemini|label> or launchctl kickstart -k gui/$(id -u)/<label> instead.\n`,
+  );
+  process.exit(64);
+}
+
+if (decision.action === 'rewrite-safe-restart') {
+  const helper = getSafeRestartScriptPath();
+  process.stderr.write(
+    `agents-in-discord guard: rewriting launchctl ${decision.verb} for ${decision.targetLabel} to safe restart helper.\n`,
+  );
+  const result = spawnSync(helper, [decision.targetLabel], {
+    stdio: 'inherit',
+    env: process.env,
+  });
+
+  if (result.error) {
+    process.stderr.write(`agents-in-discord guard: safe restart failed: ${result.error.message}\n`);
+    process.exit(1);
+  }
+
+  process.exit(result.status ?? 0);
+}
+
+const result = spawnSync(realBin, argv, {
+  stdio: 'inherit',
+  env: process.env,
+});
+
+if (result.error) {
+  process.stderr.write(`agents-in-discord guard: failed to run ${realBin}: ${result.error.message}\n`);
+  process.exit(1);
+}
+
+process.exit(result.status ?? 0);

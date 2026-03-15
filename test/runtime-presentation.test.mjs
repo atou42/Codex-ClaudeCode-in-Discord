@@ -40,6 +40,7 @@ test('runtime presentation formats runtime/session/permission labels', () => {
 
 test('runtime presentation localizes and renders process/progress helper lines', () => {
   const presentation = createPresentation();
+  const longLine = 'x'.repeat(120);
 
   assert.deepEqual(
     presentation.localizeProgressLines(['• plan: received', '• completed steps: boot'], 'zh'),
@@ -48,6 +49,10 @@ test('runtime presentation localizes and renders process/progress helper lines',
   assert.deepEqual(
     presentation.renderProcessContentLines(['step a', 'step b', 'step c'], 'en', 2),
     ['• process content:', '  · step b', '  · step c'],
+  );
+  assert.deepEqual(
+    presentation.renderProcessContentLines([longLine], 'en', 1),
+    ['• process content:', `  · ${'x'.repeat(77)}...`],
   );
 });
 
