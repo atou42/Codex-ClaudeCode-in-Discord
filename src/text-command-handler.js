@@ -1,5 +1,8 @@
 import fs from 'node:fs';
-import { normalizeCommandName } from './command-spec.js';
+import {
+  getProviderCommandAlias,
+  normalizeCommandName,
+} from './command-spec.js';
 
 function isExistingDirectory(dir) {
   try {
@@ -43,6 +46,9 @@ export function createTextCommandHandler({
   formatCancelReport,
   formatCompactStrategyConfigHelp,
   formatCompactConfigReport,
+  formatCompactConfigUnsupported = (provider) => `Compact config unsupported for ${provider}`,
+  formatProviderRawConfigSurface = (provider) => `raw config surface unavailable for ${provider}`,
+  formatProviderSessionLabel = (provider) => `${provider} session`,
   formatReasoningEffortHelp,
   formatReasoningEffortUnsupported,
   parseProviderInput,
@@ -58,6 +64,8 @@ export function createTextCommandHandler({
   resolveTimeoutSetting,
   describeConfigPolicy,
   isConfigKeyAllowed,
+  providerSupportsCompactConfigAction = () => true,
+  providerSupportsRawConfigOverrides = () => false,
   isReasoningEffortSupported,
   cancelChannelWork,
   openWorkspaceBrowser,
@@ -287,12 +295,25 @@ export function createTextCommandHandler({
       }
 
       case 'resume': {
+        const provider = getSessionProvider(session);
+        const resumeAlias = getProviderCommandAlias(provider, 'resume');
+        const sessionsAlias = getProviderCommandAlias(provider, 'sessions');
         if (!arg) {
-          await safeReply(message, '用法：`!resume <session-id>`\n用 `!sessions` 查看当前 provider 可用的 session。');
+          await safeReply(
+            message,
+            [
+              '用法：`!resume <session-id>`',
+              resumeAlias ? `当前 provider 别名：\`!${resumeAlias} <session-id>\`` : null,
+              `用 \`!sessions\`${sessionsAlias ? ` / \`!${sessionsAlias}\`` : ''} 查看当前 provider 可用的 ${formatProviderSessionLabel(provider, 'zh', { plural: true })}。`,
+            ].filter(Boolean).join('\n'),
+          );
           return;
         }
         const binding = commandActions.bindSession(session, arg);
-        await safeReply(message, `✅ 已绑定 ${binding.providerLabel} session: \`${binding.sessionId}\`\n下条消息会 resume 这个上下文。`);
+        await safeReply(
+          message,
+          `✅ 已绑定 ${formatProviderSessionLabel(binding.provider, 'zh')}: \`${binding.sessionId}\`\n下条消息会 resume 这个上下文。`,
+        );
         break;
       }
 
@@ -322,12 +343,12 @@ export function createTextCommandHandler({
 
       case 'effort': {
         const language = getSessionLanguage(session);
+        const provider = getSessionProvider(session);
         const parsed = parseReasoningEffortInput(arg, { allowDefault: true });
         if (!parsed) {
-          await safeReply(message, formatReasoningEffortHelp(language));
+          await safeReply(message, formatReasoningEffortHelp(language, provider));
           return;
         }
-        const provider = getSessionProvider(session);
         if (parsed !== 'default' && !isReasoningEffortSupported(provider, parsed)) {
           await safeReply(message, formatReasoningEffortUnsupported(provider, language));
           return;
@@ -339,14 +360,14 @@ export function createTextCommandHandler({
 
       case 'compact': {
         const provider = getSessionProvider(session);
-        if (provider !== 'codex') {
-          await safeReply(message, `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`!compact\` 仅支持 Codex CLI。`);
-          break;
-        }
         const language = getSessionLanguage(session);
         const parsed = parseCompactConfigFromText(arg || 'status');
         if (!parsed || parsed.type === 'invalid') {
-          await safeReply(message, formatCompactStrategyConfigHelp(language));
+          await safeReply(message, formatCompactStrategyConfigHelp(language, provider));
+          break;
+        }
+        if (!providerSupportsCompactConfigAction(provider, parsed)) {
+          await safeReply(message, formatCompactConfigUnsupported(provider, parsed, language));
           break;
         }
         if (parsed.type === 'status') {
@@ -360,8 +381,20 @@ export function createTextCommandHandler({
 
       case 'config': {
         const provider = getSessionProvider(session);
-        if (provider !== 'codex') {
-          await safeReply(message, `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`!config\` 仅支持 Codex CLI。`);
+        const language = getSessionLanguage(session);
+        if (!providerSupportsRawConfigOverrides(provider)) {
+          await safeReply(
+            message,
+            language === 'en'
+              ? [
+                `⚠️ Current provider = \`${provider}\` (${getProviderDisplayName(provider)}). \`!config\` is only available when the CLI exposes a stable raw config passthrough.`,
+                `• runtime surface: ${formatProviderRawConfigSurface(provider, language)}`,
+              ].join('\n')
+              : [
+                `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`!config\` 仅对暴露稳定 raw config passthrough 的 CLI 开放。`,
+                `• runtime 能力面：${formatProviderRawConfigSurface(provider, language)}`,
+              ].join('\n'),
+          );
           return;
         }
         if (!enableConfigCmd) {

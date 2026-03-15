@@ -81,20 +81,67 @@ test('createTextCommandHandler switches to a fresh session without retry hint', 
   assert.deepEqual(replies, ['🆕 已切换到新会话。\n下一条普通消息会开启新的上下文。']);
 });
 
-test('createTextCommandHandler rejects compact for non-codex providers', async () => {
+test('createTextCommandHandler rejects only unsupported compact actions for non-native providers', async () => {
   const replies = [];
   const session = { provider: 'gemini' };
 
   const handleCommand = createTextCommandHandler({
     getSession: () => session,
     getSessionProvider: (currentSession) => currentSession.provider,
+    getSessionLanguage: () => 'zh',
     getProviderDisplayName: (provider) => provider === 'gemini' ? 'Gemini CLI' : provider,
+    parseCompactConfigFromText: () => ({ type: 'set_strategy', strategy: 'native' }),
+    providerSupportsCompactConfigAction: () => false,
+    formatCompactConfigUnsupported: () => '⚠️ 当前 provider Gemini CLI 不支持 `native` 压缩。',
     safeReply: async (_message, payload) => {
       replies.push(payload);
     },
   });
 
-  await handleCommand(createMessage(), 'thread-1', '!compact status');
+  await handleCommand(createMessage(), 'thread-1', '!compact strategy native');
 
-  assert.deepEqual(replies, ['⚠️ 当前 provider = `gemini` (Gemini CLI)，`!compact` 仅支持 Codex CLI。']);
+  assert.deepEqual(replies, ['⚠️ 当前 provider Gemini CLI 不支持 `native` 压缩。']);
+});
+
+test('createTextCommandHandler explains provider-specific raw config surface when !config is unavailable', async () => {
+  const replies = [];
+  const session = { provider: 'claude', language: 'en' };
+
+  const handleCommand = createTextCommandHandler({
+    getSession: () => session,
+    getSessionProvider: (currentSession) => currentSession.provider,
+    getSessionLanguage: () => 'en',
+    getProviderDisplayName: (provider) => provider === 'claude' ? 'Claude Code' : provider,
+    providerSupportsRawConfigOverrides: () => false,
+    formatProviderRawConfigSurface: () => 'no stable raw config passthrough surface exposed by the CLI',
+    safeReply: async (_message, payload) => {
+      replies.push(payload);
+    },
+  });
+
+  await handleCommand(createMessage(), 'thread-1', '!config foo=bar');
+
+  assert.match(replies[0], /Claude Code/);
+  assert.match(replies[0], /raw config passthrough/);
+  assert.match(replies[0], /runtime surface: no stable raw config passthrough surface exposed by the CLI/);
+});
+
+test('createTextCommandHandler shows current provider-native resume alias', async () => {
+  const replies = [];
+  const session = { provider: 'gemini', language: 'zh' };
+
+  const handleCommand = createTextCommandHandler({
+    getSession: () => session,
+    getSessionProvider: (currentSession) => currentSession.provider,
+    formatProviderSessionLabel: (_provider, _language, { plural } = {}) => (plural ? 'Gemini chat sessions' : 'Gemini chat session'),
+    safeReply: async (_message, payload) => {
+      replies.push(payload);
+    },
+  });
+
+  await handleCommand(createMessage(), 'thread-1', '!resume');
+
+  assert.match(replies[0], /!chat_resume <session-id>/);
+  assert.match(replies[0], /!chat_sessions/);
+  assert.doesNotMatch(replies[0], /!project_resume/);
 });

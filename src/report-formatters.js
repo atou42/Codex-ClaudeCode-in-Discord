@@ -1,4 +1,7 @@
 import { formatWorkspaceBusyReport as formatWorkspaceBusyReportBase } from './workspace-busy-report.js';
+import { getProviderCommandAlias } from './command-spec.js';
+
+const REASONING_LEVEL_DISPLAY_ORDER = Object.freeze(['xhigh', 'high', 'medium', 'low']);
 
 export function createReportFormatters({
   botProvider = null,
@@ -13,13 +16,27 @@ export function createReportFormatters({
   getSessionProvider = () => 'codex',
   getProviderDisplayName = (provider) => String(provider || ''),
   getProviderShortName = (provider) => String(provider || ''),
+  getProviderCompactCapabilities = () => ({
+    strategies: ['hard', 'native', 'off'],
+    supportsNativeStrategy: true,
+    supportsNativeLimit: true,
+  }),
+  providerSupportsRawConfigOverrides = () => false,
+  formatProviderSessionTerm = () => 'session',
+  formatProviderRuntimeSummary = () => '',
+  formatProviderSessionStoreSurface = () => '',
+  formatProviderResumeSurface = () => '',
+  formatProviderNativeCompactSurface = () => '',
+  formatProviderRawConfigSurface = () => '',
+  formatProviderReasoningSurface = () => '',
+  getSupportedReasoningEffortLevels = () => ['xhigh', 'high', 'medium', 'low'],
   getProviderDefaults = () => ({ model: '(unknown)', effort: '(unknown)', source: 'provider' }),
   getCliHealth = () => ({ ok: false, error: 'unavailable' }),
   getRuntimeSnapshot = () => ({ running: false, queued: 0 }),
   resolveSecurityContext = () => ({ mentionOnly: false, maxQueuePerChannel: 0 }),
   resolveTimeoutSetting = () => ({ timeoutMs: 0, source: 'env default' }),
   getEffectiveSecurityProfile = () => ({ profile: 'team', source: 'env default' }),
-  resolveCompactStrategySetting = () => ({ strategy: 'hard', source: 'env default' }),
+  resolveCompactStrategySetting = () => ({ strategy: 'native', source: 'env default' }),
   resolveCompactEnabledSetting = () => ({ enabled: true, source: 'env default' }),
   resolveCompactThresholdSetting = () => ({ tokens: 0, source: 'env default' }),
   resolveNativeCompactTokenLimitSetting = () => ({ tokens: 0, source: 'env default' }),
@@ -40,6 +57,8 @@ export function createReportFormatters({
   formatRuntimeLabel = () => 'idle',
   formatTimeoutLabel = () => 'off (no hard timeout)',
   describeCompactStrategy = (strategy) => String(strategy || ''),
+  formatWorkspaceSessionPolicy = (provider) => `session policy unavailable for ${provider}`,
+  formatWorkspaceSessionResetReason = (provider) => `reset because workspace policy unavailable for ${provider}`,
   humanAge = (ms) => `${ms}ms`,
   formatTokenValue = (value) => String(value ?? '-'),
   formatConfigCommandStatus = () => 'disabled',
@@ -116,6 +135,69 @@ export function createReportFormatters({
     return `（未设置；${binding.defaultEnvKey || 'DEFAULT_WORKSPACE_DIR'}）`;
   }
 
+  function formatNativeCompactValue(provider, nativeLimit, language = 'en') {
+    const compact = getProviderCompactCapabilities(provider);
+    if (compact.supportsNativeLimit) {
+      if (language === 'en') {
+        return `${nativeLimit.tokens} (${formatSettingSourceLabel(nativeLimit.source, language)})`;
+      }
+      return `${nativeLimit.tokens}（${formatSettingSourceLabel(nativeLimit.source, language)}）`;
+    }
+    if (compact.supportsNativeStrategy) {
+      if (language === 'en') {
+        return 'n/a (this provider does not expose a native limit override)';
+      }
+      return 'n/a（当前 provider 没有暴露 native limit 覆盖）';
+    }
+    if (language === 'en') {
+      return 'n/a (native compact unavailable for this provider)';
+    }
+    return 'n/a（当前 provider 不支持 native compact）';
+  }
+
+  function formatNativeCompactSetting(provider, nativeLimit, language = 'en') {
+    const compact = getProviderCompactCapabilities(provider);
+    if (compact.supportsNativeLimit) {
+      return {
+        label: 'native compact limit',
+        value: formatNativeCompactValue(provider, nativeLimit, language),
+      };
+    }
+    if (compact.supportsNativeStrategy) {
+      return language === 'en'
+        ? {
+          label: 'native compact',
+          value: 'provider default behavior (no exposed limit override)',
+        }
+        : {
+          label: 'native compact',
+          value: 'provider 默认行为（不暴露 limit 覆盖）',
+        };
+    }
+    return language === 'en'
+      ? {
+        label: 'native compact',
+        value: 'unavailable for this provider',
+      }
+      : {
+        label: 'native compact',
+        value: '当前 provider 不支持',
+      };
+  }
+
+  function getCompactCommandKeys(provider) {
+    const compact = getProviderCompactCapabilities(provider);
+    const keys = ['status', 'strategy', 'token_limit'];
+    if (compact.supportsNativeLimit) keys.push('native_limit');
+    keys.push('enabled', 'reset');
+    return keys;
+  }
+
+  function getReasoningEffortLevels(provider) {
+    const supported = new Set(getSupportedReasoningEffortLevels(provider));
+    return REASONING_LEVEL_DISPLAY_ORDER.filter((level) => supported.has(level));
+  }
+
   function getWorkspaceStatusLines(key, session, language = 'zh') {
     const binding = getWorkspaceBinding(session, key);
     if (language === 'en') {
@@ -154,11 +236,15 @@ export function createReportFormatters({
     const workspaceLines = getWorkspaceStatusLines(key, session, lang);
     const defaultModel = formatProviderDefaultLabel({ value: defaults.model, source: defaults.source }, lang);
     const defaultEffort = formatProviderDefaultLabel({ value: defaults.effort, source: defaults.source }, lang);
+    const runtimeSummary = formatProviderRuntimeSummary(provider, lang);
+    const sessionFieldLabel = formatProviderSessionTerm(provider, lang);
+    const nativeCompact = formatNativeCompactSetting(provider, nativeLimit, lang);
 
     if (lang === 'en') {
       return [
         '🧭 **Current Status**',
         `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
+        runtimeSummary ? `• runtime profile: ${runtimeSummary}` : null,
         `• model: ${session.model || defaultModel}`,
         `• mode: ${modeDesc}`,
         `• effort: ${session.effort || defaultEffort}`,
@@ -166,11 +252,11 @@ export function createReportFormatters({
         `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)} (${formatSettingSourceLabel(compactSetting.source, lang)})`,
         `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'} (${formatSettingSourceLabel(compactEnabled.source, lang)})`,
         `• compact token limit: ${compactThreshold.tokens} (${formatSettingSourceLabel(compactThreshold.source, lang)})`,
-        `• native compact limit: ${nativeLimit.tokens} (${formatSettingSourceLabel(nativeLimit.source, lang)})`,
+        `• ${nativeCompact.label}: ${nativeCompact.value}`,
         `• ui language: ${formatLanguageLabel(language)}`,
         `• permissions: ${formatPermissionsLabel(session, lang)}`,
         `• cli: ${formatCliHealth(cliHealth, lang)}`,
-        `• session: ${formatSessionStatusLabel(session)}`,
+        `• ${sessionFieldLabel}: ${formatSessionStatusLabel(session)}`,
         `• last input tokens: ${formatTokenValue(session?.lastInputTokens)}`,
         `• security profile: ${formatSecurityProfileDisplay(security, lang)}`,
       ].filter(Boolean).join('\n');
@@ -179,6 +265,7 @@ export function createReportFormatters({
     return [
       '🧭 **当前状态**',
       `• provider: \`${provider}\` (${getProviderDisplayName(provider)})`,
+      runtimeSummary ? `• runtime 能力面: ${runtimeSummary}` : null,
       `• model: ${session.model || defaultModel}`,
       `• mode: ${modeDesc}`,
       `• effort: ${session.effort || defaultEffort}`,
@@ -186,11 +273,11 @@ export function createReportFormatters({
       `• compact strategy: ${describeCompactStrategy(compactSetting.strategy, lang)}（${formatSettingSourceLabel(compactSetting.source, lang)}）`,
       `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'}（${formatSettingSourceLabel(compactEnabled.source, lang)}）`,
       `• compact token limit: ${compactThreshold.tokens}（${formatSettingSourceLabel(compactThreshold.source, lang)}）`,
-      `• native compact limit: ${nativeLimit.tokens}（${formatSettingSourceLabel(nativeLimit.source, lang)}）`,
+      `• ${nativeCompact.label}: ${nativeCompact.value}`,
       `• 界面语言: ${formatLanguageLabel(language)}`,
       `• 权限: ${formatPermissionsLabel(session, lang)}`,
       `• CLI: ${formatCliHealth(cliHealth, lang)}`,
-      `• session: ${formatSessionStatusLabel(session)}`,
+      `• ${sessionFieldLabel}: ${formatSessionStatusLabel(session)}`,
       `• 最近输入 tokens: ${formatTokenValue(session?.lastInputTokens)}`,
       `• security profile: ${formatSecurityProfileDisplay(security, lang)}`,
     ].filter(Boolean).join('\n');
@@ -308,6 +395,15 @@ export function createReportFormatters({
     const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
     const workspaceBinding = getWorkspaceBinding(session, key);
     const workspaceLock = workspaceBinding.workspaceDir ? readWorkspaceLock(workspaceBinding.workspaceDir) : { owner: null };
+    const rawConfigStatus = providerSupportsRawConfigOverrides(provider)
+      ? formatConfigCommandStatus()
+      : `${formatConfigCommandStatus()} (provider unsupported)`;
+    const sessionStoreSurface = formatProviderSessionStoreSurface(provider);
+    const resumeSurface = formatProviderResumeSurface(provider);
+    const nativeCompactSurface = formatProviderNativeCompactSurface(provider);
+    const rawConfigSurface = formatProviderRawConfigSurface(provider);
+    const reasoningSurface = formatProviderReasoningSurface(provider);
+    const nativeCompact = formatNativeCompactSetting(provider, nativeLimit);
     return [
       '🩺 **Bot Doctor**',
       `• bot mode: ${formatBotModeLabel()}`,
@@ -317,11 +413,16 @@ export function createReportFormatters({
       `• workspace serialization: ${workspaceLock.owner ? 'busy' : 'idle'}`,
       `• runtime: ${formatRuntimeLabel(runtime)}`,
       `• queued prompts: ${runtime.queued}`,
+      sessionStoreSurface ? `• runtime session store: ${sessionStoreSurface}` : null,
+      resumeSurface ? `• runtime resume surface: ${resumeSurface}` : null,
+      nativeCompactSurface ? `• runtime native compact: ${nativeCompactSurface}` : null,
+      rawConfigSurface ? `• runtime raw config: ${rawConfigSurface}` : null,
+      reasoningSurface ? `• runtime reasoning: ${reasoningSurface}` : null,
       `• security profile: ${formatSecurityProfileDisplay(security)}`,
       `• profile setting: ${formatSecurityProfileLabel(securitySetting.profile)} (${securitySetting.source})`,
       `• mention only: ${security.mentionOnly ? 'on' : 'off'}`,
       `• queue limit: ${formatQueueLimit(security.maxQueuePerChannel)}`,
-      `• !config: ${formatConfigCommandStatus()}`,
+      `• !config: ${rawConfigStatus}`,
       `• config allowlist: ${describeConfigPolicy()}`,
       `• ALLOWED_CHANNEL_IDS: ${allowedChannelIds ? `${allowedChannelIds.size} configured` : '(all channels)'}`,
       `• ALLOWED_USER_IDS: ${allowedUserIds ? `${allowedUserIds.size} configured` : '(all users)'}`,
@@ -329,32 +430,54 @@ export function createReportFormatters({
       `• compact strategy: ${describeCompactStrategy(compactSetting.strategy)} (${compactSetting.source})`,
       `• compact enabled: ${compactEnabled.enabled ? 'on' : 'off'} (${compactEnabled.source})`,
       `• compact token limit: ${compactThreshold.tokens} (${compactThreshold.source})`,
-      `• native compact limit: ${nativeLimit.tokens} (${nativeLimit.source})`,
-    ].join('\n');
+      `• ${nativeCompact.label}: ${nativeCompact.value}`,
+    ].filter(Boolean).join('\n');
   }
 
-  function formatCompactStrategyConfigHelp(language) {
+  function formatCompactStrategyConfigHelp(language, provider = 'codex') {
+    const compact = getProviderCompactCapabilities(provider);
+    const strategyExample = compact.supportsNativeStrategy ? 'native' : 'hard';
+    const commandKeys = getCompactCommandKeys(provider).join('|');
+    const examples = [
+      `\`!compact strategy ${strategyExample}\``,
+      '\`!compact token_limit 272000\`',
+      '\`!compact enabled on\`',
+    ];
+    if (compact.supportsNativeLimit) {
+      examples.splice(2, 0, '\`!compact native_limit 320000\`');
+    }
     if (language === 'en') {
       return [
-        'Usage: `!compact <status|strategy|token_limit|native_limit|enabled|reset> [value]`',
+        `Usage: \`!compact <${commandKeys}> [value]\``,
         `Slash: \`${slashRef('compact')} key:<...> value:<...>\``,
-        'Examples: `!compact strategy native`, `!compact token_limit 272000`, `!compact enabled on`',
-        'Note: compact settings only affect Codex CLI.',
+        `Examples: ${examples.join(', ')}`,
+        compact.supportsNativeLimit
+          ? 'Note: this provider supports provider-native compaction. `hard` stays bot-managed, and `native_limit` overrides the native token limit.'
+          : compact.supportsNativeStrategy
+            ? 'Note: this provider supports provider-native compaction. `hard` stays bot-managed, but `native_limit` is not exposed; native compaction uses the provider default behavior.'
+            : 'Note: this provider only supports bot-managed hard compaction.',
       ].join('\n');
     }
     return [
-      '用法：`!compact <status|strategy|token_limit|native_limit|enabled|reset> [value]`',
+      `用法：\`!compact <${commandKeys}> [value]\``,
       `Slash：\`${slashRef('compact')} key:<...> value:<...>\``,
-      '示例：`!compact strategy native`、`!compact token_limit 272000`、`!compact enabled on`',
-      '说明：compact 配置仅对 Codex CLI 生效。',
+      `示例：${examples.join('、')}`,
+      compact.supportsNativeLimit
+        ? '说明：当前 provider 支持原生 native 压缩；`hard` 仍由 bot 统一管理，`native_limit` 用来覆盖原生 token limit。'
+        : compact.supportsNativeStrategy
+          ? '说明：当前 provider 支持原生 native 压缩；`hard` 仍由 bot 统一管理，但不暴露 `native_limit`，native 压缩按 provider 默认行为运行。'
+          : '说明：当前 provider 仅支持 bot 侧的 hard 压缩。',
     ].join('\n');
   }
 
   function formatCompactConfigReport(language, session, changed = false) {
+    const provider = getSessionProvider(session);
+    const compact = getProviderCompactCapabilities(provider);
     const strategy = resolveCompactStrategySetting(session);
     const enabled = resolveCompactEnabledSetting(session);
     const threshold = resolveCompactThresholdSetting(session);
     const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
+    const nativeCompact = formatNativeCompactSetting(provider, nativeLimit, language);
 
     if (language === 'en') {
       return [
@@ -362,8 +485,12 @@ export function createReportFormatters({
         `• strategy: ${describeCompactStrategy(strategy.strategy, language)} (${formatSettingSourceLabel(strategy.source, language)})`,
         `• enabled: ${enabled.enabled ? 'on' : 'off'} (${formatSettingSourceLabel(enabled.source, language)})`,
         `• token limit: ${threshold.tokens} (${formatSettingSourceLabel(threshold.source, language)})`,
-        `• native limit: ${nativeLimit.tokens} (${formatSettingSourceLabel(nativeLimit.source, language)})`,
-        '• note: native compaction is handled inside Codex CLI; the bot does not currently emit a guaranteed per-compact notification.',
+        `• ${nativeCompact.label}: ${nativeCompact.value}`,
+        compact.supportsNativeLimit
+          ? '• note: native compaction is handled inside the provider CLI; the bot does not currently emit a guaranteed per-compact notification.'
+          : compact.supportsNativeStrategy
+            ? '• note: native compaction is still handled inside the provider CLI, but this provider keeps the provider-default native limit.'
+            : '• note: this provider only uses bot-managed hard compaction; native compaction is unavailable.',
       ].join('\n');
     }
     return [
@@ -371,15 +498,26 @@ export function createReportFormatters({
       `• strategy: ${describeCompactStrategy(strategy.strategy, language)}（${formatSettingSourceLabel(strategy.source, language)}）`,
       `• enabled: ${enabled.enabled ? 'on' : 'off'}（${formatSettingSourceLabel(enabled.source, language)}）`,
       `• token limit: ${threshold.tokens}（${formatSettingSourceLabel(threshold.source, language)}）`,
-      `• native limit: ${nativeLimit.tokens}（${formatSettingSourceLabel(nativeLimit.source, language)}）`,
-      '• 说明：native 压缩发生在 Codex CLI 内部，bot 目前拿不到稳定的“本次刚压缩完成”通知。',
+      `• ${nativeCompact.label}: ${nativeCompact.value}`,
+      compact.supportsNativeLimit
+        ? '• 说明：native 压缩发生在 provider CLI 内部，bot 目前拿不到稳定的“本次刚压缩完成”通知。'
+        : compact.supportsNativeStrategy
+          ? '• 说明：native 压缩仍发生在 provider CLI 内部，但当前 provider 使用 provider 默认 native limit。'
+          : '• 说明：当前 provider 只使用 bot 侧的 hard 压缩，不支持 native 压缩。',
     ].join('\n');
   }
 
-  function formatReasoningEffortHelp(language) {
+  function formatReasoningEffortHelp(language, provider = 'codex') {
+    const levels = getReasoningEffortLevels(provider);
+    if (!levels.length) {
+      return language === 'en'
+        ? `Current provider ${getProviderDisplayName(provider)} does not expose reasoning effort. Use the provider default behavior.`
+        : `当前 provider ${getProviderDisplayName(provider)} 没有暴露 reasoning effort，请使用 provider 默认行为。`;
+    }
+    const usage = [...levels, 'default'].join('|');
     return language === 'en'
-      ? 'Usage: `!effort <xhigh|high|medium|low|default>`'
-      : '用法：`!effort <xhigh|high|medium|low|default>`';
+      ? `Usage: \`!effort <${usage}>\``
+      : `用法：\`!effort <${usage}>\``;
   }
 
   function formatLanguageConfigHelp(language) {
@@ -462,6 +600,11 @@ export function createReportFormatters({
 
   function formatHelpReport(session) {
     const language = getSessionLanguage(session);
+    const provider = getSessionProvider(session);
+    const compact = getProviderCompactCapabilities(provider);
+    const reasoningLevels = getReasoningEffortLevels(provider);
+    const resumeAlias = getProviderCommandAlias(provider, 'resume');
+    const sessionsAlias = getProviderCommandAlias(provider, 'sessions');
     if (language === 'en') {
       return [
         '**📋 Commands**',
@@ -485,7 +628,9 @@ export function createReportFormatters({
         `• \`${slashRef('new')}\` / \`!new\` — switch to a fresh session but keep channel settings`,
         `• \`${slashRef('reset')}\` / \`!reset\` — clear session context and extra config overrides`,
         '• `!resume <session_id>` — bind existing provider session',
-        '• `!sessions` — list recent provider sessions',
+        resumeAlias ? `• current provider alias: \`!${resumeAlias} <session_id>\`` : null,
+        '• `!sessions` — list recent provider sessions from the native runtime store',
+        sessionsAlias ? `• current provider alias: \`!${sessionsAlias}\`` : null,
         !botProvider ? '• `!provider <codex|claude|gemini|status>` — switch provider for current channel' : null,
         '',
         '**Workspace**',
@@ -496,10 +641,18 @@ export function createReportFormatters({
         '',
         '**Model & Runtime**',
         '• `!model <name|default>` — set model override',
-        '• `!effort <xhigh|high|medium|low|default>` — reasoning effort',
-        `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — compact config (Codex only)`,
+        reasoningLevels.length
+          ? `• \`!effort <${[...reasoningLevels, 'default'].join('|')}>\` — reasoning effort`
+          : `• reasoning effort — not exposed by current provider (${getProviderDisplayName(provider)})`,
+        compact.supportsNativeLimit
+          ? `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — context compaction config (native + native_limit available on current provider)`
+          : compact.supportsNativeStrategy
+            ? `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — context compaction config (native available; current provider keeps the provider-default native limit)`
+            : `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — context compaction config (hard only on current provider)`,
         '• `!mode <safe|dangerous>` — execution mode',
-        '• `!config <key=value>` — append provider config override (Codex only; when enabled + allowlisted)',
+        providerSupportsRawConfigOverrides(provider)
+          ? '• `!config <key=value>` — append raw provider config override'
+          : `• raw config passthrough — not exposed by current provider CLI (${getProviderDisplayName(provider)})`,
         '',
         'Normal messages are forwarded to the current provider.',
       ].filter(Boolean).join('\n');
@@ -526,7 +679,9 @@ export function createReportFormatters({
       `• \`${slashRef('new')}\` / \`!new\` — 切到新会话，但保留当前频道配置`,
       `• \`${slashRef('reset')}\` / \`!reset\` — 清空会话与额外配置，下条消息新开上下文`,
       '• `!resume <session_id>` — 继承一个已有的 provider session',
-      '• `!sessions` — 列出最近的 provider sessions',
+      resumeAlias ? `• 当前 provider 别名：\`!${resumeAlias} <session_id>\`` : null,
+      '• `!sessions` — 从 provider 原生运行时存储里列出最近的 sessions',
+      sessionsAlias ? `• 当前 provider 别名：\`!${sessionsAlias}\`` : null,
       !botProvider ? '• `!provider <codex|claude|gemini|status>` — 切换当前频道 provider' : null,
       '',
       '**工作目录**',
@@ -537,10 +692,18 @@ export function createReportFormatters({
       '',
       '**模型 & 执行**',
       '• `!model <name|default>` — 切换模型（如 gpt-5.3-codex, o3）',
-      '• `!effort <xhigh|high|medium|low|default>` — reasoning effort',
-      `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — compact 配置（仅 Codex）`,
+      reasoningLevels.length
+        ? `• \`!effort <${[...reasoningLevels, 'default'].join('|')}>\` — reasoning effort`
+        : `• reasoning effort — 当前 provider (${getProviderDisplayName(provider)}) 未暴露`,
+      compact.supportsNativeLimit
+        ? `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — 上下文压缩配置（当前 provider 支持 native 与 native_limit）`
+        : compact.supportsNativeStrategy
+          ? `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — 上下文压缩配置（当前 provider 支持 native，但 native_limit 走 provider 默认行为）`
+          : `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — 上下文压缩配置（当前 provider 仅支持 hard）`,
       '• `!mode <safe|dangerous>` — 执行模式',
-      '• `!config <key=value>` — 添加 provider 配置覆盖（当前仅 Codex 支持；需 ENABLE_CONFIG_CMD=true 且 key 在白名单）',
+      providerSupportsRawConfigOverrides(provider)
+        ? '• `!config <key=value>` — 添加 provider 原生配置透传'
+        : `• raw config passthrough — 当前 provider CLI (${getProviderDisplayName(provider)}) 未暴露`,
       '',
       '普通消息直接转给当前 provider。',
     ].filter(Boolean).join('\n');
@@ -549,17 +712,18 @@ export function createReportFormatters({
   function formatWorkspaceReport(key, session) {
     const language = normalizeUiLanguage(getSessionLanguage(session));
     const lines = getWorkspaceStatusLines(key, session, language);
+    const provider = getSessionProvider(session);
     if (language === 'en') {
       return [
         '📁 **Workspace**',
         ...lines,
-        '• session rule: Codex and Gemini clear session on workspace change; Claude keeps session when possible.',
+        `• session rule: ${formatWorkspaceSessionPolicy(provider, language)}`,
       ].join('\n');
     }
     return [
       '📁 **工作目录**',
       ...lines,
-      '• session 规则：Codex / Gemini 在 workspace 变化时会清空 session；Claude 尽量保留当前 session。',
+      `• session 规则：${formatWorkspaceSessionPolicy(provider, language)}`,
     ].join('\n');
   }
 
@@ -596,13 +760,12 @@ export function createReportFormatters({
   function formatWorkspaceUpdateReport(key, session, result) {
     const language = normalizeUiLanguage(getSessionLanguage(session));
     const lines = getWorkspaceStatusLines(key, session, language);
-    const providerShortName = getProviderShortName(getSessionProvider(session));
     if (language === 'en') {
       return [
         result.clearedOverride ? '✅ Cleared thread workspace override' : '✅ Workspace updated',
         ...lines,
         result.sessionReset
-          ? `• session: reset because ${providerShortName} cannot resume into a different workspace`
+          ? `• session: ${formatWorkspaceSessionResetReason(getSessionProvider(session), language)}`
           : '• session: kept',
       ].join('\n');
     }
@@ -610,7 +773,7 @@ export function createReportFormatters({
       result.clearedOverride ? '✅ 已清除当前 thread 的 workspace 覆盖' : '✅ workspace 已更新',
       ...lines,
       result.sessionReset
-        ? `• session: 已重置（${providerShortName} 不能在不同 workspace 中继续同一个 session）`
+        ? `• session: ${formatWorkspaceSessionResetReason(getSessionProvider(session), language)}`
         : '• session: 已保留',
     ].join('\n');
   }

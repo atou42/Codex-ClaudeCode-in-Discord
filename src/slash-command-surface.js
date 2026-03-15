@@ -23,7 +23,7 @@ export function slashRef(base, slashPrefix = '') {
 function buildSlashCommandBuilder(entry, commandName, { SlashCommandBuilder, slashPrefix }) {
   const builder = new SlashCommandBuilder()
     .setName(slashName(commandName, slashPrefix))
-    .setDescription(entry.description);
+    .setDescription(entry.aliasDescriptions?.[commandName] || entry.description);
   return entry.configure ? entry.configure(builder) : builder;
 }
 

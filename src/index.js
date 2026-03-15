@@ -9,17 +9,38 @@ import {
   getDefaultSlashPrefix,
   parseOptionalProvider,
   resolveDiscordToken,
+  resolveProviderScopedEnv,
 } from './bot-instance-utils.js';
 import {
+  formatCompactConfigUnsupported,
   formatReasoningEffortUnsupported,
+  formatWorkspaceSessionPolicy,
+  formatWorkspaceSessionResetReason,
   getProviderBinEnvName,
+  getProviderCompactCapabilities,
   getProviderDefaultBin,
   getProviderDisplayName,
   getProviderShortName,
+  getSupportedReasoningEffortLevels,
+  getSupportedCompactStrategies,
   isReasoningEffortSupported,
   normalizeProvider,
   parseProviderInput,
+  providerSupportsCompactConfigAction,
+  providerSupportsRawConfigOverrides,
 } from './provider-metadata.js';
+import {
+  formatProviderNativeCompactSurface,
+  formatProviderRawConfigSurface,
+  formatProviderReasoningSurface,
+  formatProviderResumeSurface,
+  formatProviderSessionTerm,
+  formatProviderRuntimeSummary,
+  formatProviderSessionLabel,
+  formatProviderSessionStoreSurface,
+  formatRecentSessionsLookup,
+  formatRecentSessionsTitle,
+} from './provider-runtime-surface.js';
 import {
   buildSpawnEnv,
   formatCliHealth,
@@ -161,8 +182,8 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-const ALLOWED_CHANNEL_IDS = parseCsvSet(process.env.ALLOWED_CHANNEL_IDS);
-const ALLOWED_USER_IDS = parseCsvSet(process.env.ALLOWED_USER_IDS);
+const ALLOWED_CHANNEL_IDS = parseCsvSet(resolveProviderScopedEnv('ALLOWED_CHANNEL_IDS', BOT_PROVIDER, process.env));
+const ALLOWED_USER_IDS = parseCsvSet(resolveProviderScopedEnv('ALLOWED_USER_IDS', BOT_PROVIDER, process.env));
 const SECURITY_PROFILE = normalizeSecurityProfile(process.env.SECURITY_PROFILE || 'auto');
 const SECURITY_PROFILE_DEFAULTS = Object.freeze({
   solo: { mentionOnly: false, maxQueuePerChannel: 0 },
@@ -240,7 +261,7 @@ const MAX_INPUT_TOKENS_BEFORE_COMPACT = toInt(
   process.env.MAX_INPUT_TOKENS_BEFORE_COMPACT,
   Number.isFinite(LEGACY_MAX_INPUT_TOKENS_BEFORE_RESET) ? LEGACY_MAX_INPUT_TOKENS_BEFORE_RESET : 250000,
 );
-const COMPACT_STRATEGY = normalizeCompactStrategy(process.env.COMPACT_STRATEGY || 'hard');
+const COMPACT_STRATEGY = normalizeCompactStrategy(process.env.COMPACT_STRATEGY || 'native');
 const COMPACT_ON_THRESHOLD = String(process.env.COMPACT_ON_THRESHOLD || 'true').toLowerCase() !== 'false';
 const MODEL_AUTO_COMPACT_TOKEN_LIMIT = toInt(
   process.env.MODEL_AUTO_COMPACT_TOKEN_LIMIT,
@@ -300,6 +321,7 @@ const appContext = createAppContext({
     modelAutoCompactTokenLimit: MODEL_AUTO_COMPACT_TOKEN_LIMIT,
     readCodexDefaults,
     normalizeProvider,
+    getSupportedCompactStrategies,
   },
   securityPolicyOptions: {
     securityProfile: SECURITY_PROFILE,
@@ -330,6 +352,11 @@ const appContext = createAppContext({
     resolveDefaultWorkspace: resolveProviderDefaultWorkspace,
   },
   commandActionsOptions: {
+    normalizeProvider,
+    normalizeUiLanguage,
+    formatProviderSessionLabel,
+    formatRecentSessionsTitle,
+    formatRecentSessionsLookup,
     resolveProviderDefaultWorkspace,
     setProviderDefaultWorkspace,
     getProviderShortName,
@@ -400,6 +427,7 @@ const appContext = createAppContext({
       normalizeUiLanguage,
       getProviderDisplayName,
       getProviderShortName,
+      formatProviderSessionTerm,
       getProviderDefaultBin,
       getProviderBinEnvName,
       stopChildProcess,
@@ -466,11 +494,23 @@ const appContext = createAppContext({
       normalizeUiLanguage,
       getProviderDisplayName,
       getProviderShortName,
+      getProviderCompactCapabilities,
+      providerSupportsRawConfigOverrides,
+      formatProviderSessionTerm,
+      formatProviderRuntimeSummary,
+      formatProviderSessionStoreSurface,
+      formatProviderResumeSurface,
+      formatProviderNativeCompactSurface,
+      formatProviderRawConfigSurface,
+      formatProviderReasoningSurface,
+      getSupportedReasoningEffortLevels,
       getCliHealth,
       formatCliHealth,
       formatLanguageLabel,
       formatSecurityProfileLabel,
       describeCompactStrategy,
+      formatWorkspaceSessionPolicy,
+      formatWorkspaceSessionResetReason,
       humanAge,
       formatTokenValue,
     },
@@ -487,7 +527,10 @@ const appContext = createAppContext({
       ButtonBuilder,
       ButtonStyle,
       getProviderDisplayName,
+      formatProviderSessionLabel,
       isReasoningEffortSupported,
+      providerSupportsCompactConfigAction,
+      formatCompactConfigUnsupported,
       formatReasoningEffortUnsupported,
       normalizeProvider,
       parseWorkspaceCommandAction,
@@ -502,6 +545,11 @@ const appContext = createAppContext({
       getProviderDisplayName,
       getProviderShortName,
       safeReply,
+      formatProviderSessionLabel,
+      providerSupportsRawConfigOverrides,
+      formatProviderRawConfigSurface,
+      providerSupportsCompactConfigAction,
+      formatCompactConfigUnsupported,
       formatReasoningEffortUnsupported,
       parseProviderInput,
       parseUiLanguageInput,
@@ -558,6 +606,8 @@ console.log([
   '🔐 Security defaults:',
   `• BOT_MODE=${BOT_MODE}`,
   `• DEFAULT_PROVIDER=${DEFAULT_PROVIDER}`,
+  `• DEFAULT_MODE=${DEFAULT_MODE}`,
+  `• SLASH_PREFIX=${SLASH_PREFIX || '(none)'}`,
   `• SECURITY_PROFILE=${SECURITY_PROFILE}`,
   `• MENTION_ONLY=${MENTION_ONLY_OVERRIDE === null ? 'profile-default' : MENTION_ONLY_OVERRIDE}`,
   `• MAX_QUEUE_PER_CHANNEL=${MAX_QUEUE_PER_CHANNEL_OVERRIDE === null ? 'profile-default' : MAX_QUEUE_PER_CHANNEL_OVERRIDE}`,

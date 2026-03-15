@@ -64,6 +64,11 @@ function createOrchestrator(overrides = {}) {
     normalizeUiLanguage: (value) => (String(value || '').trim().toLowerCase() === 'en' ? 'en' : 'zh'),
     getProviderDisplayName: (provider) => provider === 'codex' ? 'Codex CLI' : provider,
     getProviderShortName: (provider) => provider === 'codex' ? 'Codex' : provider,
+    formatProviderSessionTerm: (provider) => {
+      if (provider === 'claude') return 'project session';
+      if (provider === 'gemini') return 'chat session';
+      return 'rollout session';
+    },
     getProviderDefaultBin: () => 'codex',
     getProviderBinEnvName: () => 'CODEX_BIN',
     resolveTimeoutSetting: () => ({ timeoutMs: 60_000, source: 'session override' }),
@@ -161,7 +166,7 @@ test('createPromptOrchestrator.handlePrompt runs task updates session and replie
   assert.equal(harness.saveCount > 0, true);
   assert.equal(replyLog.length, 1);
   assert.match(replyLog[0], /final answer/);
-  assert.match(replyLog[0], /• session: \*\*demo\*\* \(`sess-2`\)/);
+  assert.match(replyLog[0], /• rollout session: \*\*demo\*\* \(`sess-2`\)/);
   assert.deepEqual(progressCalls[0], {
     type: 'start',
     initialLatestStep: '等待 workspace 锁：/repo/demo',

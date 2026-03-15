@@ -22,6 +22,7 @@ export function createPromptOrchestrator({
   normalizeUiLanguage,
   getProviderDisplayName,
   getProviderShortName,
+  formatProviderSessionTerm = () => 'session',
   getProviderDefaultBin,
   getProviderBinEnvName,
   resolveTimeoutSetting,
@@ -57,6 +58,7 @@ export function createPromptOrchestrator({
     truncate,
     composeFinalAnswerText,
     getProviderShortName,
+    formatProviderSessionTerm,
     getSessionProvider,
     getSessionId,
   });
@@ -282,6 +284,7 @@ export function createPromptOrchestrator({
       const preNotes = [];
       if (shouldCompactSession(session)) {
         const previousThreadId = getSessionId(session);
+        const sessionTerm = formatProviderSessionTerm(getSessionProvider(session), language);
         const compacted = await compactSessionContext({
           session,
           workspaceDir,
@@ -298,11 +301,11 @@ export function createPromptOrchestrator({
           clearSessionId(session);
           saveDb();
           promptToRun = buildPromptFromCompactedContext(compacted.summary, prompt);
-          preNotes.push(`上下文输入 token=${session.lastInputTokens}，已自动压缩并切换新会话（旧 session: ${previousThreadId}）。`);
+          preNotes.push(`上下文输入 token=${session.lastInputTokens}，已自动压缩并切换新会话（旧 ${sessionTerm}: ${previousThreadId}）。`);
         } else {
           clearSessionId(session);
           saveDb();
-          preNotes.push(`上下文输入 token=${session.lastInputTokens}，自动压缩失败，已回退 reset（旧 session: ${previousThreadId}）。`);
+          preNotes.push(`上下文输入 token=${session.lastInputTokens}，自动压缩失败，已回退 reset（旧 ${sessionTerm}: ${previousThreadId}）。`);
           if (compacted.error) preNotes.push(`压缩失败原因：${compacted.error}`);
         }
       }

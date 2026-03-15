@@ -1,4 +1,44 @@
+import {
+  getProviderCompactCapabilities,
+  getSupportedReasoningEffortLevels,
+  normalizeProvider,
+} from './provider-metadata.js';
+
 const ACTION_BUTTON_COMMAND_NAMES = Object.freeze(['status', 'sessions', 'queue', 'progress', 'new', 'cancel', 'retry']);
+
+const PROVIDER_NATIVE_SESSION_COMMANDS = Object.freeze({
+  codex: Object.freeze({
+    resume: 'rollout_resume',
+    sessions: 'rollout_sessions',
+    sessionTerm: Object.freeze({
+      singular: 'rollout session',
+      plural: 'rollout sessions',
+    }),
+  }),
+  claude: Object.freeze({
+    resume: 'project_resume',
+    sessions: 'project_sessions',
+    sessionTerm: Object.freeze({
+      singular: 'project session',
+      plural: 'project sessions',
+    }),
+  }),
+  gemini: Object.freeze({
+    resume: 'chat_resume',
+    sessions: 'chat_sessions',
+    sessionTerm: Object.freeze({
+      singular: 'chat session',
+      plural: 'chat sessions',
+    }),
+  }),
+});
+
+const ALL_SESSION_COMMAND_ALIASES = Object.freeze({
+  sessions: Object.freeze(['rollout_sessions', 'project_sessions', 'chat_sessions']),
+  resume: Object.freeze(['rollout_resume', 'project_resume', 'chat_resume']),
+});
+
+const REASONING_LEVEL_DISPLAY_ORDER = Object.freeze(['xhigh', 'high', 'medium', 'low']);
 
 const COMMAND_ALIASES = Object.freeze({
   abort: 'cancel',
@@ -11,6 +51,12 @@ const COMMAND_ALIASES = Object.freeze({
   lang: 'language',
   cd: 'setdir',
   defaultdir: 'setdefaultdir',
+  rollout_sessions: 'sessions',
+  project_sessions: 'sessions',
+  chat_sessions: 'sessions',
+  rollout_resume: 'resume',
+  project_resume: 'resume',
+  chat_resume: 'resume',
 });
 
 export function normalizeCommandName(value, { allowBangPrefix = false } = {}) {
@@ -24,7 +70,81 @@ export function getActionButtonCommandNames() {
   return [...ACTION_BUTTON_COMMAND_NAMES];
 }
 
+export function getProviderCommandAlias(provider, commandName) {
+  const normalizedProvider = normalizeProvider(provider);
+  const surface = PROVIDER_NATIVE_SESSION_COMMANDS[normalizedProvider];
+  return surface?.[commandName] || '';
+}
+
+function getProviderSessionTerm(provider, { plural = false } = {}) {
+  const normalizedProvider = normalizeProvider(provider);
+  const surface = PROVIDER_NATIVE_SESSION_COMMANDS[normalizedProvider];
+  if (!surface?.sessionTerm) return plural ? 'provider sessions' : 'provider session';
+  return plural ? surface.sessionTerm.plural : surface.sessionTerm.singular;
+}
+
+function getSessionCommandAliases(commandName, botProvider = null) {
+  if (!botProvider) return [...(ALL_SESSION_COMMAND_ALIASES[commandName] || [])];
+  const alias = getProviderCommandAlias(botProvider, commandName);
+  return alias ? [alias] : [];
+}
+
+function getSessionAliasDescriptions(aliases = []) {
+  return Object.freeze(Object.fromEntries(aliases.map((alias) => {
+    if (alias === 'rollout_sessions') return [alias, '列出最近的 rollout sessions（同 sessions）'];
+    if (alias === 'project_sessions') return [alias, '列出最近的 project sessions（同 sessions）'];
+    if (alias === 'chat_sessions') return [alias, '列出最近的 chat sessions（同 sessions）'];
+    if (alias === 'rollout_resume') return [alias, '继承一个已有的 rollout session（同 resume）'];
+    if (alias === 'project_resume') return [alias, '继承一个已有的 project session（同 resume）'];
+    if (alias === 'chat_resume') return [alias, '继承一个已有的 chat session（同 resume）'];
+    return [alias, alias];
+  })));
+}
+
+function getCompactKeyChoices(botProvider = null) {
+  const choices = [
+    { name: 'status', value: 'status' },
+    { name: 'strategy', value: 'strategy' },
+    { name: 'token_limit', value: 'token_limit' },
+  ];
+  if (!botProvider || getProviderCompactCapabilities(botProvider).supportsNativeLimit) {
+    choices.push({ name: 'native_limit', value: 'native_limit' });
+  }
+  choices.push(
+    { name: 'enabled', value: 'enabled' },
+    { name: 'reset', value: 'reset' },
+  );
+  return choices;
+}
+
+function getEffortChoices(botProvider = null) {
+  if (!botProvider) {
+    return [
+      { name: 'xhigh', value: 'xhigh' },
+      { name: 'high', value: 'high' },
+      { name: 'medium', value: 'medium' },
+      { name: 'low', value: 'low' },
+      { name: 'default', value: 'default' },
+    ];
+  }
+  const supported = new Set(getSupportedReasoningEffortLevels(botProvider));
+  const levels = REASONING_LEVEL_DISPLAY_ORDER.filter((level) => supported.has(level));
+  if (!levels.length) return [];
+  return [
+    ...levels.map((level) => ({ name: level, value: level })),
+    { name: 'default', value: 'default' },
+  ];
+}
+
 export function buildSlashCommandEntries({ botProvider = null } = {}) {
+  const lockedProvider = botProvider ? normalizeProvider(botProvider) : null;
+  const sessionAliases = getSessionCommandAliases('sessions', lockedProvider);
+  const resumeAliases = getSessionCommandAliases('resume', lockedProvider);
+  const effortChoices = getEffortChoices(lockedProvider);
+  const compactKeyChoices = getCompactKeyChoices(lockedProvider);
+  const sessionPlural = lockedProvider ? getProviderSessionTerm(lockedProvider, { plural: true }) : 'provider sessions';
+  const sessionSingular = lockedProvider ? getProviderSessionTerm(lockedProvider) : 'session';
+
   return [
     {
       name: 'status',
@@ -40,7 +160,9 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
     },
     {
       name: 'sessions',
-      description: '列出最近的 provider sessions',
+      aliases: sessionAliases,
+      description: lockedProvider ? `列出最近的 ${sessionPlural}` : '列出最近的 provider sessions',
+      aliasDescriptions: getSessionAliasDescriptions(sessionAliases),
     },
     {
       name: 'setdir',
@@ -76,34 +198,23 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
         return builder.addStringOption(o => o.setName('name').setDescription('模型名（如 o3, gpt-5.3-codex）或 default').setRequired(true));
       },
     },
-    {
+    effortChoices.length && {
       name: 'effort',
       description: '设置 reasoning effort',
       configure(builder) {
         return builder.addStringOption(o => o.setName('level').setDescription('推理力度').setRequired(true)
-          .addChoices(
-            { name: 'xhigh', value: 'xhigh' },
-            { name: 'high', value: 'high' },
-            { name: 'medium', value: 'medium' },
-            { name: 'low', value: 'low' },
-            { name: 'default', value: 'default' },
-          ));
+          .addChoices(...effortChoices));
       },
     },
     {
       name: 'compact',
-      description: '配置 Codex compact（strategy/limit/enabled/status）',
+      description: lockedProvider && !getProviderCompactCapabilities(lockedProvider).supportsNativeLimit
+        ? '配置上下文压缩（hard/native/off、token_limit、enabled、status）'
+        : '配置上下文压缩（hard/native/off、limit、enabled、status）',
       configure(builder) {
         return builder
           .addStringOption(o => o.setName('key').setDescription('配置项').setRequired(true)
-            .addChoices(
-              { name: 'status', value: 'status' },
-              { name: 'strategy', value: 'strategy' },
-              { name: 'token_limit', value: 'token_limit' },
-              { name: 'native_limit', value: 'native_limit' },
-              { name: 'enabled', value: 'enabled' },
-              { name: 'reset', value: 'reset' },
-            ))
+            .addChoices(...compactKeyChoices))
           .addStringOption(o => o.setName('value').setDescription('值：如 native / 272000 / on / default').setRequired(false));
       },
     },
@@ -120,16 +231,20 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
     },
     {
       name: 'name',
-      description: '给当前 session 起个名字，方便识别',
+      description: lockedProvider ? `给当前 ${sessionSingular} 起个名字，方便识别` : '给当前 session 起个名字，方便识别',
       configure(builder) {
         return builder.addStringOption(o => o.setName('label').setDescription('名字，如「cc-hub诊断」「埋点重构」').setRequired(true));
       },
     },
     {
       name: 'resume',
-      description: '继承一个已有的 session',
+      aliases: resumeAliases,
+      description: lockedProvider ? `继承一个已有的 ${sessionSingular}` : '继承一个已有的 session',
+      aliasDescriptions: getSessionAliasDescriptions(resumeAliases),
       configure(builder) {
-        return builder.addStringOption(o => o.setName('session_id').setDescription('provider session UUID').setRequired(true));
+        return builder.addStringOption(o => o.setName('session_id').setDescription(
+          lockedProvider ? `${sessionSingular} UUID` : 'provider session UUID',
+        ).setRequired(true));
       },
     },
     {

@@ -10,6 +10,7 @@ export function createPromptResultRenderer({
   truncate = (text) => String(text || ''),
   composeFinalAnswerText = () => '',
   getProviderShortName = (provider) => provider,
+  formatProviderSessionTerm = () => 'session',
   getSessionProvider = () => 'codex',
   getSessionId = () => null,
 } = {}) {
@@ -41,7 +42,7 @@ export function createPromptResultRenderer({
     if (currentSessionId || result?.threadId) {
       const id = result.threadId || currentSessionId;
       const label = session.name ? `**${session.name}** (\`${id}\`)` : `\`${id}\``;
-      tail.push(`• session: ${label}`);
+      tail.push(`• ${formatProviderSessionTerm(getSessionProvider(session), 'zh')}: ${label}`);
     }
 
     if (tail.length) {

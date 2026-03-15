@@ -84,6 +84,8 @@ test('buildSlashCommands includes workspace commands and aliases', () => {
   assert.ok(names.includes('cx_setdefaultdir'));
   assert.ok(names.includes('cx_new'));
   assert.ok(names.includes('cx_abort'));
+  assert.ok(names.includes('cx_project_sessions'));
+  assert.ok(names.includes('cx_chat_resume'));
   assert.ok(names.includes('cx_onboarding_config'));
   assert.ok(!names.includes('cx_retry'));
   assert.ok(!names.includes('cx_process_lines'));
@@ -114,4 +116,47 @@ test('buildSlashCommands exposes gemini as provider choice', () => {
   const choices = provider.options[0].choices.map((choice) => choice.value);
 
   assert.deepEqual(choices, ['codex', 'claude', 'gemini', 'status']);
+});
+
+test('buildSlashCommands gives provider-native alias descriptions to session aliases', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'cx',
+    botProvider: null,
+  }).map((command) => command.toJSON());
+
+  const projectSessions = commands.find((command) => command.name === 'cx_project_sessions');
+  const chatResume = commands.find((command) => command.name === 'cx_chat_resume');
+
+  assert.match(projectSessions.description, /project sessions/);
+  assert.match(chatResume.description, /chat session/);
+});
+
+test('buildSlashCommands narrows locked-provider surfaces to native aliases and supported knobs', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'gm',
+    botProvider: 'gemini',
+  }).map((command) => command.toJSON());
+
+  const names = commands.map((command) => command.name);
+  const compact = commands.find((command) => command.name === 'gm_compact');
+  const sessions = commands.find((command) => command.name === 'gm_sessions');
+  const resume = commands.find((command) => command.name === 'gm_resume');
+
+  assert.ok(!names.includes('gm_provider'));
+  assert.ok(!names.includes('gm_effort'));
+  assert.ok(names.includes('gm_chat_sessions'));
+  assert.ok(!names.includes('gm_project_sessions'));
+  assert.ok(names.includes('gm_chat_resume'));
+  assert.ok(!names.includes('gm_rollout_resume'));
+  assert.equal(sessions.description, '列出最近的 chat sessions');
+  assert.equal(resume.description, '继承一个已有的 chat session');
+  assert.deepEqual(compact.options[0].choices.map((choice) => choice.value), [
+    'status',
+    'strategy',
+    'token_limit',
+    'enabled',
+    'reset',
+  ]);
 });

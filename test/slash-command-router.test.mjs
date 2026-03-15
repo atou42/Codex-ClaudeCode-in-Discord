@@ -20,7 +20,7 @@ function createInteraction(commandName) {
   };
 }
 
-function createRouterState() {
+function createRouterState(overrides = {}) {
   const session = { provider: 'codex', language: 'zh' };
   const replies = [];
   let resetCalls = 0;
@@ -83,6 +83,7 @@ function createRouterState() {
     formatCancelReport: (outcome) => JSON.stringify(outcome),
     formatCompactStrategyConfigHelp: () => '',
     formatCompactConfigReport: () => '',
+    formatCompactConfigUnsupported: () => '',
     formatReasoningEffortUnsupported: () => '',
     normalizeProvider: (value) => value,
     parseWorkspaceCommandAction: (value) => String(value || '').trim().toLowerCase() === 'browse'
@@ -92,6 +93,7 @@ function createRouterState() {
     parseSecurityProfileInput: () => 'team',
     parseTimeoutConfigAction: () => ({ type: 'status' }),
     parseCompactConfigAction: () => ({ type: 'status' }),
+    providerSupportsCompactConfigAction: () => true,
     cancelChannelWork: (key, reason) => {
       const outcome = { key, reason };
       cancelCalls.push(outcome);
@@ -108,6 +110,7 @@ function createRouterState() {
     },
     resolvePath: (value) => value,
     safeError: (err) => String(err?.message || err),
+    ...overrides,
   });
 
   return {
@@ -217,11 +220,15 @@ test('createSlashCommandRouter routes retry command through retry handler', asyn
   }]);
 });
 
-test('createSlashCommandRouter rejects compact for non-codex providers', async () => {
-  const state = createRouterState();
+test('createSlashCommandRouter rejects only unsupported compact actions for non-native providers', async () => {
+  const state = createRouterState({
+    parseCompactConfigAction: () => ({ type: 'set_strategy', strategy: 'native' }),
+    providerSupportsCompactConfigAction: () => false,
+    formatCompactConfigUnsupported: () => '⚠️ 当前 provider Gemini CLI 不支持 `native` 压缩。',
+  });
   state.session.provider = 'gemini';
   const interaction = createInteraction('cx_compact');
-  interaction.options.getString = (name) => (name === 'key' ? 'status' : null);
+  interaction.options.getString = (name) => (name === 'key' ? 'strategy' : 'native');
 
   const handled = await state.router({
     interaction,
@@ -233,7 +240,7 @@ test('createSlashCommandRouter rejects compact for non-codex providers', async (
 
   assert.equal(handled, true);
   assert.deepEqual(state.replies, [{
-    content: '⚠️ 当前 provider = `gemini` (gemini)，`/cx_compact` 仅支持 Codex CLI。',
+    content: '⚠️ 当前 provider Gemini CLI 不支持 `native` 压缩。',
     flags: 64,
   }]);
 });

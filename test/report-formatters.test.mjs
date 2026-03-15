@@ -25,6 +25,28 @@ function createFormatters(overrides = {}) {
       if (provider === 'claude') return 'Claude';
       return 'Codex';
     },
+    getProviderCompactCapabilities: (provider) => ({
+      strategies: ['hard', 'native', 'off'],
+      supportsNativeStrategy: true,
+      supportsNativeLimit: provider === 'codex',
+    }),
+    providerSupportsRawConfigOverrides: (provider) => provider === 'codex',
+    formatProviderSessionTerm: (provider) => {
+      if (provider === 'claude') return 'project session';
+      if (provider === 'gemini') return 'chat session';
+      return 'rollout session';
+    },
+    formatProviderRuntimeSummary: (provider) => `runtime:${provider}`,
+    formatProviderSessionStoreSurface: (provider) => `store:${provider}`,
+    formatProviderResumeSurface: (provider) => `resume:${provider}`,
+    formatProviderNativeCompactSurface: (provider) => `compact:${provider}`,
+    formatProviderRawConfigSurface: (provider) => `config:${provider}`,
+    formatProviderReasoningSurface: (provider) => `reasoning:${provider}`,
+    getSupportedReasoningEffortLevels: (provider) => {
+      if (provider === 'gemini') return [];
+      if (provider === 'claude') return ['low', 'medium', 'high'];
+      return ['low', 'medium', 'high', 'xhigh'];
+    },
     getProviderDefaults: () => ({ model: 'gpt-5-codex', effort: 'high', source: 'config.toml' }),
     getCliHealth: (provider) => ({ ok: true, version: '1.2.3', bin: `/usr/local/bin/${provider}` }),
     getRuntimeSnapshot: () => ({
@@ -71,6 +93,16 @@ function createFormatters(overrides = {}) {
     describeCompactStrategy: (strategy, language = 'en') => (
       language === 'en' ? `strategy:${strategy}` : `策略:${strategy}`
     ),
+    formatWorkspaceSessionPolicy: (provider, language = 'en') => (
+      language === 'en'
+        ? `${provider} sessions are treated as workspace-scoped`
+        : `${provider} session 按 workspace 绑定处理`
+    ),
+    formatWorkspaceSessionResetReason: (provider, language = 'en') => (
+      language === 'en'
+        ? `reset because ${provider} sessions are treated as workspace-scoped`
+        : `已重置（${provider} session 按 workspace 绑定处理）`
+    ),
     humanAge: (ms) => `${Math.round(ms / 1000)}s`,
     formatTokenValue: (value) => (value === null || value === undefined ? '-' : String(value)),
     formatConfigCommandStatus: () => 'enabled',
@@ -104,6 +136,8 @@ test('createReportFormatters.formatStatusReport uses provider defaults for model
   assert.match(report, /model: gpt-5-codex _\(config\.toml\)_/);
   assert.match(report, /effort: high _\(config\.toml\)_/);
   assert.match(report, /workspace: `\/repo\/thread-1` \(provider default\)/);
+  assert.match(report, /runtime profile: runtime:codex/);
+  assert.match(report, /rollout session: \*\*alpha\*\* \(`sess-1`\)/);
   assert.doesNotMatch(report, /\(unknown\)/);
 });
 
@@ -127,6 +161,11 @@ test('createReportFormatters.formatDoctorReport includes allowlist and workspace
 
   assert.match(report, /bot mode: locked to `gemini` \(Gemini CLI\)/);
   assert.match(report, /workspace serialization: busy/);
+  assert.match(report, /runtime session store: store:gemini/);
+  assert.match(report, /runtime resume surface: resume:gemini/);
+  assert.match(report, /runtime native compact: compact:gemini/);
+  assert.match(report, /runtime raw config: config:gemini/);
+  assert.match(report, /runtime reasoning: reasoning:gemini/);
   assert.match(report, /ALLOWED_CHANNEL_IDS: 2 configured/);
   assert.match(report, /ALLOWED_USER_IDS: 1 configured/);
 });
@@ -134,6 +173,7 @@ test('createReportFormatters.formatDoctorReport includes allowlist and workspace
 test('createReportFormatters.formatHelpReport documents browse actions and provider switching', () => {
   const sharedFormatters = createFormatters();
   const lockedFormatters = createFormatters({ botProvider: 'codex' });
+  const geminiHelp = sharedFormatters.formatHelpReport({ language: 'en', provider: 'gemini' });
 
   const sharedHelp = sharedFormatters.formatHelpReport({ language: 'en' });
   const lockedHelp = lockedFormatters.formatHelpReport({ language: 'en' });
@@ -141,6 +181,14 @@ test('createReportFormatters.formatHelpReport documents browse actions and provi
   assert.match(sharedHelp, /!provider <codex\|claude\|gemini\|status>/);
   assert.match(sharedHelp, /!setdir <path\|browse\|default\|status>/);
   assert.match(sharedHelp, /!setdefaultdir <path\|browse\|clear\|status>/);
+  assert.match(sharedHelp, /native runtime store/);
+  assert.match(sharedHelp, /!rollout_resume/);
+  assert.match(sharedHelp, /!rollout_sessions/);
+  assert.match(geminiHelp, /!chat_resume/);
+  assert.match(geminiHelp, /!chat_sessions/);
+  assert.doesNotMatch(geminiHelp, /!config <key=value>/);
+  assert.doesNotMatch(geminiHelp, /!effort </);
+  assert.match(geminiHelp, /raw config passthrough/);
   assert.doesNotMatch(lockedHelp, /!provider <codex\|claude\|gemini\|status>/);
 });
 
@@ -158,7 +206,7 @@ test('createReportFormatters.workspace reports explain session reset and lock ow
     { provider: 'gemini', key: 'thread-9', acquiredAt: '2026-03-13T08:00:00.000Z' },
   );
 
-  assert.match(updateReport, /reset because Gemini cannot resume into a different workspace/);
+  assert.match(updateReport, /reset because gemini sessions are treated as workspace-scoped/);
   assert.match(busyReport, /workspace 正忙/);
   assert.match(busyReport, /当前持有 provider: `gemini`/);
   assert.match(busyReport, /当前持有频道: `thread-9`/);
@@ -168,17 +216,25 @@ test('createReportFormatters config helpers and reports remain available from on
   const formatters = createFormatters();
 
   const compactHelp = formatters.formatCompactStrategyConfigHelp('en');
+  const geminiCompactHelp = formatters.formatCompactStrategyConfigHelp('en', 'gemini');
   const compactReport = formatters.formatCompactConfigReport('zh', {}, true);
+  const geminiCompactReport = formatters.formatCompactConfigReport('en', { provider: 'gemini', language: 'en' }, false);
   const timeoutHelp = formatters.formatTimeoutConfigHelp('en');
   const languageReport = formatters.formatLanguageConfigReport('en', true);
   const profileReport = formatters.formatProfileConfigReport('zh', 'team', false);
-  const effortHelp = formatters.formatReasoningEffortHelp('zh');
+  const effortHelp = formatters.formatReasoningEffortHelp('zh', 'claude');
+  const geminiEffortHelp = formatters.formatReasoningEffortHelp('en', 'gemini');
 
   assert.match(compactHelp, /\/bot-compact key:<\.\.\.> value:<\.\.\.>/);
+  assert.match(compactHelp, /native_limit/);
+  assert.match(geminiCompactHelp, /!compact <status\|strategy\|token_limit\|enabled\|reset>/);
   assert.match(compactReport, /compact 配置已更新/);
   assert.match(compactReport, /策略:native（频道覆盖）/);
+  assert.match(geminiCompactReport, /native compact: provider default behavior/);
+  assert.doesNotMatch(geminiCompactReport, /native compact limit:/);
   assert.match(timeoutHelp, /\/bot-timeout <ms\|off\|status>/);
   assert.equal(languageReport, '✅ Message language set to en (English)');
   assert.equal(profileReport, 'ℹ️ 当前安全策略 profile 为 team');
-  assert.equal(effortHelp, '用法：`!effort <xhigh|high|medium|low|default>`');
+  assert.equal(effortHelp, '用法：`!effort <high|medium|low|default>`');
+  assert.match(geminiEffortHelp, /does not expose reasoning effort/);
 });

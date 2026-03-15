@@ -85,6 +85,8 @@ export function createSlashCommandRouter({
   formatCancelReport,
   formatCompactStrategyConfigHelp,
   formatCompactConfigReport,
+  formatCompactConfigUnsupported = (provider) => `Compact config unsupported for ${provider}`,
+  formatProviderSessionLabel = (provider) => `${provider} session`,
   formatReasoningEffortUnsupported,
   normalizeProvider,
   parseWorkspaceCommandAction,
@@ -92,6 +94,7 @@ export function createSlashCommandRouter({
   parseSecurityProfileInput,
   parseTimeoutConfigAction,
   parseCompactConfigAction,
+  providerSupportsCompactConfigAction = () => true,
   cancelChannelWork,
   retryLastPrompt,
   openWorkspaceBrowser,
@@ -312,13 +315,6 @@ export function createSlashCommandRouter({
 
   registerSlashHandlers(handlers, ['compact'], async ({ interaction, session, respond }) => {
     const provider = getSessionProvider(session);
-    if (provider !== 'codex') {
-      await respond({
-        content: `⚠️ 当前 provider = \`${provider}\` (${getProviderDisplayName(provider)})，\`${slashRef('compact')}\` 仅支持 Codex CLI。`,
-        flags: 64,
-      });
-      return;
-    }
     const language = getSessionLanguage(session);
     const parsed = parseCompactConfigAction(
       interaction.options.getString('key'),
@@ -326,7 +322,14 @@ export function createSlashCommandRouter({
     );
     if (!parsed || parsed.type === 'invalid') {
       await respond({
-        content: formatCompactStrategyConfigHelp(language),
+        content: formatCompactStrategyConfigHelp(language, provider),
+        flags: 64,
+      });
+      return;
+    }
+    if (!providerSupportsCompactConfigAction(provider, parsed)) {
+      await respond({
+        content: formatCompactConfigUnsupported(provider, parsed, language),
         flags: 64,
       });
       return;
@@ -355,7 +358,7 @@ export function createSlashCommandRouter({
   registerSlashHandlers(handlers, ['resume'], async ({ interaction, session, respond }) => {
     const sid = interaction.options.getString('session_id');
     const binding = commandActions.bindSession(session, sid);
-    await respond(`✅ 已绑定 ${binding.providerLabel} session: \`${binding.sessionId}\``);
+    await respond(`✅ 已绑定 ${formatProviderSessionLabel(binding.provider, 'zh')}: \`${binding.sessionId}\``);
   });
 
   registerSlashHandlers(handlers, ['name'], async ({ interaction, session, respond }) => {

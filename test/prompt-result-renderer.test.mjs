@@ -9,6 +9,11 @@ function createRenderer(overrides = {}) {
     truncate: (text, max) => (String(text || '').length <= max ? String(text || '') : `${String(text).slice(0, max - 3)}...`),
     composeFinalAnswerText: ({ finalAnswerMessages }) => finalAnswerMessages.join('\n\n'),
     getProviderShortName: (provider) => provider === 'codex' ? 'Codex' : provider,
+    formatProviderSessionTerm: (provider) => {
+      if (provider === 'claude') return 'project session';
+      if (provider === 'gemini') return 'chat session';
+      return 'rollout session';
+    },
     getSessionProvider: (session) => session.provider || 'codex',
     getSessionId: (session) => session.runnerSessionId || session.codexThreadId || null,
     ...overrides,
@@ -35,7 +40,7 @@ test('createPromptResultRenderer renders reasoning answer notes and session labe
   assert.match(text, /🧠 Reasoning/);
   assert.match(text, /final answer/);
   assert.match(text, /• auto reset/);
-  assert.match(text, /• session: \*\*demo\*\* \(`sess-9`\)/);
+  assert.match(text, /• rollout session: \*\*demo\*\* \(`sess-9`\)/);
 });
 
 test('createPromptResultRenderer falls back when provider returns no visible answer', () => {
