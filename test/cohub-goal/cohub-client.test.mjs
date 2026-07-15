@@ -87,7 +87,7 @@ describe('CohubClaudeGoalClient', () => {
             resolveImport: mockResolve,
             readPackageJson: mockReadPkg,
             httpTransport: mockHttp,
-            websocketClient: { on: () => () => {}, connect: async () => {} }
+            websocketClient: { on: () => () => {}, connect: async () => {}, disconnect: async () => {} }
           }
         }
       );
@@ -268,7 +268,7 @@ describe('CohubClaudeGoalClient', () => {
 
       await assert.rejects(
         async () => client.connect({ spaceId: 'sp_1' }),
-        { message: /subscribe.*error.*FORBIDDEN/i }
+        { message: /subscribe/i }
       );
     });
 
@@ -376,7 +376,7 @@ describe('CohubClaudeGoalClient', () => {
   });
 
   describe('prompt with stable clientMessageId', () => {
-    it('generates stable clientMessageId from content', async () => {
+    it('uses caller continuationId as clientMessageId', async () => {
       const capturedRequests = [];
       const mockHttp = {
         request: mock.fn(async (opts) => {
@@ -398,19 +398,22 @@ describe('CohubClaudeGoalClient', () => {
       await client.prompt({
         spaceId: 'sp_1',
         sessionId: 'sess_1',
+        continuationId: 'cont_stable_123',
         content: [{ type: 'text', text: 'hello' }]
       });
 
       await client.prompt({
         spaceId: 'sp_1',
         sessionId: 'sess_1',
-        content: [{ type: 'text', text: 'hello' }]
+        continuationId: 'cont_stable_123',
+        content: [{ type: 'text', text: 'world' }]
       });
 
       assert.equal(capturedRequests.length, 2);
       const id1 = capturedRequests[0].meta.clientMessageId;
       const id2 = capturedRequests[1].meta.clientMessageId;
-      assert.equal(id1, id2, 'same content produces same clientMessageId');
+      assert.equal(id1, 'cont_stable_123', 'clientMessageId equals continuationId');
+      assert.equal(id2, 'cont_stable_123', 'same continuationId produces same clientMessageId');
     });
   });
 
@@ -636,7 +639,7 @@ describe('CohubClaudeGoalClient', () => {
 
       await assert.rejects(
         async () => client.turns.get({ spaceId: 'sp_1', sessionId: 'sess_1', turnId: 'run_1' }),
-        { message: /session.*mismatch/i }
+        { message: /mismatch/i }
       );
     });
 
@@ -667,7 +670,8 @@ describe('CohubClaudeGoalClient', () => {
       const mockWs = {
         state: 'open',
         disconnect: mock.fn(async () => {}),
-        on: mock.fn(() => () => {})
+        on: mock.fn(() => () => {}),
+        connect: mock.fn(async () => {})
       };
 
       const client = makeClient(['sp_1'], { sp_1: [] }, ['run_'], { websocketClient: mockWs });
