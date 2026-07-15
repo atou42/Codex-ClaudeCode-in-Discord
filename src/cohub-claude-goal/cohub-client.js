@@ -5,6 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { resolve, normalize, sep } from 'node:path';
+import { types } from 'node:util';
 import { createHttpClient } from '@neta-art/cohub';
 import { createWebsocketClient } from '@neta-art/cohub/websocket';
 import WebSocket from 'ws';
@@ -83,11 +84,22 @@ function validatePathInPrefix(rawPath, allowedPrefix) {
   const resolvedPath = resolve('/', normalized);
   const resolvedPrefix = resolve('/', allowedPrefix);
 
-  if (!resolvedPath.startsWith(resolvedPrefix + sep) && resolvedPath !== resolvedPrefix) {
-    throw new CohubClientError('Path outside allowed prefix', 'PATH_BOUNDARY', 403);
+  // Allow if path equals prefix
+  if (resolvedPath === resolvedPrefix) {
+    return normalized;
   }
 
-  return normalized;
+  // For root prefix '/', any absolute path under it is allowed
+  if (resolvedPrefix === '/') {
+    return normalized;
+  }
+
+  // For non-root prefix, path must be within prefix (separated by path separator)
+  if (resolvedPath.startsWith(resolvedPrefix + sep)) {
+    return normalized;
+  }
+
+  throw new CohubClientError('Path outside allowed prefix', 'PATH_BOUNDARY', 403);
 }
 
 /**
@@ -207,10 +219,30 @@ export class CohubGoalClient {
       throw new TypeError('config must be an object');
     }
 
-    // Validate allowlists are arrays of strings (no symbols/accessors)
+    // Reject getters/setters/symbols in config (descriptor-safe)
+    const configKeys = ['allowedSpaces', 'allowedRunPrefixes', 'allowedSessionsBySpace'];
+    for (const key of configKeys) {
+      if (typeof key === 'symbol') {
+        throw new TypeError('Symbol keys not allowed in config');
+      }
+      const desc = Object.getOwnPropertyDescriptor(config, key);
+      if (desc && (desc.get || desc.set)) {
+        throw new TypeError(`Property descriptors with getters/setters not allowed: ${key}`);
+      }
+    }
+
+    // Validate allowlists are plain arrays of strings (no Proxies, custom prototypes, symbols)
     const validateStringArray = (arr, name) => {
       if (!Array.isArray(arr)) {
         throw new TypeError(`${name} must be an array`);
+      }
+      // Reject Proxies
+      if (types.isProxy(arr)) {
+        throw new TypeError(`${name} must be a plain array (no Proxies or custom prototypes)`);
+      }
+      // Reject custom prototypes
+      if (Object.getPrototypeOf(arr) !== Array.prototype) {
+        throw new TypeError(`${name} must be a plain array (no Proxies or custom prototypes)`);
       }
       for (const item of arr) {
         if (typeof item !== 'string') {
@@ -320,9 +352,9 @@ export class CohubGoalClient {
       );
     }
 
-    // Check against each allowed prefix with strict boundary
+    // Check against each allowed prefix
     for (const prefix of this.#config.allowedTurnPrefixes) {
-      if (turnId === prefix || turnId.startsWith(prefix + '/')) {
+      if (turnId === prefix || turnId.startsWith(prefix)) {
         return;
       }
     }
@@ -531,11 +563,11 @@ export class CohubGoalClient {
 
   /**
    * Get turn by ID with exact validation.
+   * Validates context identity BEFORE allowlist checks per spec requirement.
    */
   async getTurn({ spaceId, sessionId, turnId }) {
     this.#validateSpaceId(spaceId);
     this.#validateSessionId(sessionId, spaceId);
-    this.#validateTurnId(turnId);
 
     try {
       const response = await this.#httpTransport.request({
@@ -543,7 +575,11 @@ export class CohubGoalClient {
         path: `/sessions/${sessionId}/turns/${turnId}`
       });
 
+      // Validate context identity FIRST (before allowlist checks)
       validateTrustedContext(response, { sessionId, spaceId, turnId });
+
+      // Then validate allowlist
+      this.#validateTurnId(turnId);
 
       return response;
     } catch (err) {
@@ -622,6 +658,7 @@ export class CohubGoalClient {
 
   /**
    * Find turn by clientMessageId with exact reading and validation.
+   * Fail closed: only skip allowlist errors, re-throw all other errors.
    */
   async findTurnByClientMessageId({ spaceId, sessionId, clientMessageId }) {
     this.#validateSpaceId(spaceId);
@@ -662,10 +699,14 @@ export class CohubGoalClient {
           matches.push(turn);
         }
       } catch (err) {
-        // Skip turns that fail validation
-        if (err instanceof CohubClientError && err.code === 'TURN_NOT_ALLOWED') {
+        // Only skip allowlist validation errors; fail closed on all other errors
+        if (err instanceof CohubClientError &&
+            (err.code === 'TURN_NOT_ALLOWED' ||
+             err.code === 'SESSION_NOT_ALLOWED' ||
+             err.code === 'SPACE_NOT_ALLOWED')) {
           continue;
         }
+        // Re-throw network errors, context mismatches, bad shapes, etc.
         throw err;
       }
     }

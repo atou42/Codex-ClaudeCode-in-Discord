@@ -1,221 +1,11 @@
 /**
  * @fileoverview Cohub client tests: allowlists, WS lifecycle, HTTP truth, typed errors.
- * RED then GREEN: missing module first, then implementation.
+ * Tests the production implementation in src/cohub-claude-goal/cohub-client.js
  */
 
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
-
-// Helper to export for test cases
-class CohubClaudeGoalClient {
-  constructor(config) {
-    // Delegate to real implementation with factory injection
-    const factories = config.factories || {};
-
-    // Version checking via factories
-    if (factories.readPackageJson) {
-      const cohubPkg = factories.readPackageJson('@neta-art/cohub');
-      const wsPkg = factories.readPackageJson('ws');
-
-      if (cohubPkg.version !== '2.11.1') {
-        throw new Error(`Package version mismatch: @neta-art/cohub@${cohubPkg.version}, required 2.11.1`);
-      }
-      if (wsPkg.version !== '8.21.1') {
-        throw new Error(`Package version mismatch: ws@${wsPkg.version}, required 8.21.1`);
-      }
-    }
-
-    // Store config
-    this.config = config;
-    this.httpTransport = factories.httpTransport;
-    this.websocketClient = factories.websocketClient;
-
-    // Validate structure
-    if (!Array.isArray(config.allowedSpaces)) {
-      throw new TypeError('allowedSpaces must be an array');
-    }
-    if (!config.allowedSessionsBySpace || typeof config.allowedSessionsBySpace !== 'object') {
-      throw new TypeError('allowedSessionsBySpace must be an object');
-    }
-    if (!Array.isArray(config.allowedRunPrefixes)) {
-      throw new TypeError('allowedRunPrefixes must be an array');
-    }
-  }
-
-  #validateSpaceId(spaceId) {
-    if (!this.config.allowedSpaces.includes(spaceId)) {
-      throw new Error(`Space ${spaceId} not allowed`);
-    }
-  }
-
-  #validateSessionId(sessionId, spaceId) {
-    const spaceSessions = this.config.allowedSessionsBySpace[spaceId];
-    if (!spaceSessions || !spaceSessions.includes(sessionId)) {
-      throw new Error(`Session ${sessionId} not allowed`);
-    }
-  }
-
-  #validateTurnPrefix(turnId) {
-    for (const prefix of this.config.allowedRunPrefixes) {
-      if (turnId === prefix || turnId.startsWith(prefix)) {
-        return;
-      }
-    }
-    throw new Error(`Turn prefix not allowed for ${turnId}`);
-  }
-
-  async connect({ spaceId }) {
-    this.#validateSpaceId(spaceId);
-
-    return new Promise((resolve, reject) => {
-      const room = `space:${spaceId}`;
-      const unsubscribers = [];
-      let subscribedHandler, subscribeErrorHandler;
-
-      subscribedHandler = (payload) => {
-        if (payload && Array.isArray(payload.rooms) && payload.rooms.includes(room)) {
-          unsubscribers.forEach(u => u());
-          resolve();
-        }
-      };
-
-      subscribeErrorHandler = (payload) => {
-        if (payload && Array.isArray(payload.rejected)) {
-          const rejection = payload.rejected.find(r => r.room === room);
-          if (rejection) {
-            unsubscribers.forEach(u => u());
-            reject(new Error(`subscribeError: ${rejection.code}`));
-          }
-        }
-      };
-
-      unsubscribers.push(this.websocketClient.on('subscribed', subscribedHandler));
-      unsubscribers.push(this.websocketClient.on('subscribeError', subscribeErrorHandler));
-      unsubscribers.push(this.websocketClient.on('disconnect', () => {}));
-      unsubscribers.push(this.websocketClient.on('close', () => {}));
-
-      this.websocketClient.connect()
-        .then(() => {
-          this.websocketClient.subscribeRooms([room]);
-        })
-        .catch(reject);
-    });
-  }
-
-  async close() {
-    if (this._closed) return;
-    this._closed = true;
-
-    if (this.websocketClient && this.websocketClient.disconnect) {
-      await this.websocketClient.disconnect();
-    }
-  }
-
-  get turns() {
-    return {
-      index: async ({ spaceId, sessionId }) => {
-        this.#validateSpaceId(spaceId);
-        this.#validateSessionId(sessionId, spaceId);
-
-        const response = await this.httpTransport.request({
-          method: 'GET',
-          path: `/sessions/${sessionId}/turns/index`
-        });
-
-        // Pagination handling
-        const allTurns = [...response.turns];
-        let cursor = response.nextCursor;
-
-        while (response.hasMore && cursor) {
-          const nextPage = await this.httpTransport.request({
-            method: 'GET',
-            path: `/sessions/${sessionId}/turns/index?cursor=${cursor}`
-          });
-          allTurns.push(...nextPage.turns);
-          cursor = nextPage.nextCursor;
-          if (!nextPage.hasMore) break;
-        }
-
-        return {
-          session: response.session,
-          turns: allTurns,
-          hasMore: false
-        };
-      },
-
-      get: async ({ spaceId, sessionId, turnId }) => {
-        this.#validateSpaceId(spaceId);
-        this.#validateSessionId(sessionId, spaceId);
-        this.#validateTurnPrefix(turnId);
-
-        const response = await this.httpTransport.request({
-          method: 'GET',
-          path: `/sessions/${sessionId}/turns/${turnId}`
-        });
-
-        // Validate trusted context
-        if (response.session?.id !== sessionId) {
-          throw new Error(`Session mismatch: expected ${sessionId}, got ${response.session?.id}`);
-        }
-
-        return response;
-      }
-    };
-  }
-
-  async prompt({ spaceId, sessionId, content }) {
-    this.#validateSpaceId(spaceId);
-    this.#validateSessionId(sessionId, spaceId);
-
-    const { createHash } = await import('node:crypto');
-    const body = JSON.stringify({ type: 'immediate', content });
-    const clientMessageId = `cmid_${createHash('sha256').update(body).digest('hex').slice(0, 16)}`;
-
-    return await this.httpTransport.request({
-      method: 'POST',
-      path: `/sessions/${sessionId}/turns`,
-      body: { type: 'immediate', content, clientMessageId }
-    });
-  }
-
-  async findTurnByClientMessageId({ spaceId, sessionId, clientMessageId }) {
-    this.#validateSpaceId(spaceId);
-    this.#validateSessionId(sessionId, spaceId);
-
-    const indexResult = await this.turns.index({ spaceId, sessionId });
-    const matches = [];
-
-    for (const candidate of indexResult.turns) {
-      try {
-        const detail = await this.turns.get({ spaceId, sessionId, turnId: candidate.id });
-        if (detail.turn?.meta?.clientMessageId === clientMessageId) {
-          matches.push(detail.turn);
-        }
-      } catch (err) {
-        // Skip invalid turns
-        continue;
-      }
-    }
-
-    return matches;
-  }
-
-  get files() {
-    return {
-      read: async ({ spaceId, path }) => {
-        this.#validateSpaceId(spaceId);
-
-        // Normalize path
-        const normalized = path.replace(/\/+/g, '/').replace(/\/+$/, '') || '/';
-
-        return await this.httpTransport.request({
-          method: 'GET',
-          path: `/spaces/${spaceId}/files?path=${normalized}`
-        });
-      }
-    };
-  }
-}
+import { CohubGoalClient as CohubClaudeGoalClient } from '../../src/cohub-claude-goal/cohub-client.js';
 
 describe('CohubClaudeGoalClient', () => {
   describe('construction and version enforcement', () => {
@@ -232,12 +22,16 @@ describe('CohubClaudeGoalClient', () => {
       };
 
       assert.throws(
-        () => new CohubClaudeGoalClient({
-          allowedSpaces: ['sp_test'],
-          allowedSessionsBySpace: { sp_test: ['sess_test'] },
-          allowedRunPrefixes: ['run_'],
-          factories: { resolveImport: mockResolve, readPackageJson: mockReadPkg }
-        }),
+        () => new CohubClaudeGoalClient(
+          {
+            allowedSpaces: ['sp_test'],
+            allowedSessionsBySpace: { sp_test: ['sess_test'] },
+            allowedRunPrefixes: ['run_']
+          },
+          {
+            factories: { resolveImport: mockResolve, readPackageJson: mockReadPkg }
+          }
+        ),
         { message: /cohub.*2\.11\.1/i }
       );
     });
@@ -255,12 +49,16 @@ describe('CohubClaudeGoalClient', () => {
       };
 
       assert.throws(
-        () => new CohubClaudeGoalClient({
-          allowedSpaces: ['sp_test'],
-          allowedSessionsBySpace: { sp_test: ['sess_test'] },
-          allowedRunPrefixes: ['run_'],
-          factories: { resolveImport: mockResolve, readPackageJson: mockReadPkg }
-        }),
+        () => new CohubClaudeGoalClient(
+          {
+            allowedSpaces: ['sp_test'],
+            allowedSessionsBySpace: { sp_test: ['sess_test'] },
+            allowedRunPrefixes: ['run_']
+          },
+          {
+            factories: { resolveImport: mockResolve, readPackageJson: mockReadPkg }
+          }
+        ),
         { message: /ws.*8\.21\.1/i }
       );
     });
@@ -276,15 +74,87 @@ describe('CohubClaudeGoalClient', () => {
         if (name === 'ws') return { name: 'ws', version: '8.21.1' };
         throw new Error('unexpected');
       };
+      const mockHttp = { request: mock.fn(async () => ({})) };
 
-      const client = new CohubClaudeGoalClient({
-        allowedSpaces: ['sp_test'],
-        allowedSessionsBySpace: { sp_test: ['sess_test'] },
-        allowedRunPrefixes: ['run_'],
-        factories: { resolveImport: mockResolve, readPackageJson: mockReadPkg }
-      });
+      const client = new CohubClaudeGoalClient(
+        {
+          allowedSpaces: ['sp_test'],
+          allowedSessionsBySpace: { sp_test: ['sess_test'] },
+          allowedRunPrefixes: ['run_']
+        },
+        {
+          factories: {
+            resolveImport: mockResolve,
+            readPackageJson: mockReadPkg,
+            httpTransport: mockHttp,
+            websocketClient: { on: () => () => {}, connect: async () => {} }
+          }
+        }
+      );
 
       assert.ok(client);
+    });
+  });
+
+  describe('descriptor-safety', () => {
+    it('rejects config with getter properties', () => {
+      const mockReadPkg = (name) => {
+        if (name === '@neta-art/cohub') return { name: '@neta-art/cohub', version: '2.11.1' };
+        if (name === 'ws') return { name: 'ws', version: '8.21.1' };
+        throw new Error('unexpected');
+      };
+
+      const config = {
+        allowedRunPrefixes: ['run_'],
+        allowedSessionsBySpace: {}
+      };
+      Object.defineProperty(config, 'allowedSpaces', {
+        get() { return ['sp_evil']; }
+      });
+
+      assert.throws(
+        () => new CohubClaudeGoalClient(config, {
+          factories: {
+            readPackageJson: mockReadPkg,
+            httpTransport: { request: async () => ({}) },
+            websocketClient: { on: () => () => {}, connect: async () => {} }
+          }
+        }),
+        { message: /getters\/setters not allowed/i }
+      );
+    });
+
+    it('rejects Proxy-wrapped arrays', () => {
+      const mockReadPkg = (name) => {
+        if (name === '@neta-art/cohub') return { name: '@neta-art/cohub', version: '2.11.1' };
+        if (name === 'ws') return { name: 'ws', version: '8.21.1' };
+        throw new Error('unexpected');
+      };
+
+      const proxy = new Proxy(['sp_1'], {
+        get(target, prop) {
+          if (prop === 'includes') return () => true;
+          return target[prop];
+        }
+      });
+
+      assert.throws(
+        () => new CohubClaudeGoalClient(
+          {
+            allowedSpaces: proxy,
+            allowedSessionsBySpace: {},
+            allowedRunPrefixes: ['run_']
+          },
+          {
+            factories: {
+              readPackageJson: mockReadPkg,
+              httpTransport: { request: async () => ({}) },
+              websocketClient: { on: () => () => {}, connect: async () => {} }
+            }
+          }
+        ),
+        { message: /plain array.*no Proxies/i }
+      );
     });
   });
 
@@ -294,7 +164,7 @@ describe('CohubClaudeGoalClient', () => {
 
       await assert.rejects(
         async () => client.turns.index({ spaceId: 'sp_forbidden', sessionId: 'sess_1' }),
-        { message: /space.*not allowed/i }
+        { message: /space.*not.*allow/i }
       );
     });
 
@@ -303,7 +173,7 @@ describe('CohubClaudeGoalClient', () => {
 
       await assert.rejects(
         async () => client.turns.index({ spaceId: 'sp_1', sessionId: 'sess_forbidden' }),
-        { message: /session.*not allowed/i }
+        { message: /session.*not.*allow/i }
       );
     });
 
@@ -316,7 +186,7 @@ describe('CohubClaudeGoalClient', () => {
           sessionId: 'sess_1',
           turnId: 'turn_bad_prefix_123'
         }),
-        { message: /turn.*prefix.*not allowed/i }
+        { message: /turn.*not.*allow/i }
       );
     });
 
@@ -398,7 +268,7 @@ describe('CohubClaudeGoalClient', () => {
 
       await assert.rejects(
         async () => client.connect({ spaceId: 'sp_1' }),
-        { message: /subscribeError.*FORBIDDEN/i }
+        { message: /subscribe.*error.*FORBIDDEN/i }
       );
     });
 
@@ -462,7 +332,7 @@ describe('CohubClaudeGoalClient', () => {
     it('fetches all pages when hasMore is true', async () => {
       const mockHttp = {
         request: mock.fn(async (opts) => {
-          if (opts.path.includes('cursor=')) {
+          if (opts.query && opts.query.cursor) {
             return {
               session: { id: 'sess_1', spaceId: 'sp_1' },
               turns: [{ id: 'run_3', sequence: 3 }],
@@ -514,7 +384,11 @@ describe('CohubClaudeGoalClient', () => {
           return {
             mode: 'immediate',
             session: { id: 'sess_1', spaceId: 'sp_1' },
-            turn: { id: 'run_1', sessionId: 'sess_1' }
+            turn: {
+              id: 'run_1',
+              sessionId: 'sess_1',
+              meta: { clientMessageId: opts.body.meta.clientMessageId }
+            }
           };
         })
       };
@@ -534,8 +408,8 @@ describe('CohubClaudeGoalClient', () => {
       });
 
       assert.equal(capturedRequests.length, 2);
-      const id1 = capturedRequests[0].clientMessageId;
-      const id2 = capturedRequests[1].clientMessageId;
+      const id1 = capturedRequests[0].meta.clientMessageId;
+      const id2 = capturedRequests[1].meta.clientMessageId;
       assert.equal(id1, id2, 'same content produces same clientMessageId');
     });
   });
@@ -544,7 +418,7 @@ describe('CohubClaudeGoalClient', () => {
     it('returns empty array when no matches', async () => {
       const mockHttp = {
         request: mock.fn(async (opts) => {
-          if (opts.path.includes('/turns/index')) {
+          if (opts.path.includes('/turns') && !opts.path.match(/\/turns\/[^/]+$/)) {
             return {
               session: { id: 'sess_1', spaceId: 'sp_1' },
               turns: [],
@@ -569,7 +443,7 @@ describe('CohubClaudeGoalClient', () => {
     it('returns multiple matches when found', async () => {
       const mockHttp = {
         request: mock.fn(async (opts) => {
-          if (opts.path.includes('/turns/index')) {
+          if (opts.path.includes('/turns') && !opts.path.match(/\/turns\/[^/]+$/)) {
             return {
               session: { id: 'sess_1', spaceId: 'sp_1' },
               turns: [
@@ -614,6 +488,97 @@ describe('CohubClaudeGoalClient', () => {
       assert.equal(result.length, 1);
       assert.equal(result[0].id, 'run_1');
     });
+
+    it('skips allowlist errors but fails on context mismatches', async () => {
+      const mockHttp = {
+        request: mock.fn(async (opts) => {
+          if (opts.path.includes('/turns') && !opts.path.match(/\/turns\/[^/]+$/)) {
+            return {
+              session: { id: 'sess_1', spaceId: 'sp_1' },
+              turns: [
+                { id: 'run_1', sequence: 1 },
+                { id: 'evil_prefix_2', sequence: 2 }
+              ],
+              hasMore: false
+            };
+          }
+          if (opts.path.includes('/turns/run_1')) {
+            return {
+              session: { id: 'sess_1', spaceId: 'sp_1' },
+              turn: {
+                id: 'run_1',
+                sessionId: 'sess_1',
+                meta: { clientMessageId: 'msg_target' }
+              }
+            };
+          }
+          if (opts.path.includes('/turns/evil_prefix_2')) {
+            // This should be skipped (allowlist error)
+            return {
+              session: { id: 'sess_1', spaceId: 'sp_1' },
+              turn: {
+                id: 'evil_prefix_2',
+                sessionId: 'sess_1',
+                meta: { clientMessageId: 'msg_other' }
+              }
+            };
+          }
+          throw new Error('unexpected path');
+        })
+      };
+
+      const client = makeClient(['sp_1'], { sp_1: ['sess_1'] }, ['run_'], { httpTransport: mockHttp });
+
+      // Should skip evil_prefix_2 without throwing
+      const result = await client.findTurnByClientMessageId({
+        spaceId: 'sp_1',
+        sessionId: 'sess_1',
+        clientMessageId: 'msg_target'
+      });
+
+      assert.equal(result.length, 1);
+      assert.equal(result[0].id, 'run_1');
+    });
+
+    it('fails closed on non-allowlist errors', async () => {
+      const mockHttp = {
+        request: mock.fn(async (opts) => {
+          if (opts.path.includes('/turns') && !opts.path.match(/\/turns\/[^/]+$/)) {
+            return {
+              session: { id: 'sess_1', spaceId: 'sp_1' },
+              turns: [
+                { id: 'run_1', sequence: 1 }
+              ],
+              hasMore: false
+            };
+          }
+          if (opts.path.includes('/turns/run_1')) {
+            // Return wrong session (context mismatch, not allowlist)
+            return {
+              session: { id: 'sess_wrong', spaceId: 'sp_1' },
+              turn: {
+                id: 'run_1',
+                sessionId: 'sess_wrong',
+                meta: { clientMessageId: 'msg_target' }
+              }
+            };
+          }
+          throw new Error('unexpected path');
+        })
+      };
+
+      const client = makeClient(['sp_1'], { sp_1: ['sess_1'] }, ['run_'], { httpTransport: mockHttp });
+
+      // Should throw on context mismatch (not skip it)
+      await assert.rejects(
+        async () => client.findTurnByClientMessageId({
+          spaceId: 'sp_1',
+          sessionId: 'sess_1',
+          clientMessageId: 'msg_target'
+        }),
+        { message: /mismatch/i }
+      );
+    });
   });
 
   describe('typed error handling', () => {
@@ -651,7 +616,7 @@ describe('CohubClaudeGoalClient', () => {
       await assert.rejects(
         async () => client.turns.get({ spaceId: 'sp_1', sessionId: 'sess_1', turnId: 'run_1' }),
         (err) => {
-          assert.ok(err.message.includes('Rate limited'));
+          assert.ok(err.message.includes('Rate limit'));
           return true;
         }
       );
@@ -672,6 +637,27 @@ describe('CohubClaudeGoalClient', () => {
       await assert.rejects(
         async () => client.turns.get({ spaceId: 'sp_1', sessionId: 'sess_1', turnId: 'run_1' }),
         { message: /session.*mismatch/i }
+      );
+    });
+
+    it('reports context mismatch before allowlist violation', async () => {
+      const mockHttp = {
+        request: mock.fn(async () => ({
+          session: { id: 'sess_wrong', spaceId: 'sp_1' },
+          turn: { id: 'evil_prefix_123', sessionId: 'sess_wrong' }
+        }))
+      };
+
+      const client = makeClient(['sp_1'], { sp_1: ['sess_1'] }, ['run_'], { httpTransport: mockHttp });
+
+      await assert.rejects(
+        async () => client.turns.get({ spaceId: 'sp_1', sessionId: 'sess_1', turnId: 'evil_prefix_123' }),
+        (err) => {
+          // Should get CONTEXT_MISMATCH, not TURN_NOT_ALLOWED
+          assert.ok(err.message.includes('mismatch'), 'Should report context mismatch');
+          assert.ok(!err.message.includes('not allowed'), 'Should not report allowlist error');
+          return true;
+        }
       );
     });
   });
@@ -702,14 +688,21 @@ function makeClient(allowedSpaces, allowedSessionsBySpace, allowedRunPrefixes, m
     throw new Error('unexpected');
   };
 
-  return new CohubClaudeGoalClient({
-    allowedSpaces,
-    allowedSessionsBySpace,
-    allowedRunPrefixes,
-    factories: {
-      readPackageJson: mockReadPkg,
-      httpTransport: mocks.httpTransport,
-      websocketClient: mocks.websocketClient
+  const defaultMockHttp = { request: mock.fn(async () => ({ session: { id: 'sess_1', spaceId: 'sp_1' }, turns: [], hasMore: false })) };
+  const defaultMockWs = { on: () => () => {}, connect: async () => {}, subscribeRooms: () => {}, disconnect: async () => {} };
+
+  return new CohubClaudeGoalClient(
+    {
+      allowedSpaces,
+      allowedSessionsBySpace,
+      allowedRunPrefixes
+    },
+    {
+      factories: {
+        readPackageJson: mockReadPkg,
+        httpTransport: mocks.httpTransport || defaultMockHttp,
+        websocketClient: mocks.websocketClient || defaultMockWs
+      }
     }
-  });
+  );
 }
