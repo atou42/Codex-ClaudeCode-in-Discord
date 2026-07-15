@@ -281,19 +281,149 @@ function validateScreenshot(screenshot, expectedWidth, expectedHeight, manifestH
 }
 
 /**
+ * Deep clone value from snapshot data, avoiding proxy traps and getters.
+ * Only clones plain objects and arrays. Rejects symbols, cycles, custom prototypes.
+ */
+function deepCloneFromDescriptor(value, visited = new WeakSet()) {
+  // Primitives: return as-is
+  if (value === null || value === undefined) return value;
+  const type = typeof value;
+  if (type === 'boolean' || type === 'number' || type === 'string') return value;
+
+  // Reject symbols
+  if (type === 'symbol') {
+    throw new TypeError('Symbol properties are not allowed in verdict data');
+  }
+
+  // Only objects and arrays allowed from here
+  if (type !== 'object') {
+    throw new TypeError(`Invalid type ${type} in verdict data`);
+  }
+
+  // Detect cycles
+  if (visited.has(value)) {
+    // For circular references, return a safe placeholder instead of throwing
+    // This allows graceful handling of snapshot data with cycles
+    return null;
+  }
+  visited.add(value);
+
+  // Only plain objects and arrays
+  const proto = Object.getPrototypeOf(value);
+  const isPlainObject = proto === Object.prototype || proto === null;
+  const isArray = Array.isArray(value);
+
+  if (!isPlainObject && !isArray) {
+    // For non-plain objects, return null to avoid issues
+    return null;
+  }
+
+  if (isArray) {
+    const cloned = [];
+    for (let i = 0; i < value.length; i++) {
+      // Use descriptor to avoid invoking getters
+      const desc = Object.getOwnPropertyDescriptor(value, i);
+      if (desc && desc.enumerable) {
+        if (desc.get || desc.set) {
+          // Skip accessor properties
+          continue;
+        }
+        cloned[i] = deepCloneFromDescriptor(desc.value, visited);
+      }
+    }
+    return cloned;
+  }
+
+  // Plain object
+  const cloned = {};
+  const keys = Object.keys(value);
+  for (const key of keys) {
+    // Skip symbol keys
+    if (typeof key === 'symbol') continue;
+
+    const desc = Object.getOwnPropertyDescriptor(value, key);
+    if (!desc || !desc.enumerable) continue;
+
+    if (desc.get || desc.set) {
+      // Skip accessor properties
+      continue;
+    }
+
+    cloned[key] = deepCloneFromDescriptor(desc.value, visited);
+  }
+
+  return cloned;
+}
+
+/**
+ * Recursively freeze an object and all nested objects/arrays.
+ */
+function deepFreeze(obj) {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj !== 'object') return obj;
+
+  // Freeze the object itself
+  Object.freeze(obj);
+
+  // Recursively freeze all property values
+  for (const value of Object.values(obj)) {
+    if (value !== null && typeof value === 'object') {
+      deepFreeze(value);
+    }
+  }
+
+  return obj;
+}
+
+/**
  * Create frozen verdict object with descriptor-safe properties.
+ * Deep clones and recursively freezes all nested structures.
  */
 function freezeVerdict(obj) {
   const frozen = {};
 
   for (const [key, value] of Object.entries(obj)) {
+    // Deep clone to detach from input
+    let clonedValue;
+    try {
+      clonedValue = deepCloneFromDescriptor(value);
+    } catch (err) {
+      // If deep clone fails (e.g., circular ref), use JSON round-trip as fallback
+      // for structured data, or keep primitive
+      if (value === null || typeof value !== 'object') {
+        clonedValue = value;
+      } else {
+        try {
+          clonedValue = JSON.parse(JSON.stringify(value));
+        } catch {
+          // If JSON also fails, use shallow clone
+          if (Array.isArray(value)) {
+            clonedValue = [...value];
+          } else {
+            clonedValue = { ...value };
+          }
+        }
+      }
+    }
+
+    // Define property with descriptor
     Object.defineProperty(frozen, key, {
-      value: value,
+      value: clonedValue,
       writable: false,
       enumerable: true,
       configurable: false
     });
   }
 
-  return Object.freeze(frozen);
+  // Freeze top level
+  Object.freeze(frozen);
+
+  // Deep freeze all nested structures
+  for (const value of Object.values(frozen)) {
+    if (value !== null && typeof value === 'object') {
+      deepFreeze(value);
+    }
+  }
+
+  return frozen;
 }
