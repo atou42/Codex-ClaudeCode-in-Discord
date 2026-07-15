@@ -394,6 +394,132 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
     });
   });
 
+  describe('Settled restart command', () => {
+    it('should allow restart from PAUSED_USER with fresh condition', async () => {
+      launcher = new Launcher({
+        goalDir: mockGoalDir,
+        mockStreamParser: (argv, launcherInstance) => {
+          // Verify argv includes both --resume and /goal
+          assert.ok(argv.includes('--resume'), 'Should include --resume');
+          assert.ok(argv.some(arg => arg.startsWith('/goal')), 'Should include /goal');
+
+          launcherInstance._processStreamEvent({ type: 'bootstrap' });
+          launcherInstance._processStreamEvent({
+            tool: 'verify',
+            result: { verdict: 'DONE' }
+          });
+          launcherInstance._handleProcessExit(0, null);
+        }
+      });
+
+      await launcher.init();
+      launcher.state = State.PAUSED_USER;
+      launcher.lastVerdict = Verdict.PAUSED_USER;
+      await launcher._updateState();
+
+      const result = await launcher.restartSettled({
+        condition: 'Fresh condition after user approval'
+      });
+
+      assert.ok(result, 'Should return result');
+    });
+
+    it('should allow restart from BLOCKED with fresh condition', async () => {
+      launcher = new Launcher({
+        goalDir: mockGoalDir,
+        mockStreamParser: (argv, launcherInstance) => {
+          launcherInstance._processStreamEvent({ type: 'bootstrap' });
+          launcherInstance._processStreamEvent({
+            tool: 'verify',
+            result: { verdict: 'DONE' }
+          });
+          launcherInstance._handleProcessExit(0, null);
+        }
+      });
+
+      await launcher.init();
+      launcher.state = State.BLOCKED;
+      launcher.lastVerdict = Verdict.BLOCKED;
+      await launcher._updateState();
+
+      const result = await launcher.restartSettled({
+        condition: 'Fresh condition after blocker removed'
+      });
+
+      assert.ok(result, 'Should return result');
+    });
+
+    it('should reject restart from RUNNING_CLAUDE', async () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      await launcher.init();
+      launcher.state = State.RUNNING_CLAUDE;
+      await launcher._updateState();
+
+      await assert.rejects(
+        async () => await launcher.restartSettled({ condition: 'any' }),
+        /Cannot restart from state RUNNING_CLAUDE/
+      );
+    });
+
+    it('should reject restart from WAITING_COHUB', async () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      await launcher.init();
+      launcher.state = State.WAITING_COHUB;
+      await launcher._updateState();
+
+      await assert.rejects(
+        async () => await launcher.restartSettled({ condition: 'any' }),
+        /Cannot restart from state WAITING_COHUB/
+      );
+    });
+
+    it('should reject restart from DONE', async () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      await launcher.init();
+      launcher.state = State.DONE;
+      await launcher._updateState();
+
+      await assert.rejects(
+        async () => await launcher.restartSettled({ condition: 'any' }),
+        /Cannot restart from state DONE/
+      );
+    });
+
+    it('should require explicit condition', async () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      await launcher.init();
+      launcher.state = State.PAUSED_USER;
+      await launcher._updateState();
+
+      await assert.rejects(
+        async () => await launcher.restartSettled({}),
+        /requires explicit fresh condition/
+      );
+    });
+
+    it('should reset evaluator and wait refusal flags on restart', async () => {
+      launcher = new Launcher({
+        goalDir: mockGoalDir,
+        mockStreamParser: (argv, launcherInstance) => {
+          // Check flags were reset
+          assert.strictEqual(launcherInstance.evaluatorEntered, false);
+          assert.strictEqual(launcherInstance.waitRefusalCount, 0);
+
+          launcherInstance._processStreamEvent({ type: 'bootstrap' });
+          launcherInstance._handleProcessExit(0, null);
+        }
+      });
+
+      await launcher.init();
+      launcher.state = State.BLOCKED;
+      launcher.evaluatorEntered = true;
+      launcher.waitRefusalCount = 2;
+      await launcher._updateState();
+
+      await launcher.restartSettled({ condition: 'Fresh condition' });
+    });
+  });
+
   describe('Argv construction', () => {
     it('should include exactly 4 MCP tools allowlist', () => {
       launcher = new Launcher({ goalDir: mockGoalDir });
@@ -519,6 +645,61 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       launcher._checkTurnProgress();
 
       assert.strictEqual(launcher.turnsSinceProgress, 0);
+    });
+
+    it('should detect first wait refusal without blocking', () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      launcher.state = State.RUNNING_CLAUDE;
+      launcher.lastVerdict = Verdict.RUNNING;
+
+      // Turn with actions but no wait
+      launcher.currentTurn = { actions: [{ tool: 'inspect' }] };
+      launcher._checkTurnProgress();
+
+      assert.strictEqual(launcher.waitRefusalCount, 1);
+      assert.strictEqual(launcher.state, State.RUNNING_CLAUDE, 'Should NOT block on first refusal');
+    });
+
+    it('should block on second consecutive wait refusal', () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      launcher.state = State.RUNNING_CLAUDE;
+      launcher.lastVerdict = Verdict.RUNNING;
+      launcher.waitRefusalCount = 1; // First refusal already happened
+
+      // Second turn with actions but no wait
+      launcher.currentTurn = { actions: [{ tool: 'submit' }] };
+      launcher._checkTurnProgress();
+
+      assert.strictEqual(launcher.waitRefusalCount, 2);
+      assert.strictEqual(launcher.state, State.BLOCKED, 'Should block on second consecutive refusal');
+    });
+
+    it('should reset wait refusal counter on successful wait', () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      launcher.state = State.RUNNING_CLAUDE;
+      launcher.lastVerdict = Verdict.RUNNING;
+      launcher.waitRefusalCount = 1; // Had one refusal
+
+      // Turn with wait call
+      launcher.currentTurn = { actions: [{ tool: 'wait' }] };
+      launcher._checkTurnProgress();
+
+      assert.strictEqual(launcher.waitRefusalCount, 0, 'Should reset counter on wait');
+      assert.strictEqual(launcher.state, State.RUNNING_CLAUDE);
+    });
+
+    it('should not check wait refusal when verdict is not RUNNING', () => {
+      launcher = new Launcher({ goalDir: mockGoalDir });
+      launcher.state = State.RUNNING_CLAUDE;
+      launcher.lastVerdict = Verdict.DONE; // Not RUNNING
+      launcher.waitRefusalCount = 0;
+
+      // Turn with actions but no wait
+      launcher.currentTurn = { actions: [{ tool: 'inspect' }] };
+      launcher._checkTurnProgress();
+
+      assert.strictEqual(launcher.waitRefusalCount, 0, 'Should not increment when verdict is not RUNNING');
+      assert.strictEqual(launcher.state, State.RUNNING_CLAUDE);
     });
   });
 

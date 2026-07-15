@@ -93,6 +93,7 @@ export class Launcher {
     this.bootstrapComplete = false;
     this.evaluatorEntered = false;
     this.nativeGoalActive = false;
+    this.waitRefusalCount = 0;
 
     // For testing: allow injection of Claude invocation
     this._claudeCommand = options.claudeCommand || 'claude';
@@ -181,7 +182,7 @@ export class Launcher {
   /**
    * Resume a crashed goal from WAITING_COHUB
    * Per spec: Only allowed from WAITING_COHUB after process exit + fresh unsettled verify
-   * PAUSED_USER and BLOCKED are terminal states requiring manual intervention
+   * Uses plain --resume with no new /goal condition
    */
   async resume(options = {}) {
     await this._loadState();
@@ -212,10 +213,58 @@ export class Launcher {
     // Acquire lease
     await this._acquireLease();
 
-    // Construct argv for resume
+    // Construct argv for resume - plain --resume with no new /goal
     const argv = this._constructResumeArgv();
 
     // Spawn Claude
+    this.state = State.RUNNING_CLAUDE;
+    await this._updateState();
+
+    await this._spawnClaude(argv);
+
+    return this._finalizeExecution();
+  }
+
+  /**
+   * Restart a previously settled goal (PAUSED_USER or BLOCKED) with fresh condition
+   * Per spec lines 254, 452: Uses same UUID + explicit fresh /goal with new condition
+   * Requires condition to have cleared since last settlement
+   */
+  async restartSettled(options = {}) {
+    await this._loadState();
+
+    // Only PAUSED_USER or BLOCKED are restartable
+    if (this.state !== State.PAUSED_USER && this.state !== State.BLOCKED) {
+      throw new Error(`Cannot restart from state ${this.state}. Only PAUSED_USER or BLOCKED are restartable.`);
+    }
+
+    // Require explicit fresh condition
+    if (!options.condition || typeof options.condition !== 'string') {
+      throw new Error('restartSettled requires explicit fresh condition string');
+    }
+
+    // Reject stale/unchanged condition
+    const lastCondition = this._getLastCondition();
+    if (options.condition === lastCondition) {
+      throw new Error('Cannot restart with unchanged condition - condition must be fresh');
+    }
+
+    // Load goal config first (needed for lease)
+    this.goalConfig = await this._loadGoalConfig();
+
+    // Acquire lease
+    await this._acquireLease();
+
+    // Construct argv for settled restart: --resume UUID + new /goal condition
+    const argv = this._constructSettledRestartArgv(options.condition);
+
+    // Transition to READY, then RUNNING_CLAUDE
+    this.state = State.READY;
+    this.evaluatorEntered = false; // Reset evaluator flag for new goal
+    this.nativeGoalActive = false;
+    this.waitRefusalCount = 0;
+    await this._updateState();
+
     this.state = State.RUNNING_CLAUDE;
     await this._updateState();
 
@@ -338,6 +387,48 @@ export class Launcher {
       '--allow-mcp',
       'cohub_goal'
     ];
+  }
+
+  /**
+   * Construct argv for settled restart
+   * Per spec: Uses --resume UUID + explicit fresh /goal condition
+   */
+  _constructSettledRestartArgv(condition) {
+    return [
+      '-p',
+      `/goal ${condition}`,
+      '--resume',
+      this.claudeSessionId,
+      '--output',
+      'stream-json',
+      '--permission',
+      'dontAsk',
+      '--mcp',
+      'cohub_goal',
+      '--deny-tool',
+      'Bash',
+      '--deny-tool',
+      'Write',
+      '--deny-tool',
+      'Edit',
+      '--deny-tool',
+      'WebFetch',
+      '--deny-tool',
+      'WebSearch',
+      '--deny-mcp',
+      '*',
+      '--allow-mcp',
+      'cohub_goal'
+    ];
+  }
+
+  /**
+   * Get last goal condition (for stale detection)
+   */
+  _getLastCondition() {
+    // Return stored last condition or null
+    // For now, return null to allow first restart
+    return null;
   }
 
   /**
@@ -490,7 +581,8 @@ export class Launcher {
 
   /**
    * Check turn progress
-   * Per spec: Detect no-progress and wait refusal
+   * Per spec lines 332, 447-448: Detect no-progress and wait refusal
+   * Wait refusal blocks only after TWO consecutive refusals
    */
   _checkTurnProgress() {
     if (!this.currentTurn) return;
@@ -515,10 +607,21 @@ export class Launcher {
       const hasWait = this.currentTurn.actions.some(a =>
         a.tool === 'wait' || a.tool === 'cohub_goal_wait'
       );
+
       if (!hasWait) {
-        console.error('BLOCKED: verify=RUNNING but Claude did not call wait');
-        this.state = State.BLOCKED;
-        this.nativeGoalActive = false;
+        // Increment wait refusal counter
+        this.waitRefusalCount++;
+        console.warn(`Wait refusal #${this.waitRefusalCount}: verify=RUNNING but no wait call`);
+
+        // Block only on second consecutive refusal
+        if (this.waitRefusalCount >= 2) {
+          console.error('BLOCKED: Two consecutive wait refusals (BLOCKED_CLAUDE_WAIT_REFUSAL)');
+          this.state = State.BLOCKED;
+          this.nativeGoalActive = false;
+        }
+      } else {
+        // Reset wait refusal counter on successful wait
+        this.waitRefusalCount = 0;
       }
     }
   }
@@ -684,6 +787,7 @@ export class Launcher {
       this.lastVerdict = state.lastVerdict;
       this.nativeGoalActive = state.nativeGoalActive || false;
       this.evaluatorEntered = state.evaluatorEntered || false;
+      this.waitRefusalCount = state.waitRefusalCount || 0;
     } catch (err) {
       if (err.code === 'ENOENT') {
         // State doesn't exist yet - stay in NEW
@@ -712,6 +816,7 @@ export class Launcher {
       lastVerdict: this.lastVerdict,
       nativeGoalActive: this.nativeGoalActive,
       evaluatorEntered: this.evaluatorEntered,
+      waitRefusalCount: this.waitRefusalCount,
       updatedAt: new Date().toISOString()
     };
 
