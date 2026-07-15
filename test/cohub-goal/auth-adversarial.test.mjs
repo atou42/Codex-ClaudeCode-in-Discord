@@ -79,7 +79,7 @@ describe('CohubAuth adversarial acceptance', () => {
     });
   });
 
-  describe('strict JSON parser rejects duplicates', () => {
+  describe('strict JSON parser rejects duplicates at every depth', () => {
     it('should reject duplicate key at top level', () => {
       const now = Date.now();
       const dup = `{"schemaVersion":1,"schemaVersion":2,"env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2","resource":"https://api.talesofai","scope":"openid profile","tokenType":"Bearer","accessToken":"access123","refreshToken":"refresh456","accessTokenExpiresAt":${now + 3600000},"createdAt":${now},"updatedAt":${now}}`;
@@ -96,6 +96,82 @@ describe('CohubAuth adversarial acceptance', () => {
       fs.writeFileSync(authPath, dup, { mode: 0o600 });
       assert.throws(() => new CohubAuth(authPath), (err) => {
         return err.category === 'invalid_schema' && err.message.includes('duplicate');
+      });
+    });
+
+    it('should reject nested duplicate keys at depth 2', () => {
+      // This would pass old parser (only checked depth 1) but must fail now
+      const nested = `{"schemaVersion":1,"env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2","resource":"https://api.talesofai","scope":"openid profile","tokenType":"Bearer","accessToken":"secret1","refreshToken":"secret2","accessTokenExpiresAt":${Date.now() + 3600000},"createdAt":${Date.now()},"updatedAt":${Date.now()},"meta":{"a":1,"a":2}}`;
+      fs.writeFileSync(authPath, nested, { mode: 0o600 });
+      assert.throws(() => new CohubAuth(authPath), (err) => {
+        return err.category === 'invalid_schema' && err.message.includes('duplicate');
+      });
+    });
+
+    it('should reject nested duplicate keys at depth 3', () => {
+      const nested = `{"schemaVersion":1,"env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2","resource":"https://api.talesofai","scope":"openid profile","tokenType":"Bearer","accessToken":"secret1","refreshToken":"secret2","accessTokenExpiresAt":${Date.now() + 3600000},"createdAt":${Date.now()},"updatedAt":${Date.now()},"outer":{"inner":{"x":1,"x":2}}}`;
+      fs.writeFileSync(authPath, nested, { mode: 0o600 });
+      assert.throws(() => new CohubAuth(authPath), (err) => {
+        return err.category === 'invalid_schema' && err.message.includes('duplicate');
+      });
+    });
+
+    it('should reject duplicate keys in objects inside arrays', () => {
+      const arrayNested = `{"schemaVersion":1,"env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2","resource":"https://api.talesofai","scope":"openid profile","tokenType":"Bearer","accessToken":"secret1","refreshToken":"secret2","accessTokenExpiresAt":${Date.now() + 3600000},"createdAt":${Date.now()},"updatedAt":${Date.now()},"items":[{"id":1,"id":2}]}`;
+      fs.writeFileSync(authPath, arrayNested, { mode: 0o600 });
+      assert.throws(() => new CohubAuth(authPath), (err) => {
+        return err.category === 'invalid_schema' && err.message.includes('duplicate');
+      });
+    });
+
+    it('should reject escaped-equivalent nested keys', () => {
+      // "k\\u0065y" becomes "key", duplicate of "key"
+      const escaped = `{"schemaVersion":1,"env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2","resource":"https://api.talesofai","scope":"openid profile","tokenType":"Bearer","accessToken":"secret1","refreshToken":"secret2","accessTokenExpiresAt":${Date.now() + 3600000},"createdAt":${Date.now()},"updatedAt":${Date.now()},"data":{"k\\u0065y":1,"key":2}}`;
+      fs.writeFileSync(authPath, escaped, { mode: 0o600 });
+      assert.throws(() => new CohubAuth(authPath), (err) => {
+        return err.category === 'invalid_schema' && err.message.includes('duplicate');
+      });
+    });
+
+    it('should handle braces and colons inside string values correctly', () => {
+      // Valid JSON with string containing braces/colons should parse
+      const valid = validAuthRecord({ scope: 'openid {profile}:read' });
+      fs.writeFileSync(authPath, JSON.stringify(valid), { mode: 0o600 });
+      const cohubAuth = new CohubAuth(authPath);
+      assert.equal(cohubAuth.getAccessToken(), 'access-secret-xyz');
+    });
+
+    it('should handle escaped backslashes in string values', () => {
+      // Valid JSON with escaped backslashes
+      const valid = validAuthRecord({ scope: 'path\\\\to\\\\resource' });
+      fs.writeFileSync(authPath, JSON.stringify(valid), { mode: 0o600 });
+      const cohubAuth = new CohubAuth(authPath);
+      assert.equal(cohubAuth.getAccessToken(), 'access-secret-xyz');
+    });
+
+    it('should accept same key name in different sibling objects', () => {
+      // "id" in first object, "id" in second object is valid (different objects)
+      const valid = validAuthRecord();
+      // Add a valid nested structure where key appears in siblings
+      const validNested = {
+        ...valid,
+        meta: {
+          user: { id: 'user1' },
+          team: { id: 'team1' }
+        }
+      };
+      fs.writeFileSync(authPath, JSON.stringify(validNested), { mode: 0o600 });
+      // This will fail schema validation (unknown field 'meta'), testing parser only
+      assert.throws(() => new CohubAuth(authPath), (err) => {
+        return err.category === 'invalid_schema' && err.message.includes('unknown field');
+      });
+    });
+
+    it('should reject malformed truncated JSON', () => {
+      const truncated = `{"schemaVersion":1,"env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2"`;
+      fs.writeFileSync(authPath, truncated, { mode: 0o600 });
+      assert.throws(() => new CohubAuth(authPath), (err) => {
+        return err.category === 'invalid_schema' && err.message.includes('invalid JSON');
       });
     });
   });
@@ -279,6 +355,55 @@ describe('CohubAuth adversarial acceptance', () => {
   });
 
   describe('errors/stacks/logs zero secrets', () => {
+    it('should not include secrets when rejecting duplicate keys in auth file', () => {
+      const secret1 = 'ultra-secret-access-xyz-12345';
+      const secret2 = 'ultra-secret-refresh-abc-67890';
+      // Duplicate "env" key with secrets in the file
+      const dup = `{"schemaVersion":1,"env":"prod","env":"prod","issuer":"https://auth.neta.art","clientId":"f8d26cdlwx85b0e5l3om2","resource":"https://api.talesofai","scope":"openid profile","tokenType":"Bearer","accessToken":"${secret1}","refreshToken":"${secret2}","accessTokenExpiresAt":${Date.now() + 3600000},"createdAt":${Date.now()},"updatedAt":${Date.now()}}`;
+      fs.writeFileSync(authPath, dup, { mode: 0o600 });
+
+      let caught;
+      try {
+        new CohubAuth(authPath);
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.ok(caught.message.includes('duplicate'));
+      // Even though file contains secrets, the duplicate key error must not leak them
+      assert.ok(!caught.message.includes(secret1));
+      assert.ok(!caught.message.includes(secret2));
+      assert.ok(!(caught.stack || '').includes(secret1));
+      assert.ok(!(caught.stack || '').includes(secret2));
+    });
+
+    it('should not include secrets when rejecting duplicate keys in refresh response', async () => {
+      const auth = validAuthRecord();
+      fs.writeFileSync(authPath, JSON.stringify(auth), { mode: 0o600 });
+      const cohubAuth = new CohubAuth(authPath);
+
+      const newSecret = 'new-secret-token-xyz-999';
+      const mockFetch = async () => ({
+        ok: true,
+        status: 200,
+        text: async () => `{"access_token":"${newSecret}","access_token":"duplicate","token_type":"Bearer","expires_in":3600}`,
+      });
+
+      let caught;
+      try {
+        await cohubAuth.refresh({ fetch: mockFetch });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.equal(caught.category, 'bad_response');
+      assert.ok(caught.message.includes('duplicate'));
+      assert.ok(!caught.message.includes(newSecret));
+      assert.ok(!(caught.stack || '').includes(newSecret));
+    });
+
     it('should not include accessToken in network error message', async () => {
       const secret = 'ultra-secret-access-token-xyz';
       const auth = validAuthRecord({ accessToken: secret });
