@@ -30,11 +30,14 @@
     "postinstall": "node scripts/patch-discord-ws.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@neta-art/cohub": "2.11.1",
     "discord.js": "^14.19.3",
     "dotenv": "^16.6.1",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
-    "undici": "^6.21.3"
+    "undici": "6.27.0",
+    "ws": "8.21.1"
   }
 }
