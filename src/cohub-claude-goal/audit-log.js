@@ -11,7 +11,7 @@
  * unknown/missing fields, corrupt/truncated/unexpected/symlink files.
  * Never overwrite corrupt evidence.
  *
- * Query by event/action/Turn must reconstruct complete chain.
+ * Query by event/action/Turn must validate complete chain before returning.
  * Secret substrings absent from error/stdout/records.
  * Exact bytes preserved on failure.
  */
@@ -62,26 +62,25 @@ const VALID_TYPES = new Set([
 /**
  * Redact secrets from error messages using descriptor-safe zero-leak sanitizer.
  * Replace any potential secret substring with placeholder.
+ * Never access record properties directly - use sanitized copies only.
  */
-function sanitizeError(error, record) {
-  let message = error.message || String(error);
+function sanitizeError(error, recordSnapshot) {
+  let message = String(error?.message || error || '');
 
   // Don't sanitize validation errors - they don't contain user secrets
-  if (!record || !message.includes('[')) {
+  if (!recordSnapshot || !message.includes('[')) {
     return message;
   }
 
-  // Redact potential secret fields
+  // Work with frozen snapshot to avoid getter triggers
   const sensitiveFields = ['eventId', 'actionId', 'turnId', 'claudeSessionId'];
 
   for (const field of sensitiveFields) {
-    if (record && record[field] && typeof record[field] === 'string') {
-      const value = record[field];
-      if (value.length > 8) { // Only redact substantial values
-        // Replace any occurrence of the value
-        const regex = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
-        message = message.replace(regex, `[${field.toUpperCase()}]`);
-      }
+    const value = recordSnapshot[field];
+    if (value && typeof value === 'string' && value.length > 8) {
+      const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'g');
+      message = message.replace(regex, `[${field.toUpperCase()}]`);
     }
   }
 
@@ -101,7 +100,13 @@ function isPlainObject(value) {
 }
 
 function hasDangerousKeys(obj) {
-  for (const key of Object.keys(obj)) {
+  // Check both enumerable keys (Object.keys) and all own properties
+  const allKeys = new Set([
+    ...Object.keys(obj),
+    ...Object.getOwnPropertyNames(obj)
+  ]);
+
+  for (const key of allKeys) {
     if (DANGEROUS_KEYS.has(key)) {
       return true;
     }
@@ -149,6 +154,46 @@ function detectCircular(obj, seen = new WeakSet()) {
   }
 
   return false;
+}
+
+/**
+ * Recursively validate object structure for dangerous patterns.
+ * Checks all nested objects, not just top level.
+ */
+function validateObjectDeep(obj, path = 'record') {
+  if (!isPlainObject(obj)) {
+    throw new TypeError(`${path} must be a plain object`);
+  }
+
+  if (hasDangerousKeys(obj)) {
+    throw new TypeError(`${path} contains dangerous keys (__proto__, constructor, prototype)`);
+  }
+
+  if (hasAccessorProperties(obj)) {
+    throw new TypeError(`${path} contains accessor properties`);
+  }
+
+  if (hasSymbolKeys(obj)) {
+    throw new TypeError(`${path} contains symbol keys`);
+  }
+
+  // Recursively validate nested objects and arrays
+  for (const [key, value] of Object.entries(obj)) {
+    // Check the key itself isn't dangerous
+    if (DANGEROUS_KEYS.has(key)) {
+      throw new TypeError(`${path} contains dangerous key: ${key}`);
+    }
+
+    if (isPlainObject(value)) {
+      validateObjectDeep(value, `${path}.${key}`);
+    } else if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        if (isPlainObject(value[i])) {
+          validateObjectDeep(value[i], `${path}.${key}[${i}]`);
+        }
+      }
+    }
+  }
 }
 
 /**
@@ -243,6 +288,11 @@ function validateRecordStructure(record) {
       }
     }
   }
+
+  // Recursively validate metadata if present
+  if (record.metadata !== undefined) {
+    validateObjectDeep(record.metadata, 'metadata');
+  }
 }
 
 /**
@@ -270,7 +320,7 @@ function toCanonicalJSON(record) {
 
 /**
  * Read all valid audit records from directory, in sequence order.
- * Ignore temp files. Detect corruption but don't fix it.
+ * Ignore temp files and lock files. Detect corruption but don't fix it.
  */
 async function readAuditRecords(dir) {
   let entries;
@@ -287,8 +337,8 @@ async function readAuditRecords(dir) {
   const pattern = /^(\d{8})-([a-f0-9]{16,})\.json$/;
 
   for (const entry of entries) {
-    // Skip temp files
-    if (entry.startsWith('.audit-temp')) {
+    // Skip temp files and lock files
+    if (entry.startsWith('.audit-temp') || entry.startsWith('.audit-lock')) {
       continue;
     }
 
@@ -419,6 +469,35 @@ export async function validateAuditIntegrity(dir) {
 }
 
 /**
+ * Clean stale lock files that are older than timeout.
+ */
+async function cleanStaleLocks(dir, timeoutMs = 30000) {
+  try {
+    const entries = await readdir(dir);
+    const now = Date.now();
+
+    for (const entry of entries) {
+      if (!entry.startsWith('.audit-lock-')) {
+        continue;
+      }
+
+      const lockPath = join(dir, entry);
+      try {
+        const stats = await stat(lockPath);
+        const age = now - stats.mtimeMs;
+        if (age > timeoutMs) {
+          await unlink(lockPath).catch(() => {});
+        }
+      } catch (err) {
+        // Lock file disappeared, that's fine
+      }
+    }
+  } catch (err) {
+    // Directory doesn't exist or not accessible, that's fine
+  }
+}
+
+/**
  * Append audit record with atomic write, hash chain, and integrity checks.
  * Never overwrite corrupt evidence. Fail fast on any violation.
  * Retries on concurrent write conflicts.
@@ -426,9 +505,17 @@ export async function validateAuditIntegrity(dir) {
 export async function appendAuditRecord(dir, record, maxRetries = 5) {
   let lastError;
 
+  // Create snapshot for error sanitization (frozen to prevent getter triggers)
+  const recordSnapshot = Object.freeze({
+    eventId: record?.eventId,
+    actionId: record?.actionId,
+    turnId: record?.turnId,
+    claudeSessionId: record?.claudeSessionId
+  });
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      // Validate structure
+      // Validate structure first
       validateRecordStructure(record);
 
       // Check integrity before append
@@ -437,93 +524,102 @@ export async function appendAuditRecord(dir, record, maxRetries = 5) {
         throw new Error(`Cannot append to corrupt audit log: ${integrity.errors.join('; ')}`);
       }
 
-      // Scan directory for highest existing sequence number
-      // New sequence is always highestSeq + 1 to prevent filling gaps
-      const existingFiles = await readdir(dir).catch(() => []);
-      const seqPattern = /^(\d{8})-/;
-      let highestSeq = 0;
-      for (const file of existingFiles) {
-        const match = file.match(seqPattern);
-        if (match) {
-          const seq = parseInt(match[1], 10);
-          if (seq > highestSeq) {
-            highestSeq = seq;
-          }
-        }
-      }
-
-      // New sequence must be exactly highestSeq + 1
-      const nextSeq = highestSeq + 1;
-
-      // Build complete record without entryHash first
-      const recordWithoutHash = {
-        schemaVersion: SCHEMA_VERSION,
-        goalInstance: record.goalInstance,
-        goalVersion: record.goalVersion,
-        claudeSessionId: record.claudeSessionId,
-        type: record.type,
-        eventId: record.eventId ?? null,
-        actionId: record.actionId ?? null,
-        turnId: record.turnId ?? null,
-        beforeSnapshotHash: record.beforeSnapshotHash,
-        afterSnapshotHash: record.afterSnapshotHash,
-        decision: record.decision ?? null,
-        evidenceRefs: record.evidenceRefs ?? [],
-        timestamp: new Date().toISOString(),
-        seq: nextSeq,
-        previousEntryHash: integrity.headHash
-      };
-
-      // Add optional metadata if present
-      if (record.metadata !== undefined) {
-        if (!isPlainObject(record.metadata)) {
-          throw new TypeError('metadata must be a plain object');
-        }
-        if (hasDangerousKeys(record.metadata)) {
-          throw new TypeError('metadata contains dangerous keys');
-        }
-        recordWithoutHash.metadata = record.metadata;
-      }
-
-      // Serialize to canonical JSON without entryHash
-      const canonicalWithoutHash = toCanonicalJSON(recordWithoutHash);
-
-      // Compute entry hash from canonical form
-      const entryHash = sha256(canonicalWithoutHash);
-
-      // Add entryHash to complete record
-      const completeRecord = {
-        ...recordWithoutHash,
-        entryHash
-      };
-
-      // Serialize final record with hash
-      const final = toCanonicalJSON(completeRecord);
-
-      // Generate filename: 8-digit padded sequence + 16-char hash prefix
-      const seqPadded = String(completeRecord.seq).padStart(8, '0');
-      const hashPrefix = entryHash.slice(0, 16);
-      const filename = `${seqPadded}-${hashPrefix}.json`;
-      const finalPath = join(dir, filename);
-
-      // Atomic conflict check using filesystem as lock
-      // Create a lock file for this sequence number exclusively
+      // CRITICAL FIX: Take lock FIRST, then scan for sequence
+      // This ensures atomic sequence allocation
+      const lockSeq = integrity.recordCount + 1;
+      const seqPadded = String(lockSeq).padStart(8, '0');
       const lockPath = join(dir, `.audit-lock-${seqPadded}`);
+
       let lockFd;
       try {
         lockFd = await open(lockPath, 'wx');
       } catch (err) {
         if (err.code === 'EEXIST') {
-          // Another writer is working on this sequence - retry
-          const conflictErr = new Error(`Sequence ${completeRecord.seq} locked by concurrent writer`);
+          // Lock exists - try to clean if stale, then retry
+          await cleanStaleLocks(dir, 5000); // More aggressive: 5s timeout
+
+          // Try once more after cleanup
+          try {
+            lockFd = await open(lockPath, 'wx');
+          } catch (retryErr) {
+            if (retryErr.code === 'EEXIST') {
+              // Still locked - concurrent writer is active
+              const conflictErr = new Error(`Sequence ${lockSeq} locked by concurrent writer`);
+              conflictErr.code = 'EEXIST';
+              throw conflictErr;
+            }
+            throw retryErr;
+          }
+        } else {
+          throw err;
+        }
+      }
+
+      // We have the lock, now verify sequence is still valid
+      // Re-validate integrity under lock to ensure no race
+      try {
+        const integrityUnderLock = await validateAuditIntegrity(dir);
+        if (!integrityUnderLock.valid) {
+          throw new Error(`Cannot append to corrupt audit log: ${integrityUnderLock.errors.join('; ')}`);
+        }
+
+        if (integrityUnderLock.recordCount !== integrity.recordCount) {
+          // Another writer completed between our first check and lock acquisition
+          // Release lock and retry
+          await lockFd.close();
+          await unlink(lockPath).catch(() => {});
+          const conflictErr = new Error(`Concurrent write detected, retrying`);
           conflictErr.code = 'EEXIST';
           throw conflictErr;
         }
-        throw err;
-      }
 
-      // We have the lock, write the file
-      try {
+        const nextSeq = integrityUnderLock.recordCount + 1;
+
+        // Build complete record without entryHash first
+        const recordWithoutHash = {
+          schemaVersion: SCHEMA_VERSION,
+          goalInstance: record.goalInstance,
+          goalVersion: record.goalVersion,
+          claudeSessionId: record.claudeSessionId,
+          type: record.type,
+          eventId: record.eventId ?? null,
+          actionId: record.actionId ?? null,
+          turnId: record.turnId ?? null,
+          beforeSnapshotHash: record.beforeSnapshotHash,
+          afterSnapshotHash: record.afterSnapshotHash,
+          decision: record.decision ?? null,
+          evidenceRefs: record.evidenceRefs ?? [],
+          timestamp: new Date().toISOString(),
+          seq: nextSeq,
+          previousEntryHash: integrityUnderLock.headHash
+        };
+
+        // Add optional metadata if present (already validated)
+        if (record.metadata !== undefined) {
+          recordWithoutHash.metadata = record.metadata;
+        }
+
+        // Serialize to canonical JSON without entryHash
+        const canonicalWithoutHash = toCanonicalJSON(recordWithoutHash);
+
+        // Compute entry hash from canonical form
+        const entryHash = sha256(canonicalWithoutHash);
+
+        // Add entryHash to complete record
+        const completeRecord = {
+          ...recordWithoutHash,
+          entryHash
+        };
+
+        // Serialize final record with hash
+        const final = toCanonicalJSON(completeRecord);
+
+        // Generate filename: 8-digit padded sequence + 16-char hash prefix
+        const hashPrefix = entryHash.slice(0, 16);
+        const filename = `${seqPadded}-${hashPrefix}.json`;
+        const finalPath = join(dir, filename);
+
+        // Write file atomically
         let fd;
         try {
           fd = await open(finalPath, 'wx', 0o644);
@@ -544,61 +640,84 @@ export async function appendAuditRecord(dir, record, maxRetries = 5) {
         } finally {
           await fd.close();
         }
-      } finally {
-        // Release lock
+
+        // Fsync directory - propagate real failures
+        try {
+          const dirFd = await open(dir, 'r');
+          try {
+            await dirFd.sync();
+          } finally {
+            await dirFd.close();
+          }
+        } catch (err) {
+          // Only ignore errors that indicate fsync is not supported
+          // ENOTSUP, EOPNOTSUPP, EISDIR, EBADF (on some platforms)
+          const ignorableCodes = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EISDIR', 'EBADF', 'EINVAL']);
+          if (!ignorableCodes.has(err.code)) {
+            // Real error like ENOSPC, EIO - propagate it
+            throw new Error(`Directory fsync failed: ${err.message}`);
+          }
+          // Otherwise, directory fsync not supported - that's OK
+        }
+
+        // Success - release lock
         await lockFd.close();
         await unlink(lockPath).catch(() => {});
-      }
 
-      // Fsync directory (best effort - not all filesystems support)
-      try {
-        const dirFd = await open(dir, 'r');
-        try {
-          await dirFd.sync();
-        } finally {
-          await dirFd.close();
-        }
-      } catch (err) {
-        // Directory fsync not supported on all platforms - continue
+        return {
+          seq: completeRecord.seq,
+          entryHash,
+          filePath: finalPath
+        };
+      } catch (error) {
+        // Release lock on any error in the locked section
+        await lockFd.close();
+        await unlink(lockPath).catch(() => {});
+        throw error;
       }
-
-      return {
-        seq: completeRecord.seq,
-        entryHash,
-        filePath: finalPath
-      };
     } catch (error) {
       // Validation errors (TypeError) should not be retried
       if (error instanceof TypeError) {
         throw error;
       }
 
-      // If it's a file already exists error, retry
+      // If it's a conflict error, retry
       if (error.code === 'EEXIST' && attempt < maxRetries - 1) {
         lastError = error;
         // Small random delay to reduce contention
-        await new Promise(resolve => setTimeout(resolve, Math.random() * 10));
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 10 + 5));
         continue;
       }
 
       // For other errors or final retry, sanitize and throw
-      const sanitized = sanitizeError(error, record);
-      const ErrorClass = error.constructor || Error;
-      const err = new ErrorClass(sanitized);
-      err.code = error.code;
+      const sanitized = sanitizeError(error, recordSnapshot);
+      // SECURITY FIX: Never use error.constructor directly
+      const ErrorConstructor = (error instanceof TypeError) ? TypeError : Error;
+      const err = new ErrorConstructor(sanitized);
+      if (error.code) {
+        err.code = error.code;
+      }
       throw err;
     }
   }
 
   // If we exhausted retries
-  throw lastError || new Error('Failed to append record after retries');
+  const sanitized = sanitizeError(lastError, recordSnapshot);
+  throw new Error(`Failed to append record after ${maxRetries} retries: ${sanitized}`);
 }
 
 /**
  * Query audit log by criteria: eventId, actionId, turnId, type.
  * Returns all matching records in sequence order.
+ * MUST validate integrity before returning.
  */
 export async function queryAuditLog(dir, criteria) {
+  // CRITICAL FIX: Validate integrity before returning any data
+  const integrity = await validateAuditIntegrity(dir);
+  if (!integrity.valid) {
+    throw new Error(`Cannot query corrupt audit log: ${integrity.errors.join('; ')}`);
+  }
+
   const records = await readAuditRecords(dir);
 
   const results = records
@@ -624,8 +743,15 @@ export async function queryAuditLog(dir, criteria) {
 
 /**
  * Read entire audit log in sequence order.
+ * MUST validate integrity before returning.
  */
 export async function readAuditLog(dir) {
+  // CRITICAL FIX: Validate integrity before returning any data
+  const integrity = await validateAuditIntegrity(dir);
+  if (!integrity.valid) {
+    throw new Error(`Cannot read corrupt audit log: ${integrity.errors.join('; ')}`);
+  }
+
   const records = await readAuditRecords(dir);
   return records.map(r => r.record);
 }
