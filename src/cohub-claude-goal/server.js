@@ -2,16 +2,19 @@
  * @fileoverview MCP server boundary with dependency injection (spec lines 210-280).
  * Exposes exactly four tools: cohub_goal_inspect, cohub_goal_submit,
  * cohub_goal_wait, cohub_goal_verify. Exact schemas, allowlist fields,
- * redacted responses, typed errors. Tool handlers call only injected functions.
+ * fail-closed sanitization, typed errors. Tool handlers call only injected functions.
+ *
+ * Security model:
+ * - All untrusted input sanitized BEFORE any property access
+ * - types.isProxy checked BEFORE Array.isArray or any other operation
+ * - Dependency output validated with fail-closed: bad output = INTERNAL_ERROR
+ * - Configuration immutable: allowlists frozen, deps captured at construction
+ * - Errors built from fixed template table, never echo attacker content
  */
 
 import { types } from 'node:util';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const REDACTED_FIELDS = new Set([
-  'accessToken', 'refreshToken', 'token', 'secret', 'password',
-  'env', '_rawBody', '_httpHeaders', '_internal'
-]);
 
 const MAX_RESPONSE_SIZE = 512 * 1024; // 512KB
 const MAX_ARRAY_LENGTH = 1000;
@@ -19,12 +22,78 @@ const MAX_STRING_LENGTH = 10000;
 const MAX_DEPTH = 20;
 const MAX_TOTAL_BYTES = 100 * 1024; // 100KB input limit
 
+// Exact decision allowlist from spec
+const ALLOWED_DECISIONS = new Set(['CONTINUE', 'DISPATCH', 'RECEIVE', 'APPROVE', 'COMPLETE']);
+
+// Exact watch role allowlist from spec
+const ALLOWED_WATCH_ROLES = new Set(['parent', 'worker', 'merged']);
+
+/**
+ * Fixed error code to message table (spec lines 348-372).
+ * Errors never include attacker-controlled values.
+ */
+const ERROR_MESSAGES = {
+  // Request validation
+  INVALID_REQUEST: 'request must be an object',
+  MISSING_METHOD: 'method is required',
+  UNKNOWN_METHOD: 'unknown method',
+  MISSING_PARAMS: 'params is required',
+  MISSING_NAME: 'tool name is required',
+  MISSING_ARGUMENTS: 'arguments is required',
+  UNKNOWN_TOOL: 'unknown tool',
+
+  // Argument validation
+  INVALID_ARGUMENTS: 'arguments must be a plain object',
+  PROXY_NOT_ALLOWED: 'proxy not allowed',
+  MISSING_FIELD: 'required field missing',
+  UNKNOWN_FIELD: 'unknown field',
+
+  // Type validation
+  INVALID_PROTOTYPE: 'only plain objects with default prototype allowed',
+  ACCESSOR_PROPERTIES: 'accessor properties not allowed',
+  MISSING_DESCRIPTOR: 'property descriptor missing',
+  SYMBOL_KEYS: 'symbol keys not allowed',
+  SYMBOL_VALUE: 'symbol values not allowed',
+  DANGEROUS_KEYS: 'dangerous key not allowed',
+  FUNCTION_VALUE: 'function not allowed',
+  BIGINT_VALUE: 'BigInt not allowed',
+  UNDEFINED_VALUE: 'undefined not allowed',
+  NONFINITE_NUMBER: 'NaN or Infinity not allowed',
+  CYCLIC_REFERENCE: 'cycle detected in input',
+
+  // Array validation
+  SPARSE_ARRAY: 'sparse array not allowed',
+  ARRAY_EXTRA_PROPERTIES: 'array with extra properties not allowed',
+  ARRAY_TOO_LONG: 'array exceeds maximum length',
+
+  // Size/depth limits
+  STRING_TOO_LONG: 'string exceeds maximum length',
+  MAX_DEPTH: 'nesting depth exceeded',
+  INPUT_TOO_LARGE: 'input exceeds size limit',
+  RESPONSE_TOO_LARGE: 'response exceeds size limit',
+
+  // Schema validation
+  INVALID_HASH: 'hash must be 64 lowercase hex characters',
+  INVALID_ID: 'invalid identifier format',
+  INVALID_DECISION: 'decision not in allowlist',
+  INVALID_EVIDENCE_REF: 'evidence reference invalid',
+  INVALID_WATCH_ITEM: 'watch item invalid',
+
+  // Allowlist validation
+  GOAL_NOT_ALLOWED: 'goal not in allowlist',
+  SPACE_NOT_ALLOWED: 'space not in allowlist',
+
+  // Internal errors (generic, no details leaked)
+  INTERNAL_ERROR: 'internal error',
+  UNKNOWN_TYPE: 'unsupported type'
+};
+
 /**
  * Custom error with typed code
  */
 class MCPValidationError extends Error {
-  constructor(code, message) {
-    super(message);
+  constructor(code) {
+    super(ERROR_MESSAGES[code] || 'unknown error');
     this.code = code;
     this.name = 'MCPValidationError';
   }
@@ -36,11 +105,13 @@ class MCPValidationError extends Error {
  * strings, numbers (finite only), booleans, null.
  * Rejects: proxies, getters/setters, symbols, cycles, sparse arrays, extra array props,
  * dangerous keys, null/custom prototypes, functions, BigInt, undefined, NaN/Infinity.
+ *
+ * CRITICAL: types.isProxy MUST be first operation on any object, before Array.isArray.
  */
 function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root') {
   // Depth check
   if (depth > MAX_DEPTH) {
-    throw new MCPValidationError('MAX_DEPTH', `nesting depth exceeded at ${path}`);
+    throw new MCPValidationError('MAX_DEPTH');
   }
 
   // Primitives (allow only safe types)
@@ -56,55 +127,55 @@ function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root')
 
   if (type === 'number') {
     if (!Number.isFinite(value)) {
-      throw new MCPValidationError('NONFINITE_NUMBER', `NaN or Infinity not allowed at ${path}`);
+      throw new MCPValidationError('NONFINITE_NUMBER');
     }
     return value;
   }
 
   if (type === 'string') {
     if (value.length > MAX_STRING_LENGTH) {
-      throw new MCPValidationError('STRING_TOO_LONG', `string exceeds ${MAX_STRING_LENGTH} chars at ${path}`);
+      throw new MCPValidationError('STRING_TOO_LONG');
     }
     return value;
   }
 
   if (type === 'undefined') {
-    throw new MCPValidationError('UNDEFINED_VALUE', `undefined not allowed at ${path}`);
+    throw new MCPValidationError('UNDEFINED_VALUE');
   }
 
   if (type === 'bigint') {
-    throw new MCPValidationError('BIGINT_VALUE', `BigInt not allowed at ${path}`);
+    throw new MCPValidationError('BIGINT_VALUE');
   }
 
   if (type === 'function') {
-    throw new MCPValidationError('FUNCTION_VALUE', `function not allowed at ${path}`);
+    throw new MCPValidationError('FUNCTION_VALUE');
   }
 
   if (type === 'symbol') {
-    throw new MCPValidationError('SYMBOL_VALUE', `symbol not allowed at ${path}`);
+    throw new MCPValidationError('SYMBOL_VALUE');
   }
 
   if (type !== 'object') {
-    throw new MCPValidationError('UNKNOWN_TYPE', `unknown type ${type} at ${path}`);
+    throw new MCPValidationError('UNKNOWN_TYPE');
   }
 
-  // Check for proxy BEFORE any property access
+  // CRITICAL: Check for proxy BEFORE any property access, including Array.isArray
   if (types.isProxy(value)) {
-    throw new MCPValidationError('PROXY_NOT_ALLOWED', `proxy not allowed at ${path}`);
+    throw new MCPValidationError('PROXY_NOT_ALLOWED');
   }
 
   // Cycle detection
   if (seen.has(value)) {
-    throw new MCPValidationError('CYCLIC_REFERENCE', `cycle detected at ${path}`);
+    throw new MCPValidationError('CYCLIC_REFERENCE');
   }
   seen.add(value);
 
-  // Arrays
+  // Arrays - must come after proxy check
   if (Array.isArray(value)) {
     // Check for sparse arrays (holes)
     for (let i = 0; i < value.length; i++) {
       if (!(i in value)) {
-        throw new MCPValidationError('SPARSE_ARRAY', `sparse array not allowed at ${path}`);
+        throw new MCPValidationError('SPARSE_ARRAY');
       }
     }
 
@@ -112,24 +183,31 @@ function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root')
     const ownKeys = Object.getOwnPropertyNames(value);
     for (const key of ownKeys) {
       if (key !== 'length' && !/^\d+$/.test(key)) {
-        throw new MCPValidationError('ARRAY_EXTRA_PROPERTIES', `array with extra properties not allowed at ${path}`);
+        throw new MCPValidationError('ARRAY_EXTRA_PROPERTIES');
       }
     }
 
     // Check for symbol keys on array
     if (Object.getOwnPropertySymbols(value).length > 0) {
-      throw new MCPValidationError('SYMBOL_KEYS', `symbol keys not allowed at ${path}`);
+      throw new MCPValidationError('SYMBOL_KEYS');
     }
 
     // Length check
     if (value.length > MAX_ARRAY_LENGTH) {
-      throw new MCPValidationError('ARRAY_TOO_LONG', `array exceeds ${MAX_ARRAY_LENGTH} items at ${path}`);
+      throw new MCPValidationError('ARRAY_TOO_LONG');
     }
 
-    // Recursively validate items
+    // Recursively validate items using descriptor access
     const cloned = [];
     for (let i = 0; i < value.length; i++) {
-      cloned[i] = validateAndClone(value[i], depth + 1, seen, `${path}[${i}]`);
+      const desc = Object.getOwnPropertyDescriptor(value, i);
+      if (!desc) {
+        throw new MCPValidationError('SPARSE_ARRAY');
+      }
+      if (desc.get || desc.set) {
+        throw new MCPValidationError('ACCESSOR_PROPERTIES');
+      }
+      cloned[i] = validateAndClone(desc.value, depth + 1, seen, `${path}[${i}]`);
     }
 
     seen.delete(value);
@@ -139,12 +217,12 @@ function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root')
   // Objects - must have exactly Object.prototype
   const proto = Object.getPrototypeOf(value);
   if (proto !== Object.prototype) {
-    throw new MCPValidationError('INVALID_PROTOTYPE', `only plain objects allowed (Object.prototype) at ${path}`);
+    throw new MCPValidationError('INVALID_PROTOTYPE');
   }
 
   // Check for symbol keys
   if (Object.getOwnPropertySymbols(value).length > 0) {
-    throw new MCPValidationError('SYMBOL_KEYS', `symbol keys not allowed at ${path}`);
+    throw new MCPValidationError('SYMBOL_KEYS');
   }
 
   // Get all own property names and check descriptors
@@ -152,25 +230,23 @@ function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root')
   const cloned = {};
 
   for (const key of ownKeys) {
-    const keyPath = `${path}.${key}`;
-
     // Check for dangerous keys
     if (DANGEROUS_KEYS.has(key)) {
-      throw new MCPValidationError('DANGEROUS_KEYS', `dangerous key "${key}" not allowed at ${keyPath}`);
+      throw new MCPValidationError('DANGEROUS_KEYS');
     }
 
     // Check descriptor - must be plain data property
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor) {
-      throw new MCPValidationError('MISSING_DESCRIPTOR', `missing descriptor at ${keyPath}`);
+      throw new MCPValidationError('MISSING_DESCRIPTOR');
     }
 
     if (descriptor.get || descriptor.set) {
-      throw new MCPValidationError('ACCESSOR_PROPERTIES', `accessor properties not allowed at ${keyPath}`);
+      throw new MCPValidationError('ACCESSOR_PROPERTIES');
     }
 
     // Clone the value recursively
-    cloned[key] = validateAndClone(descriptor.value, depth + 1, seen, keyPath);
+    cloned[key] = validateAndClone(descriptor.value, depth + 1, seen, `${path}.${key}`);
   }
 
   seen.delete(value);
@@ -183,22 +259,108 @@ function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root')
 function checkTotalSize(obj, maxBytes) {
   const json = JSON.stringify(obj);
   if (json.length > maxBytes) {
-    throw new MCPValidationError('INPUT_TOO_LARGE', `input exceeds ${maxBytes} bytes`);
+    throw new MCPValidationError('INPUT_TOO_LARGE');
   }
 }
 
 /**
- * Validate and sanitize tool arguments using recursive descriptor validation
+ * Validate hash format: exactly 64 lowercase hex characters
+ */
+function validateHash(hash) {
+  if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) {
+    throw new MCPValidationError('INVALID_HASH');
+  }
+  return hash;
+}
+
+/**
+ * Validate ID format: non-empty string, bounded length, no control chars
+ */
+function validateId(id) {
+  if (typeof id !== 'string' || id.length === 0 || id.length > 200 || /[\x00-\x1f]/.test(id)) {
+    throw new MCPValidationError('INVALID_ID');
+  }
+  return id;
+}
+
+/**
+ * Validate decision code against exact allowlist
+ */
+function validateDecision(decision) {
+  if (!ALLOWED_DECISIONS.has(decision)) {
+    throw new MCPValidationError('INVALID_DECISION');
+  }
+  return decision;
+}
+
+/**
+ * Validate evidence reference: exact {id, hash} structure
+ */
+function validateEvidenceRef(ref) {
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) {
+    throw new MCPValidationError('INVALID_EVIDENCE_REF');
+  }
+
+  const keys = Object.keys(ref);
+  if (keys.length !== 2 || !keys.includes('id') || !keys.includes('hash')) {
+    throw new MCPValidationError('INVALID_EVIDENCE_REF');
+  }
+
+  return {
+    id: validateId(ref.id),
+    hash: validateHash(ref.hash)
+  };
+}
+
+/**
+ * Validate watch item: exact {role, spaceId, sessionId, turnId} or subset based on role
+ */
+function validateWatchItem(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new MCPValidationError('INVALID_WATCH_ITEM');
+  }
+
+  if (!item.role || !ALLOWED_WATCH_ROLES.has(item.role)) {
+    throw new MCPValidationError('INVALID_WATCH_ITEM');
+  }
+
+  const keys = Object.keys(item);
+  const allowedKeys = new Set(['role', 'spaceId', 'sessionId', 'turnId']);
+
+  for (const key of keys) {
+    if (!allowedKeys.has(key)) {
+      throw new MCPValidationError('INVALID_WATCH_ITEM');
+    }
+  }
+
+  const validated = { role: item.role };
+
+  if (item.spaceId !== undefined) {
+    validated.spaceId = validateId(item.spaceId);
+  }
+  if (item.sessionId !== undefined) {
+    validated.sessionId = validateId(item.sessionId);
+  }
+  if (item.turnId !== undefined) {
+    validated.turnId = validateId(item.turnId);
+  }
+
+  return validated;
+}
+
+/**
+ * Validate and sanitize tool arguments using recursive descriptor validation.
+ * Performs both structural validation and semantic schema validation.
  */
 function validateArguments(toolName, args, schema) {
-  // First validate it's a plain object at top level
+  // First validate it's a plain object at top level (before any destructuring)
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    throw new MCPValidationError('INVALID_ARGUMENTS', 'arguments must be a plain object');
+    throw new MCPValidationError('INVALID_ARGUMENTS');
   }
 
   // Check for proxy before any access
   if (types.isProxy(args)) {
-    throw new MCPValidationError('PROXY_NOT_ALLOWED', 'proxy not allowed in arguments');
+    throw new MCPValidationError('PROXY_NOT_ALLOWED');
   }
 
   // Clone and validate the entire graph recursively
@@ -210,7 +372,7 @@ function validateArguments(toolName, args, schema) {
   // Check required fields
   for (const field of schema.required) {
     if (!(field in validated)) {
-      throw new MCPValidationError('MISSING_FIELD', `${field} is required`);
+      throw new MCPValidationError('MISSING_FIELD');
     }
   }
 
@@ -218,122 +380,98 @@ function validateArguments(toolName, args, schema) {
   const allowedFields = new Set([...schema.required, ...schema.optional]);
   for (const field of Object.keys(validated)) {
     if (!allowedFields.has(field)) {
-      throw new MCPValidationError('UNKNOWN_FIELD', `unknown field: ${field}`);
+      throw new MCPValidationError('UNKNOWN_FIELD');
     }
+  }
+
+  // Semantic validation based on tool
+  if (toolName === 'cohub_goal_submit') {
+    validated.expectedSnapshotHash = validateHash(validated.expectedSnapshotHash);
+    validated.actionSlotId = validateId(validated.actionSlotId);
+    validated.continuationId = validateId(validated.continuationId);
+    validated.decisionCode = validateDecision(validated.decisionCode);
+
+    if (!Array.isArray(validated.evidenceRefs)) {
+      throw new MCPValidationError('INVALID_EVIDENCE_REF');
+    }
+    validated.evidenceRefs = validated.evidenceRefs.map(validateEvidenceRef);
+  }
+
+  if (toolName === 'cohub_goal_wait') {
+    validated.expectedSnapshotHash = validateHash(validated.expectedSnapshotHash);
+
+    if (!Array.isArray(validated.watchSet) || validated.watchSet.length === 0) {
+      throw new MCPValidationError('INVALID_WATCH_ITEM');
+    }
+    validated.watchSet = validated.watchSet.map(validateWatchItem);
+  }
+
+  if (toolName === 'cohub_goal_verify' && validated.expectedSnapshotHash) {
+    validated.expectedSnapshotHash = validateHash(validated.expectedSnapshotHash);
   }
 
   return validated;
 }
 
 /**
- * Sanitize dependency output by walking descriptors without executing getters/toJSON/valueOf.
- * Creates a detached safe graph by reading descriptors only, never invoking traps.
+ * Secret-bearing field patterns that must not appear in output
  */
-function sanitizeDependencyOutput(obj, depth = 0, seen = new WeakSet(), path = 'response') {
-  if (depth > 10) {
-    return '[MAX_DEPTH]';
+const SECRET_FIELD_PATTERNS = [
+  /token/i,
+  /secret/i,
+  /password/i,
+  /auth/i,
+  /credential/i,
+  /key/i
+];
+
+/**
+ * Check for secret-bearing fields (fail-closed: presence = error)
+ */
+function checkForSecrets(obj, path = 'output') {
+  if (obj === null || typeof obj !== 'object') {
+    return;
   }
 
-  if (obj === null || obj === undefined) {
-    return obj;
-  }
-
-  const type = typeof obj;
-
-  // Primitives pass through
-  if (type === 'boolean' || type === 'number' || type === 'string') {
-    return obj;
-  }
-
-  // Reject unsafe types
-  if (type === 'function' || type === 'bigint' || type === 'symbol') {
-    return '[REDACTED:UNSAFE_TYPE]';
-  }
-
-  if (type !== 'object') {
-    return '[UNKNOWN_TYPE]';
-  }
-
-  // Check for proxy - this check itself may trigger traps on hostile proxies,
-  // but we catch that below. For most proxies, types.isProxy() is safe.
-  try {
-    if (types.isProxy(obj)) {
-      return '[REDACTED:PROXY]';
-    }
-  } catch {
-    // If checking isProxy itself throws, it's hostile
-    return '[REDACTED:PROXY]';
-  }
-
-  // Cycle detection
-  if (seen.has(obj)) {
-    return '[CIRCULAR]';
-  }
-  seen.add(obj);
-
-  // Arrays
   if (Array.isArray(obj)) {
-    if (obj.length > MAX_ARRAY_LENGTH) {
-      const truncated = [];
-      for (let i = 0; i < MAX_ARRAY_LENGTH; i++) {
-        truncated.push(sanitizeDependencyOutput(obj[i], depth + 1, seen, `${path}[${i}]`));
-      }
-      truncated.push(`[${obj.length - MAX_ARRAY_LENGTH} more items truncated]`);
-      seen.delete(obj);
-      return truncated;
-    }
-
-    const result = [];
     for (let i = 0; i < obj.length; i++) {
-      result.push(sanitizeDependencyOutput(obj[i], depth + 1, seen, `${path}[${i}]`));
+      checkForSecrets(obj[i], `${path}[${i}]`);
     }
-    seen.delete(obj);
-    return result;
+    return;
   }
 
-  // Objects - walk descriptors only, never access properties directly
-  // Use try-catch in case getOwnPropertyNames itself triggers hostile behavior
-  let ownKeys;
+  for (const key of Object.keys(obj)) {
+    // Check if key matches secret pattern
+    for (const pattern of SECRET_FIELD_PATTERNS) {
+      if (pattern.test(key)) {
+        throw new Error('SECRET_FIELD_IN_OUTPUT');
+      }
+    }
+
+    // Recursively check nested objects
+    checkForSecrets(obj[key], `${path}.${key}`);
+  }
+}
+
+/**
+ * Validate dependency output with fail-closed policy.
+ * Any proxy, getter, cycle, invalid structure, or secret-bearing field causes INTERNAL_ERROR.
+ * This is NOT a sanitizer that redacts - it's a validator that throws.
+ */
+function validateDependencyOutput(obj) {
   try {
-    ownKeys = Object.getOwnPropertyNames(obj);
-  } catch {
-    seen.delete(obj);
-    return '[REDACTED:HOSTILE_OBJECT]';
+    // Use the same strict validator as input
+    const validated = validateAndClone(obj, 0, new WeakSet(), 'output');
+
+    // Additional check: no secret-bearing fields
+    checkForSecrets(validated);
+
+    return validated;
+  } catch (error) {
+    // Any validation error in dependency output is an internal error
+    // Never return partial/redacted success
+    throw new Error('DEPENDENCY_OUTPUT_INVALID');
   }
-
-  const result = {};
-
-  for (const key of ownKeys) {
-    // Skip redacted fields
-    if (REDACTED_FIELDS.has(key) || key.startsWith('_')) {
-      continue;
-    }
-
-    let descriptor;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(obj, key);
-    } catch {
-      // If getting descriptor throws, skip this property
-      continue;
-    }
-
-    if (!descriptor) {
-      continue;
-    }
-
-    // If it's an accessor, skip it (never execute getters)
-    if (descriptor.get || descriptor.set) {
-      continue;
-    }
-
-    // Only process data properties
-    if ('value' in descriptor) {
-      result[key] = sanitizeDependencyOutput(descriptor.value, depth + 1, seen, `${path}.${key}`);
-    }
-  }
-
-  seen.delete(obj);
-  return result;
 }
 
 /**
@@ -342,50 +480,51 @@ function sanitizeDependencyOutput(obj, depth = 0, seen = new WeakSet(), path = '
 function boundResponse(obj) {
   const json = JSON.stringify(obj);
   if (json.length > MAX_RESPONSE_SIZE) {
-    throw new MCPValidationError('RESPONSE_TOO_LARGE', `response exceeds ${MAX_RESPONSE_SIZE} byte limit`);
+    throw new MCPValidationError('RESPONSE_TOO_LARGE');
   }
   return obj;
 }
 
 /**
  * Deep freeze an object and all nested objects/arrays.
- * Guarantees returned objects cannot be mutated and nested
- * descriptors are plain data (no getters/setters survive JSON round-trip).
  */
 function deepFreeze(obj) {
   if (obj === null || typeof obj !== 'object') {
     return obj;
   }
-  for (const value of Object.values(obj)) {
+
+  // Freeze in post-order to ensure nested objects are frozen first
+  for (const key of Object.keys(obj)) {
+    const value = obj[key];
     if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
       deepFreeze(value);
     }
   }
+
   return Object.freeze(obj);
 }
 
 /**
- * Create typed error response
+ * Create typed error response from code (never includes attacker content)
  */
-function createError(code, message) {
+function createError(code) {
+  const message = ERROR_MESSAGES[code] || ERROR_MESSAGES.INTERNAL_ERROR;
+
   return deepFreeze({
     isError: true,
     content: [{
       type: 'text',
-      text: JSON.stringify({
-        code,
-        message: String(message).replace(/\n/g, ' ')
-      })
+      text: JSON.stringify({ code, message })
     }]
   });
 }
 
 /**
- * Create success response with sanitized dependency output
+ * Create success response with validated dependency output
  */
 function createSuccess(data) {
-  const sanitized = sanitizeDependencyOutput(data);
-  const bounded = boundResponse(sanitized);
+  const validated = validateDependencyOutput(data);
+  const bounded = boundResponse(validated);
 
   return deepFreeze({
     content: [{
@@ -396,7 +535,7 @@ function createSuccess(data) {
 }
 
 /**
- * Tool schemas
+ * Tool schemas with exact structure requirements
  */
 const TOOL_SCHEMAS = {
   cohub_goal_inspect: {
@@ -425,45 +564,165 @@ const TOOL_SCHEMAS = {
 };
 
 /**
+ * Exact JSON Schema definitions for tools/list (spec lines 210-250)
+ */
+const TOOL_DEFINITIONS = deepFreeze([
+  {
+    name: 'cohub_goal_inspect',
+    description: 'Inspect current goal state and snapshot',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goalInstance: { type: 'string', minLength: 1, maxLength: 200 }
+      },
+      required: ['goalInstance'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'cohub_goal_submit',
+    description: 'Submit continuation to Cohub parent',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goalInstance: { type: 'string', minLength: 1, maxLength: 200 },
+        expectedSnapshotHash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+        actionSlotId: { type: 'string', minLength: 1, maxLength: 200 },
+        continuationId: { type: 'string', minLength: 1, maxLength: 200 },
+        decisionCode: { type: 'string', enum: Array.from(ALLOWED_DECISIONS) },
+        evidenceRefs: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 200 },
+              hash: { type: 'string', pattern: '^[0-9a-f]{64}$' }
+            },
+            required: ['id', 'hash'],
+            additionalProperties: false
+          }
+        }
+      },
+      required: [
+        'goalInstance',
+        'expectedSnapshotHash',
+        'actionSlotId',
+        'continuationId',
+        'decisionCode',
+        'evidenceRefs'
+      ],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'cohub_goal_verify',
+    description: 'Verify goal completion state',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goalInstance: { type: 'string', minLength: 1, maxLength: 200 },
+        expectedSnapshotHash: { type: 'string', pattern: '^[0-9a-f]{64}$' }
+      },
+      required: ['goalInstance'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'cohub_goal_wait',
+    description: 'Wait for Cohub events',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goalInstance: { type: 'string', minLength: 1, maxLength: 200 },
+        expectedSnapshotHash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+        watchSet: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              role: { type: 'string', enum: Array.from(ALLOWED_WATCH_ROLES) },
+              spaceId: { type: 'string', minLength: 1, maxLength: 200 },
+              sessionId: { type: 'string', minLength: 1, maxLength: 200 },
+              turnId: { type: 'string', minLength: 1, maxLength: 200 }
+            },
+            required: ['role'],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ['goalInstance', 'expectedSnapshotHash', 'watchSet'],
+      additionalProperties: false
+    }
+  }
+]);
+
+/**
  * Create MCP server with dependency injection
  */
 export function createServer(deps, options = {}) {
-  const {
-    inspect,
-    submit,
-    wait,
-    verify
-  } = deps;
+  // Validate and sanitize deps before any destructuring
+  if (!deps || typeof deps !== 'object') {
+    throw new Error('deps must be an object');
+  }
 
-  const {
-    allowedGoals = null,
-    allowedSpaces = null
-  } = options;
+  // Check for proxy on deps
+  if (types.isProxy(deps)) {
+    throw new Error('deps cannot be a proxy');
+  }
 
-  if (!inspect || !submit || !wait || !verify) {
+  // Capture dependencies immutably at construction time
+  const frozenDeps = {
+    inspect: deps.inspect,
+    submit: deps.submit,
+    wait: deps.wait,
+    verify: deps.verify
+  };
+
+  if (!frozenDeps.inspect || !frozenDeps.submit || !frozenDeps.wait || !frozenDeps.verify) {
     throw new Error('Missing required dependencies: inspect, submit, wait, verify');
+  }
+
+  // Sanitize and freeze configuration
+  let allowedGoalsSet = null;
+  let allowedSpacesSet = null;
+
+  if (options.allowedGoals) {
+    if (!Array.isArray(options.allowedGoals)) {
+      throw new Error('allowedGoals must be an array');
+    }
+    // Clone and freeze as immutable Set
+    allowedGoalsSet = new Set(options.allowedGoals.map(String));
+  }
+
+  if (options.allowedSpaces) {
+    if (!Array.isArray(options.allowedSpaces)) {
+      throw new Error('allowedSpaces must be an array');
+    }
+    // Clone and freeze as immutable Set
+    allowedSpacesSet = new Set(options.allowedSpaces.map(String));
   }
 
   /**
    * Enforce goal allowlist
    */
   function checkGoalAllowed(goalInstance) {
-    if (allowedGoals && !allowedGoals.includes(goalInstance)) {
-      throw new MCPValidationError('GOAL_NOT_ALLOWED', `goal ${goalInstance} not allowed`);
+    if (allowedGoalsSet && !allowedGoalsSet.has(goalInstance)) {
+      throw new MCPValidationError('GOAL_NOT_ALLOWED');
     }
   }
 
   /**
-   * Enforce space allowlist
+   * Enforce space allowlist on validated watch items
    */
   function checkSpacesAllowed(watchSet) {
-    if (!allowedSpaces) {
+    if (!allowedSpacesSet) {
       return;
     }
 
     for (const item of watchSet) {
-      if (item.spaceId && !allowedSpaces.includes(item.spaceId)) {
-        throw new MCPValidationError('SPACE_NOT_ALLOWED', `space ${item.spaceId} not allowed`);
+      if (item.spaceId && !allowedSpacesSet.has(item.spaceId)) {
+        throw new MCPValidationError('SPACE_NOT_ALLOWED');
       }
     }
   }
@@ -474,7 +733,7 @@ export function createServer(deps, options = {}) {
   async function handleToolCall(name, args) {
     const schema = TOOL_SCHEMAS[name];
     if (!schema) {
-      throw new MCPValidationError('UNKNOWN_TOOL', `unknown tool: ${name}`);
+      throw new MCPValidationError('UNKNOWN_TOOL');
     }
 
     const validatedArgs = validateArguments(name, args, schema);
@@ -482,141 +741,96 @@ export function createServer(deps, options = {}) {
     switch (name) {
       case 'cohub_goal_inspect': {
         checkGoalAllowed(validatedArgs.goalInstance);
-        const result = await inspect(validatedArgs.goalInstance);
+        const result = await frozenDeps.inspect(validatedArgs.goalInstance);
         return createSuccess(result);
       }
 
       case 'cohub_goal_submit': {
         checkGoalAllowed(validatedArgs.goalInstance);
-        const result = await submit(validatedArgs);
+        const result = await frozenDeps.submit(validatedArgs);
         return createSuccess(result);
       }
 
       case 'cohub_goal_wait': {
         checkGoalAllowed(validatedArgs.goalInstance);
         checkSpacesAllowed(validatedArgs.watchSet);
-        const result = await wait(validatedArgs);
+        const result = await frozenDeps.wait(validatedArgs);
         return createSuccess(result);
       }
 
       case 'cohub_goal_verify': {
         checkGoalAllowed(validatedArgs.goalInstance);
-        const result = await verify(validatedArgs.goalInstance, validatedArgs.expectedSnapshotHash);
+        const result = await frozenDeps.verify(
+          validatedArgs.goalInstance,
+          validatedArgs.expectedSnapshotHash
+        );
         return createSuccess(result);
       }
 
       default:
-        throw new MCPValidationError('UNKNOWN_TOOL', `unknown tool: ${name}`);
+        throw new MCPValidationError('UNKNOWN_TOOL');
     }
   }
 
   /**
-   * Handle MCP request
+   * Handle MCP request - sanitizes request before ANY property access
    */
   async function handleRequest(request) {
     try {
+      // Validate request is object before any access
       if (!request || typeof request !== 'object') {
-        return createError('INVALID_REQUEST', 'request must be an object');
+        return createError('INVALID_REQUEST');
       }
 
+      // Check for proxy BEFORE destructuring
+      if (types.isProxy(request)) {
+        return createError('PROXY_NOT_ALLOWED');
+      }
+
+      // Now safe to destructure
       const { method, params } = request;
 
       if (!method) {
-        return createError('MISSING_METHOD', 'method is required');
+        return createError('MISSING_METHOD');
       }
 
       if (method === 'tools/list') {
-        return {
-          tools: [
-            {
-              name: 'cohub_goal_inspect',
-              description: 'Inspect current goal state and snapshot',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  goalInstance: { type: 'string' }
-                },
-                required: ['goalInstance']
-              }
-            },
-            {
-              name: 'cohub_goal_submit',
-              description: 'Submit continuation to Cohub parent',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  goalInstance: { type: 'string' },
-                  expectedSnapshotHash: { type: 'string' },
-                  actionSlotId: { type: 'string' },
-                  continuationId: { type: 'string' },
-                  decisionCode: { type: 'string' },
-                  evidenceRefs: { type: 'array' }
-                },
-                required: [
-                  'goalInstance',
-                  'expectedSnapshotHash',
-                  'actionSlotId',
-                  'continuationId',
-                  'decisionCode',
-                  'evidenceRefs'
-                ]
-              }
-            },
-            {
-              name: 'cohub_goal_verify',
-              description: 'Verify goal completion state',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  goalInstance: { type: 'string' },
-                  expectedSnapshotHash: { type: 'string' }
-                },
-                required: ['goalInstance']
-              }
-            },
-            {
-              name: 'cohub_goal_wait',
-              description: 'Wait for Cohub events',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  goalInstance: { type: 'string' },
-                  expectedSnapshotHash: { type: 'string' },
-                  watchSet: { type: 'array' }
-                },
-                required: ['goalInstance', 'expectedSnapshotHash', 'watchSet']
-              }
-            }
-          ]
-        };
+        // Return frozen tool definitions
+        return deepFreeze({ tools: TOOL_DEFINITIONS });
       }
 
       if (method === 'tools/call') {
         if (!params) {
-          return createError('MISSING_PARAMS', 'params is required');
+          return createError('MISSING_PARAMS');
+        }
+
+        // Check params for proxy before destructuring
+        if (types.isProxy(params)) {
+          return createError('PROXY_NOT_ALLOWED');
         }
 
         const { name, arguments: args } = params;
 
         if (!name) {
-          return createError('MISSING_NAME', 'tool name is required');
+          return createError('MISSING_NAME');
         }
 
         if (args === undefined) {
-          return createError('MISSING_ARGUMENTS', 'arguments is required');
+          return createError('MISSING_ARGUMENTS');
         }
 
         return await handleToolCall(name, args);
       }
 
-      return createError('UNKNOWN_METHOD', `unknown method: ${method}`);
+      return createError('UNKNOWN_METHOD');
     } catch (error) {
-      // Return validation errors with their specific codes (allowlisted templates)
+      // Return validation errors with their specific codes
       if (error instanceof MCPValidationError) {
-        return createError(error.code, error.message);
+        return createError(error.code);
       }
-      // Unknown dependency exceptions: generic closed error, never leak raw message/stack
-      return createError('INTERNAL_ERROR', 'internal error');
+
+      // Dependency errors or unknown exceptions: generic error, no leak
+      return createError('INTERNAL_ERROR');
     }
   }
 

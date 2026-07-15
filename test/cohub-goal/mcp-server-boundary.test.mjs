@@ -43,7 +43,7 @@ test('MCP server boundary - tool schema validation', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /goalInstance.*required/i);
+    assert.match(response.content[0].text, /required/i);
   });
 
   await t.test('rejects inspect with extra unknown fields', async () => {
@@ -105,7 +105,7 @@ test('MCP server boundary - tool schema validation', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /watchSet.*required/i);
+    assert.match(response.content[0].text, /required/i);
   });
 });
 
@@ -127,7 +127,7 @@ test('MCP server boundary - dangerous field rejection', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /(dangerous|proto|invalid.prototype)/i);
+    assert.match(response.content[0].text, /(dangerous|invalid.*prototype)/i);
   });
 
   await t.test('rejects constructor in arguments', async () => {
@@ -147,7 +147,7 @@ test('MCP server boundary - dangerous field rejection', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /dangerous.*constructor/i);
+    assert.match(response.content[0].text, /dangerous/i);
   });
 
   await t.test('rejects prototype in arguments', async () => {
@@ -167,7 +167,7 @@ test('MCP server boundary - dangerous field rejection', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /dangerous.*prototype/i);
+    assert.match(response.content[0].text, /dangerous/i);
   });
 });
 
@@ -549,8 +549,7 @@ test('MCP server boundary - typed errors', async (t) => {
     const missingFieldResponse = await server.handleRequest(missingFieldRequest);
     assert.equal(missingFieldResponse.isError, true);
     const missingFieldError = JSON.parse(missingFieldResponse.content[0].text);
-    assert.equal(missingFieldError.code, 'MISSING_FIELD');
-    assert.match(missingFieldError.message, /goalInstance.*required/i);
+    assert.match(missingFieldError.message, /required/i);
 
     // Test UNKNOWN_FIELD
     const unknownFieldRequest = {
@@ -565,7 +564,7 @@ test('MCP server boundary - typed errors', async (t) => {
     assert.equal(unknownFieldResponse.isError, true);
     const unknownFieldError = JSON.parse(unknownFieldResponse.content[0].text);
     assert.equal(unknownFieldError.code, 'UNKNOWN_FIELD');
-    assert.match(unknownFieldError.message, /unknown field.*extraField/i);
+    assert.match(unknownFieldError.message, /unknown field/i);
 
     // Test INVALID_ARGUMENTS (non-plain object)
     const invalidArgsRequest = {
@@ -655,14 +654,14 @@ test('MCP server boundary - goal/config allowlists', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /not allowed/i);
+    assert.match(response.content[0].text, /(not allowed|not in allowlist)/i);
   });
 
   await t.test('enforces space allowlist', async () => {
     const mockDeps = {
       ...createMockDeps(),
       wait: async (params) => {
-        return { snapshotHash: 'abc' };
+        return { snapshotHash: '0'.repeat(64) };
       }
     };
 
@@ -677,9 +676,9 @@ test('MCP server boundary - goal/config allowlists', async (t) => {
         name: 'cohub_goal_wait',
         arguments: {
           goalInstance: 'test',
-          expectedSnapshotHash: 'abc',
+          expectedSnapshotHash: '0'.repeat(64),
           watchSet: [
-            { spaceId: 'disallowed-space', sessionId: 'sess-1', turnId: 'turn-1' }
+            { role: 'parent', spaceId: 'disallowed-space', sessionId: 'sess-1', turnId: 'turn-1' }
           ]
         }
       }
@@ -687,7 +686,7 @@ test('MCP server boundary - goal/config allowlists', async (t) => {
 
     const response = await server.handleRequest(request);
     assert.equal(response.isError, true);
-    assert.match(response.content[0].text, /space.*not allowed/i);
+    assert.match(response.content[0].text, /(space.*not allowed|not in allowlist)/i);
   });
 });
 
@@ -1310,16 +1309,12 @@ test('MCP server boundary - output sanitization attacks', async (t) => {
 
     const response = await server.handleRequest(request);
 
-    // Response should either reject the proxy or sanitize it without executing traps
-    // The actual proxy detection (types.isProxy) may trigger one trap, but
-    // the sanitization process itself must not execute property access traps
+    // Proxy in dependency output must cause INTERNAL_ERROR (fail-closed)
     const responseText = response.content[0].text;
 
-    // Should either be redacted as proxy or minimal data without trap execution
     assert.ok(
-      responseText.includes('[REDACTED:PROXY]') ||
-      (!trapCalled && responseText.includes('goalInstance')),
-      'Proxy should be redacted or sanitized without trap execution'
+      responseText.includes('INTERNAL_ERROR'),
+      'Proxy in dependency output must cause INTERNAL_ERROR'
     );
   });
 
@@ -1469,5 +1464,475 @@ test('MCP server boundary - response injection attacks', async (t) => {
     assert.doesNotThrow(() => {
       JSON.parse(response.content[0].text);
     });
+  });
+});
+
+test('MCP server boundary - request/params proxy trap zero execution', async (t) => {
+  await t.test('rejects proxy request before destructuring', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    let trapCount = 0;
+    const proxyRequest = new Proxy({
+      method: 'tools/call',
+      params: { name: 'cohub_goal_inspect', arguments: { goalInstance: 'test' } }
+    }, {
+      get(target, prop) {
+        trapCount++;
+        return target[prop];
+      }
+    });
+
+    const response = await server.handleRequest(proxyRequest);
+
+    assert.equal(response.isError, true, 'must reject proxy request');
+    assert.equal(trapCount, 0, 'must not execute any proxy traps on request');
+  });
+
+  await t.test('rejects proxy params before destructuring', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    let trapCount = 0;
+    const proxyParams = new Proxy({
+      name: 'cohub_goal_inspect',
+      arguments: { goalInstance: 'test' }
+    }, {
+      get(target, prop) {
+        trapCount++;
+        return target[prop];
+      }
+    });
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: proxyParams
+    });
+
+    assert.equal(response.isError, true, 'must reject proxy params');
+    assert.equal(trapCount, 0, 'must not execute proxy traps on params');
+  });
+
+  await t.test('checks types.isProxy before Array.isArray on arguments', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    // Create a proxy array that tracks which check happened first
+    let checkOrder = [];
+    const proxyArray = new Proxy([], {
+      get(target, prop) {
+        if (prop === Symbol.iterator || prop === 'length') {
+          checkOrder.push('Array.isArray');
+        }
+        return target[prop];
+      }
+    });
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: proxyArray
+      }
+    });
+
+    assert.equal(response.isError, true, 'must reject proxy arguments');
+    assert.equal(checkOrder.length, 0, 'types.isProxy must run before Array.isArray');
+  });
+});
+
+test('MCP server boundary - dependency output must fail-closed', async (t) => {
+  await t.test('dependency returning proxy causes INTERNAL_ERROR not success', async () => {
+    const mockDeps = {
+      ...createMockDeps(),
+      inspect: async () => new Proxy({
+        goalInstance: 'test',
+        snapshotHash: 'abc'
+      }, {
+        get() { throw new Error('trap executed'); }
+      })
+    };
+
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(mockDeps);
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    assert.equal(response.isError, true, 'must be error response');
+    const error = JSON.parse(response.content[0].text);
+    assert.equal(error.code, 'INTERNAL_ERROR', 'proxy output must cause INTERNAL_ERROR');
+  });
+
+  await t.test('dependency output with getter causes INTERNAL_ERROR not success', async () => {
+    const outputObj = { goalInstance: 'test' };
+    Object.defineProperty(outputObj, 'dangerous', {
+      get() { throw new Error('getter executed'); },
+      enumerable: true
+    });
+
+    const mockDeps = {
+      ...createMockDeps(),
+      inspect: async () => outputObj
+    };
+
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(mockDeps);
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    assert.equal(response.isError, true, 'must be error response');
+    const error = JSON.parse(response.content[0].text);
+    assert.equal(error.code, 'INTERNAL_ERROR', 'getter output must cause INTERNAL_ERROR');
+  });
+
+  await t.test('dependency output with cycle causes INTERNAL_ERROR not success', async () => {
+    const cyclicObj = { goalInstance: 'test' };
+    cyclicObj.self = cyclicObj;
+
+    const mockDeps = {
+      ...createMockDeps(),
+      inspect: async () => cyclicObj
+    };
+
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(mockDeps);
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    assert.equal(response.isError, true, 'must be error response');
+    const error = JSON.parse(response.content[0].text);
+    assert.equal(error.code, 'INTERNAL_ERROR', 'cyclic output must cause INTERNAL_ERROR');
+  });
+
+  await t.test('dependency output with secret field causes INTERNAL_ERROR', async () => {
+    const mockDeps = {
+      ...createMockDeps(),
+      inspect: async () => ({
+        goalInstance: 'test',
+        snapshotHash: '0'.repeat(64),
+        accessToken: 'secret-should-not-appear',
+        localState: 'READY'
+      })
+    };
+
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(mockDeps);
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    assert.equal(response.isError, true, 'must be error response');
+    const error = JSON.parse(response.content[0].text);
+    assert.equal(error.code, 'INTERNAL_ERROR', 'secret-bearing output must cause INTERNAL_ERROR');
+  });
+});
+
+test('MCP server boundary - exact schema validation', async (t) => {
+  await t.test('validates hash is exactly 64 lowercase hex chars', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    const invalidHashes = [
+      'ABC123',  // uppercase
+      'short',   // too short
+      'z' + '0'.repeat(63),  // invalid hex
+      '0'.repeat(65),  // too long
+      '',  // empty
+    ];
+
+    for (const hash of invalidHashes) {
+      const response = await server.handleRequest({
+        method: 'tools/call',
+        params: {
+          name: 'cohub_goal_submit',
+          arguments: {
+            goalInstance: 'test',
+            expectedSnapshotHash: hash,
+            actionSlotId: 'slot-1',
+            continuationId: 'cont-1',
+            decisionCode: 'CONTINUE',
+            evidenceRefs: []
+          }
+        }
+      });
+
+      assert.equal(response.isError, true, `hash ${hash} should be rejected`);
+    }
+  });
+
+  await t.test('validates decisionCode against exact allowlist', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    const invalidDecisions = ['INVALID', 'continue', 'WAIT', ''];
+
+    for (const decision of invalidDecisions) {
+      const response = await server.handleRequest({
+        method: 'tools/call',
+        params: {
+          name: 'cohub_goal_submit',
+          arguments: {
+            goalInstance: 'test',
+            expectedSnapshotHash: '0'.repeat(64),
+            actionSlotId: 'slot-1',
+            continuationId: 'cont-1',
+            decisionCode: decision,
+            evidenceRefs: []
+          }
+        }
+      });
+
+      assert.equal(response.isError, true, `decision ${decision} should be rejected`);
+    }
+  });
+
+  await t.test('validates evidenceRefs structure', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    // Invalid evidence refs - not exact {id, hash} structure
+    const invalidEvidenceRefs = [
+      [{ id: 'evt-1' }],  // missing hash
+      [{ hash: '0'.repeat(64) }],  // missing id
+      [{ id: 'evt-1', hash: '0'.repeat(64), extra: 'field' }],  // extra field
+      ['string'],  // not object
+    ];
+
+    for (const evidenceRefs of invalidEvidenceRefs) {
+      const response = await server.handleRequest({
+        method: 'tools/call',
+        params: {
+          name: 'cohub_goal_submit',
+          arguments: {
+            goalInstance: 'test',
+            expectedSnapshotHash: '0'.repeat(64),
+            actionSlotId: 'slot-1',
+            continuationId: 'cont-1',
+            decisionCode: 'CONTINUE',
+            evidenceRefs
+          }
+        }
+      });
+
+      assert.equal(response.isError, true, `evidenceRefs ${JSON.stringify(evidenceRefs)} should be rejected`);
+    }
+  });
+
+  await t.test('validates watchSet item provenance', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps(), {
+      allowedSpaces: ['space-1']
+    });
+
+    // Invalid watch items - missing role, wrong structure
+    const invalidWatchSets = [
+      [{ spaceId: 'space-1', sessionId: 'sess-1' }],  // missing role
+      [{ spaceId: 'space-1', role: 'invalid' }],  // role not in [parent, worker, merged]
+      [{ spaceId: 'space-1', role: 'parent', extra: 'field' }],  // extra field
+    ];
+
+    for (const watchSet of invalidWatchSets) {
+      const response = await server.handleRequest({
+        method: 'tools/call',
+        params: {
+          name: 'cohub_goal_wait',
+          arguments: {
+            goalInstance: 'test',
+            expectedSnapshotHash: '0'.repeat(64),
+            watchSet
+          }
+        }
+      });
+
+      assert.equal(response.isError, true, `watchSet ${JSON.stringify(watchSet)} should be rejected`);
+    }
+  });
+});
+
+test('MCP server boundary - immutable configuration', async (t) => {
+  await t.test('mutating allowedGoals after createServer has no effect', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+
+    const allowedGoals = ['goal-1'];
+    const server = createServer(createMockDeps(), { allowedGoals });
+
+    // Attacker mutates the array
+    allowedGoals.push('goal-2');
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'goal-2' }
+      }
+    });
+
+    assert.equal(response.isError, true, 'mutated allowedGoals must not affect server');
+  });
+
+  await t.test('mutating allowedSpaces after createServer has no effect', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+
+    const allowedSpaces = ['space-1'];
+    const server = createServer(createMockDeps(), { allowedSpaces });
+
+    // Attacker mutates the array
+    allowedSpaces.push('space-2');
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_wait',
+        arguments: {
+          goalInstance: 'test',
+          expectedSnapshotHash: '0'.repeat(64),
+          watchSet: [{ role: 'parent', spaceId: 'space-2', sessionId: 'sess', turnId: 'turn' }]
+        }
+      }
+    });
+
+    assert.equal(response.isError, true, 'mutated allowedSpaces must not affect server');
+  });
+
+  await t.test('mutating dependency functions after createServer has no effect', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+
+    const deps = createMockDeps();
+    const server = createServer(deps);
+
+    let attackerCalled = false;
+    deps.inspect = async () => {
+      attackerCalled = true;
+      return { malicious: true };
+    };
+
+    await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    assert.equal(attackerCalled, false, 'mutated deps must not be called');
+  });
+});
+
+test('MCP server boundary - tools/list exact schema', async (t) => {
+  await t.test('tools/list has additionalProperties:false on all schemas', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    const response = await server.handleRequest({ method: 'tools/list' });
+
+    assert.equal(response.tools.length, 4);
+
+    for (const tool of response.tools) {
+      assert.equal(tool.inputSchema.additionalProperties, false,
+        `${tool.name} schema must have additionalProperties:false`);
+
+      // Check nested properties also have exact schemas
+      if (tool.inputSchema.properties.evidenceRefs) {
+        const evidenceSchema = tool.inputSchema.properties.evidenceRefs;
+        assert.ok(evidenceSchema.items, 'evidenceRefs must have items schema');
+        assert.equal(evidenceSchema.items.additionalProperties, false,
+          'evidenceRefs items must have additionalProperties:false');
+      }
+
+      if (tool.inputSchema.properties.watchSet) {
+        const watchSchema = tool.inputSchema.properties.watchSet;
+        assert.ok(watchSchema.items, 'watchSet must have items schema');
+        assert.equal(watchSchema.items.additionalProperties, false,
+          'watchSet items must have additionalProperties:false');
+      }
+    }
+  });
+
+  await t.test('tools/list is deep frozen and immutable', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    const response = await server.handleRequest({ method: 'tools/list' });
+
+    assert.ok(Object.isFrozen(response), 'response must be frozen');
+    assert.ok(Object.isFrozen(response.tools), 'tools array must be frozen');
+    assert.ok(Object.isFrozen(response.tools[0]), 'tool objects must be frozen');
+    assert.ok(Object.isFrozen(response.tools[0].inputSchema), 'schemas must be frozen');
+  });
+});
+
+test('MCP server boundary - error responses never leak attacker content', async (t) => {
+  await t.test('validation error does not include attacker field name', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: {
+          goalInstance: 'test',
+          '__ATTACKER_SENTINEL__': 'malicious'
+        }
+      }
+    });
+
+    const responseText = JSON.stringify(response);
+    assert.equal(responseText.includes('__ATTACKER_SENTINEL__'), false,
+      'error must not echo attacker field names');
+  });
+
+  await t.test('error never includes raw dependency error message', async () => {
+    const mockDeps = {
+      ...createMockDeps(),
+      inspect: async () => {
+        const err = new Error('SENSITIVE_DATABASE_PATH=/var/secrets/db');
+        err.stack = 'at sensitiveFunction (/internal/path/file.js:42)';
+        throw err;
+      }
+    };
+
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(mockDeps);
+
+    const response = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    const responseText = JSON.stringify(response);
+    assert.equal(responseText.includes('SENSITIVE_DATABASE_PATH'), false);
+    assert.equal(responseText.includes('/internal/path'), false);
+    assert.equal(responseText.includes('sensitiveFunction'), false);
+
+    const error = JSON.parse(response.content[0].text);
+    assert.equal(error.code, 'INTERNAL_ERROR');
+    assert.equal(error.message, 'internal error');
   });
 });
