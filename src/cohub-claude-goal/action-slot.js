@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { sanitizeObject, sanitizeArray } from './sanitize.js';
 
 /**
  * Fixed allowlist of decision codes the bridge is permitted to issue.
@@ -37,47 +38,19 @@ const TRANSITIONS = new Map([
 
 const SNAPSHOT_HASH_RE = /^[0-9a-f]{64}$/;
 
-function isDangerousValue(value) {
-  if (value === null || value === undefined) return false;
-  if (typeof value !== 'object') return false;
-
-  // Reject anything with accessors, symbols, or non-Object prototype
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== Array.prototype && proto !== null) return true;
-
-  const desc = Object.getOwnPropertyDescriptors(value);
-  for (const key of Object.keys(desc)) {
-    if (desc[key].get || desc[key].set) return true;
-  }
-
-  if (Object.getOwnPropertySymbols(value).length > 0) return true;
-
-  // Check for cycles
-  const seen = new WeakSet();
-  function hasCycle(obj) {
-    if (obj === null || typeof obj !== 'object') return false;
-    if (seen.has(obj)) return true;
-    seen.add(obj);
-    for (const val of Object.values(obj)) {
-      if (hasCycle(val)) return true;
-    }
-    return false;
-  }
-
-  return hasCycle(value);
-}
-
 export function assertSafeOwnPlainObject(value, label) {
+  // This is now a lightweight check after sanitize has been called
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError(`${label} must be a plain object`);
-  }
-  if (isDangerousValue(value)) {
-    throw new TypeError(`${label} contains accessors, symbols, non-plain prototype, or cycles`);
   }
 }
 
 export function assertExactOwnKeys(obj, allowedKeys, label) {
-  assertSafeOwnPlainObject(obj, label);
+  // Lightweight check - sanitize should be called before this
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    throw new TypeError(`${label} must be a plain object`);
+  }
+
   const allowed = new Set(allowedKeys);
   const actual = Object.keys(obj);
   for (const key of actual) {
@@ -144,11 +117,14 @@ const GENERATE_KEYS = [
  * Generate deterministic action slot with collision-resistant IDs that include all bindings.
  */
 export function generateActionSlot(params) {
-  assertExactOwnKeys(params, GENERATE_KEYS, 'generateActionSlot params');
+  // Sanitize params to reject proxies, accessors, symbols, cycles, NaN, Infinity, etc.
+  const sanitized = sanitizeObject(params, 'generateActionSlot params');
+
+  assertExactOwnKeys(sanitized, GENERATE_KEYS, 'generateActionSlot params');
   const {
     goalVersion, snapshotHash, decisionCode, attempt,
     expectedParentSequence, expectedInputWatermark,
-  } = params;
+  } = sanitized;
 
   if (typeof goalVersion !== 'string' || goalVersion.length === 0) {
     throw new TypeError('goalVersion must be a non-empty string');
@@ -186,12 +162,15 @@ export function generateActionSlot(params) {
  * Validate complete phase history for a slot: transitions must be legal, bindings immutable.
  */
 export function validateSlotHistory(entries) {
-  if (entries.length === 0) return;
+  // Sanitize the entries array to prevent mutation/accessor attacks
+  const sanitized = sanitizeArray(entries, 'validateSlotHistory entries');
+
+  if (sanitized.length === 0) return;
 
   let prevPhase = undefined;
   let bindings = null;
 
-  for (const entry of entries) {
+  for (const entry of sanitized) {
     assertValidTransition(prevPhase, entry.phase);
 
     // After OBSERVED, all bindings are frozen
@@ -243,7 +222,21 @@ const RECOVER_KEYS = [
  * legal phase histories, and persisted stale cancellation.
  */
 export function recoverActionSlot(params) {
+  // Check if params itself is a proxy before any property access
+  if (params && typeof params === 'object') {
+    try {
+      // Try to detect proxy without triggering traps via util.types.isProxy
+      const sanitized = sanitizeObject(params, 'recoverActionSlot params (top-level)');
+      // If sanitize passes, continue with the sanitized version
+      params = sanitized;
+    } catch (err) {
+      // If it's a proxy/dangerous object, throw immediately
+      throw err;
+    }
+  }
+
   assertExactOwnKeys(params, RECOVER_KEYS, 'recoverActionSlot params');
+
   const {
     ledgerEntries, currentSnapshotHash, goalVersion, decisionCode,
     attempt, expectedParentSequence, expectedInputWatermark,
@@ -252,12 +245,20 @@ export function recoverActionSlot(params) {
   if (!Array.isArray(ledgerEntries)) {
     throw new TypeError('ledgerEntries must be an array');
   }
+
+  // Sanitize each ledger entry individually to catch nested proxies/accessors
+  const sanitizedEntries = ledgerEntries.map((entry, idx) => {
+    if (entry === undefined) {
+      throw new TypeError(`ledgerEntries[${idx}]: sparse array detected`);
+    }
+    return sanitizeObject(entry, `ledgerEntries[${idx}]`);
+  });
   assertSnapshotHash(currentSnapshotHash, 'currentSnapshotHash');
   assertDecisionCode(decisionCode);
 
   const slotEntries = new Map();
 
-  for (const entry of ledgerEntries) {
+  for (const entry of sanitizedEntries) {
     if (!Object.values(PHASES).includes(entry.phase)) {
       throw new TypeError(`Unknown ledger phase '${entry.phase}'`);
     }

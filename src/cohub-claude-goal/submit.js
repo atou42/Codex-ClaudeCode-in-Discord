@@ -26,6 +26,7 @@ import {
   isTerminalPhase,
   validateSlotHistory,
 } from './action-slot.js';
+import { sanitizeObject } from './sanitize.js';
 
 class InjectedCrashError extends Error {
   constructor(at) {
@@ -129,12 +130,16 @@ export async function submitAction(params) {
 
   const send = cohubSend || ctx.cohubSend;
 
-  if (!currentSnapshot || typeof currentSnapshot !== 'object') {
-    return { error: 'INVALID_CURRENT_SNAPSHOT', reason: 'currentSnapshot must be provided' };
+  // Sanitize currentSnapshot separately to catch nested proxies/accessors
+  let sanitizedSnapshot;
+  try {
+    sanitizedSnapshot = sanitizeObject(currentSnapshot, 'currentSnapshot');
+  } catch (err) {
+    return { error: 'INVALID_CURRENT_SNAPSHOT', reason: err.message };
   }
 
   // 1. Validate action slot against bridge-issued slot. Caller-provided IDs never replace bridge IDs.
-  const issuedSlot = currentSnapshot.actionSlot;
+  const issuedSlot = sanitizedSnapshot.actionSlot;
   if (!issuedSlot
     || issuedSlot.actionSlotId !== actionSlotId
     || issuedSlot.continuationId !== continuationId) {
@@ -184,7 +189,16 @@ export async function submitAction(params) {
   }
 
   // 3. Check persisted phases for this exact slot — recover, never create a new ID.
-  const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+  // Sanitize ledger entries to prevent accessor/mutation attacks during history validation
+  const sanitizedLedger = ctx.ledger.map((e, idx) => {
+    try {
+      return sanitizeObject(e, `ledger[${idx}]`);
+    } catch (err) {
+      throw new Error(`INTEGRITY_FAILURE: ledger[${idx}] contains dangerous properties: ${err.message}`);
+    }
+  });
+
+  const slotEntries = sanitizedLedger.filter(e => e.actionSlotId === actionSlotId);
   validateSlotHistory(slotEntries);
 
   const phases = new Set(slotEntries.map(e => e.phase));
@@ -293,20 +307,30 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
     };
   }
 
-  // Inspect ledger via copied exact data so accessors/mutations cannot bypass phase history check
-  const ledgerSnapshot = ctx.ledger.map(e => ({ ...e }));
-  const slotEntries = ledgerSnapshot.filter(e => e.actionSlotId === actionSlotId);
+  // Inspect ledger via sanitized copied data so accessors/mutations cannot bypass phase history check
+  const sanitizedLedger = ctx.ledger.map((e, idx) => {
+    try {
+      return sanitizeObject(e, `ledger[${idx}]`);
+    } catch (err) {
+      throw new Error(`INTEGRITY_FAILURE: ledger[${idx}] contains dangerous properties: ${err.message}`);
+    }
+  });
+
+  const slotEntries = sanitizedLedger.filter(e => e.actionSlotId === actionSlotId);
   const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
 
   const reconciliation = await reconcileByClientMessageId(continuationId);
 
-  // Validate reconciliation is exact own plain object with no accessors, inherited props, or cycles
-  if (!reconciliation || typeof reconciliation !== 'object' || Array.isArray(reconciliation)) {
+  // Sanitize reconciliation result to reject proxies, accessors, cycles, etc.
+  let sanitizedReconciliation;
+  try {
+    sanitizedReconciliation = sanitizeObject(reconciliation, 'reconciliation result');
+  } catch (err) {
     if (!alreadyAmbiguous) {
       await ctx.writePhase(PHASES.AMBIGUOUS, {
         actionSlotId,
         continuationId,
-        reason: 'Reconciliation returned invalid result (not a plain object).',
+        reason: 'Reconciliation returned invalid result: contains dangerous properties.',
       });
     }
     return {
@@ -315,61 +339,29 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
     };
   }
 
-  // Check for accessors or non-Object prototype
-  const proto = Object.getPrototypeOf(reconciliation);
-  if (proto !== Object.prototype && proto !== null) {
+  // Reconciliation result must be exactly { matches: [...] } — no extra keys
+  const reconKeys = Object.keys(sanitizedReconciliation);
+  if (reconKeys.length !== 1 || reconKeys[0] !== 'matches' || !Array.isArray(sanitizedReconciliation.matches)) {
     if (!alreadyAmbiguous) {
       await ctx.writePhase(PHASES.AMBIGUOUS, {
         actionSlotId,
         continuationId,
-        reason: 'Reconciliation returned object with non-plain prototype.',
+        reason: 'Reconciliation result must be exactly { matches: [...] }.',
       });
     }
     return {
       error: 'BLOCKED_AMBIGUOUS_SEND',
-      reason: 'Reconciliation returned invalid result.',
+      reason: 'Reconciliation result must be exactly { matches: [...] }.',
     };
   }
 
-  const descriptors = Object.getOwnPropertyDescriptors(reconciliation);
-  for (const key of Object.keys(descriptors)) {
-    if (descriptors[key].get || descriptors[key].set) {
-      if (!alreadyAmbiguous) {
-        await ctx.writePhase(PHASES.AMBIGUOUS, {
-          actionSlotId,
-          continuationId,
-          reason: 'Reconciliation returned object with accessor properties.',
-        });
-      }
-      return {
-        error: 'BLOCKED_AMBIGUOUS_SEND',
-        reason: 'Reconciliation returned invalid result.',
-      };
-    }
-  }
+  // Data is already sanitized (detached, frozen, no accessors) — read clones directly
+  const matchesCopy = sanitizedReconciliation.matches;
 
-  // Check for 'matches' array
-  if (!Array.isArray(reconciliation.matches)) {
-    if (!alreadyAmbiguous) {
-      await ctx.writePhase(PHASES.AMBIGUOUS, {
-        actionSlotId,
-        continuationId,
-        reason: 'Reconciliation missing or invalid matches array.',
-      });
-    }
-    return {
-      error: 'BLOCKED_AMBIGUOUS_SEND',
-      reason: 'Reconciliation result must contain a matches array.',
-    };
-  }
-
-  // Copy matches to prevent mutation attacks
-  const matchesCopy = reconciliation.matches.map(m => ({ ...m }));
-
-  // Validate each match has exactly: turnId, actionSlotId, continuationId, clientMessageId, parentSessionId
+  // Validate each match has EXACTLY: turnId, actionSlotId, continuationId, clientMessageId, parentSessionId
   const requiredFields = ['turnId', 'actionSlotId', 'continuationId', 'clientMessageId', 'parentSessionId'];
   for (const match of matchesCopy) {
-    if (!match || typeof match !== 'object') {
+    if (!match || typeof match !== 'object' || Array.isArray(match)) {
       if (!alreadyAmbiguous) {
         await ctx.writePhase(PHASES.AMBIGUOUS, {
           actionSlotId,
@@ -383,18 +375,52 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
       };
     }
 
+    // Match must have EXACTLY the five required fields — check each one is present first
+    for (const field of requiredFields) {
+      if (!(field in match)) {
+        if (!alreadyAmbiguous) {
+          await ctx.writePhase(PHASES.AMBIGUOUS, {
+            actionSlotId,
+            continuationId,
+            reason: `Match missing required field: ${field}.`,
+          });
+        }
+        return {
+          error: 'BLOCKED_AMBIGUOUS_SEND',
+          reason: `Match missing ${field}.`,
+        };
+      }
+    }
+
+    // Then check for extra fields
+    const matchKeys = Object.keys(match);
+    if (matchKeys.length !== requiredFields.length) {
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: 'Match has extra fields; exactly five required.',
+        });
+      }
+      return {
+        error: 'BLOCKED_AMBIGUOUS_SEND',
+        reason: 'Match must have exactly five fields (no extra).',
+      };
+    }
+
+    // Validate each field is a non-empty string
     for (const field of requiredFields) {
       if (typeof match[field] !== 'string' || match[field].length === 0) {
         if (!alreadyAmbiguous) {
           await ctx.writePhase(PHASES.AMBIGUOUS, {
             actionSlotId,
             continuationId,
-            reason: `Match missing or invalid ${field}.`,
+            reason: `Match has invalid ${field} (empty or non-string).`,
           });
         }
         return {
           error: 'BLOCKED_AMBIGUOUS_SEND',
-          reason: `Match missing valid ${field}.`,
+          reason: `Match ${field} must be a non-empty string.`,
         };
       }
     }
@@ -405,7 +431,7 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
         await ctx.writePhase(PHASES.AMBIGUOUS, {
           actionSlotId,
           continuationId,
-          reason: `Match actionSlotId mismatch: expected ${actionSlotId}, got ${match.actionSlotId}.`,
+          reason: 'Match actionSlotId does not match expected slot.',
         });
       }
       return {
@@ -419,7 +445,7 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
         await ctx.writePhase(PHASES.AMBIGUOUS, {
           actionSlotId,
           continuationId,
-          reason: `Match continuationId mismatch: expected ${continuationId}, got ${match.continuationId}.`,
+          reason: 'Match continuationId does not match expected continuation.',
         });
       }
       return {
@@ -433,7 +459,7 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
         await ctx.writePhase(PHASES.AMBIGUOUS, {
           actionSlotId,
           continuationId,
-          reason: `Match clientMessageId mismatch: expected ${continuationId}, got ${match.clientMessageId}.`,
+          reason: 'Match clientMessageId does not equal continuationId.',
         });
       }
       return {
@@ -504,11 +530,20 @@ export async function recoverSubmit(params) {
   assertExactOwnKeys(params, RECOVER_KEYS, 'recoverSubmit params');
   const { ctx, goalInstance, freshInspect, reconcileByClientMessageId, cohubSend } = params;
 
-  const slotIds = [...new Set(ctx.ledger.map(e => e.actionSlotId))];
+  // Sanitize ledger to prevent accessor/mutation attacks
+  const sanitizedLedger = ctx.ledger.map((e, idx) => {
+    try {
+      return sanitizeObject(e, `ledger[${idx}]`);
+    } catch (err) {
+      throw new Error(`INTEGRITY_FAILURE: ledger[${idx}] contains dangerous properties: ${err.message}`);
+    }
+  });
+
+  const slotIds = [...new Set(sanitizedLedger.map(e => e.actionSlotId))];
 
   for (let i = slotIds.length - 1; i >= 0; i--) {
     const actionSlotId = slotIds[i];
-    const entries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+    const entries = sanitizedLedger.filter(e => e.actionSlotId === actionSlotId);
     validateSlotHistory(entries);
 
     const phases = new Set(entries.map(e => e.phase));
