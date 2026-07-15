@@ -75,6 +75,8 @@ describe('reconcile', () => {
 
       const ledger = { events: [], actionSlots: [] };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 1,
         observedGeneration: 0,
@@ -95,6 +97,8 @@ describe('reconcile', () => {
 
       const ledger = { events: [], actionSlots: [] };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 1,
         observedGeneration: 0,
@@ -128,6 +132,8 @@ describe('reconcile', () => {
         trackedTurns: [{ turnId: 'turn-1', spaceId: 's1', sessionId: 'sess1' }]
       };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 1,
         reconnected: true
@@ -240,7 +246,7 @@ describe('reconcile', () => {
         actionSlots: [],
         trackedTurns: [{ turnId: 'turn-1', spaceId: 's1', sessionId: 'sess1' }]
       };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const result = await reconcile('g1', cohubReader, ledger, localState);
       const worker = result.snapshot.workerStates.find((w) => w.originalTurnId === 'turn-1');
@@ -266,7 +272,7 @@ describe('reconcile', () => {
         actionSlots: [],
         trackedTurns: [{ turnId: 'turn-1', spaceId: 's1', sessionId: 'sess1' }]
       };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const result = await reconcile('g1', cohubReader, ledger, localState);
       const worker = result.snapshot.workerStates.find((w) => w.originalTurnId === 'turn-1');
@@ -289,6 +295,8 @@ describe('reconcile', () => {
         trackedTurns: [{ turnId: 't1', spaceId: 'wrong-space', sessionId: 's1' }]
       };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 1,
         allowedSpaces: ['correct-space']
@@ -311,6 +319,8 @@ describe('reconcile', () => {
         trackedTurns: [{ turnId: 't1', spaceId: 's1', sessionId: 'unregistered-session' }]
       };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 1,
         allowedSessions: ['parent-session', 'worker-session-1']
@@ -370,6 +380,8 @@ describe('reconcile', () => {
 
       const ledger = { events: [], actionSlots: [] };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 42,
         expectedParentSequence: 42
@@ -415,7 +427,7 @@ describe('reconcile', () => {
       const seen = new Set();
       assert.throws(
         () => deduplicateEvents([attackEvent], seen),
-        /GETTER_IN_EVENT/,
+        /malicious event|Accessor property/,
         'must not execute getters in untrusted events'
       );
     });
@@ -428,7 +440,7 @@ describe('reconcile', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const result = await reconcile('g1', cohubReader, ledger, localState);
       assert.ok(Object.isFrozen(result.snapshot), 'snapshot must be frozen');

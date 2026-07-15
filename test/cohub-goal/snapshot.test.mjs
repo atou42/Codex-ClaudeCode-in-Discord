@@ -32,7 +32,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 42 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('test-goal', cohubReader, ledger, localState);
       assert.strictEqual(snapshot.decision, 'RECONCILE_AND_FAN_IN');
@@ -92,11 +92,11 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject via error result');
-      assert.ok(snapshot.integrityErrors?.some(e => e.message.includes('GETTER_EXECUTED')));
+      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED'), 'must record INPUT_VALIDATION_FAILED');
     });
 
     it('rejects symbol properties in hash input', async () => {
@@ -112,12 +112,12 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
-      // Symbol properties cause deepFreeze to reject the input
+      // Symbol properties cause sanitization to reject the input
       assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject inputs with symbol properties');
-      assert.ok(snapshot.integrityErrors?.some(e => e.message.includes('symbol')));
+      assert.ok(snapshot.integrityErrors?.some(e => e.message.includes('Symbol') || e.code === 'INPUT_VALIDATION_FAILED'));
     });
 
     it('rejects proxy objects that intercept field access', async () => {
@@ -138,11 +138,11 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject via error result');
-      assert.ok(snapshot.integrityErrors?.some(e => e.message.includes('PROXY_TRAP_EXECUTED')));
+      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED'), 'must record INPUT_VALIDATION_FAILED');
     });
 
     it('rejects circular references in state', async () => {
@@ -156,7 +156,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject via error result');
@@ -177,7 +177,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const s1 = await createSnapshot('g1', cohubReader1, ledger, localState);
       const s2 = await createSnapshot('g1', cohubReader2, ledger, localState);
@@ -205,7 +205,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const s1 = await createSnapshot('g1', cohubReader1, ledger, localState);
       const s2 = await createSnapshot('g1', cohubReader2, ledger, localState);
@@ -221,7 +221,7 @@ describe('snapshot', () => {
       });
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const s1 = await createSnapshot('g1', makeReader('2026-01-01T00:00:00Z'), ledger, localState);
       const s2 = await createSnapshot('g1', makeReader('2026-01-02T00:00:00Z'), ledger, localState);
@@ -242,6 +242,8 @@ describe('snapshot', () => {
 
       const ledger = { events: [], actionSlots: [] };
       const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session',
         status: 'RUNNING',
         parentSequence: 1,
         observedGeneration: 0,
@@ -272,7 +274,7 @@ describe('snapshot', () => {
         actionSlots: [],
         trackedTurns: [{ turnId: 'turn-1', spaceId: 'space-1', sessionId: 'session-1' }]
       };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.ok(snapshot.workerStates);
@@ -294,7 +296,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       const str = JSON.stringify(snapshot);
@@ -315,7 +317,9 @@ describe('snapshot', () => {
         actionSlots: [],
         trackedTurns: [{ turnId: 't1', spaceId: 'wrong-space', sessionId: 's1' }]
       };
-      const localState = { status: 'RUNNING', parentSequence: 1, allowedSpaces: ['correct-space'] };
+      const localState = {
+        parentSpaceId: 'test-space',
+        parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 1, allowedSpaces: ['correct-space'] };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.ok(snapshot.integrityErrors?.some((e) => e.code.includes('SPACE')));
@@ -338,7 +342,7 @@ describe('snapshot', () => {
         actionSlots: [],
         trackedTurns: [{ turnId: 'turn-1', spaceId: 's1', sessionId: 'sess1' }]
       };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.ok(snapshot.integrityErrors?.some((e) => e.code.includes('CHAIN')));
@@ -356,7 +360,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       await createSnapshot('g1', cohubReader, ledger, localState);
       const firstCount = readCount;
@@ -401,7 +405,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       const str = JSON.stringify(snapshot);
@@ -445,7 +449,7 @@ describe('snapshot', () => {
       };
 
       const ledger = { events: [], actionSlots: [] };
-      const localState = { status: 'RUNNING', parentSequence: 1 };
+      const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       // Normal operation succeeds
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);

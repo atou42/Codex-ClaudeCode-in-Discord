@@ -15,7 +15,8 @@ const ALLOWLISTED_STATE_FIELDS = Object.freeze([
   'stage',
   'nextAction',
   'humanWait',
-  'tasks'
+  'tasks',
+  'parent'
 ]);
 
 const ALLOWLISTED_GATE_FIELDS = Object.freeze([
