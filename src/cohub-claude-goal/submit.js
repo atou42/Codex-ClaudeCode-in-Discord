@@ -293,12 +293,15 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
     };
   }
 
+  // Inspect ledger via copied exact data so accessors/mutations cannot bypass phase history check
+  const ledgerSnapshot = ctx.ledger.map(e => ({ ...e }));
+  const slotEntries = ledgerSnapshot.filter(e => e.actionSlotId === actionSlotId);
+  const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
+
   const reconciliation = await reconcileByClientMessageId(continuationId);
 
   // Validate reconciliation is exact own plain object with no accessors, inherited props, or cycles
   if (!reconciliation || typeof reconciliation !== 'object' || Array.isArray(reconciliation)) {
-    const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
-    const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
     if (!alreadyAmbiguous) {
       await ctx.writePhase(PHASES.AMBIGUOUS, {
         actionSlotId,
@@ -315,8 +318,6 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
   // Check for accessors or non-Object prototype
   const proto = Object.getPrototypeOf(reconciliation);
   if (proto !== Object.prototype && proto !== null) {
-    const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
-    const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
     if (!alreadyAmbiguous) {
       await ctx.writePhase(PHASES.AMBIGUOUS, {
         actionSlotId,
@@ -333,8 +334,6 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
   const descriptors = Object.getOwnPropertyDescriptors(reconciliation);
   for (const key of Object.keys(descriptors)) {
     if (descriptors[key].get || descriptors[key].set) {
-      const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
-      const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
       if (!alreadyAmbiguous) {
         await ctx.writePhase(PHASES.AMBIGUOUS, {
           actionSlotId,
@@ -349,66 +348,141 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
     }
   }
 
-  if (reconciliation.found === true) {
-    if (!reconciliation.turnId || typeof reconciliation.turnId !== 'string' || reconciliation.turnId.length === 0) {
-      const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
-      const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
-      if (!alreadyAmbiguous) {
-        await ctx.writePhase(PHASES.AMBIGUOUS, {
-          actionSlotId,
-          continuationId,
-          reason: 'Reconciliation found=true but turnId is missing or invalid.',
-        });
-      }
-      return {
-        error: 'BLOCKED_AMBIGUOUS_SEND',
-        reason: 'Reconciliation found=true but turnId is missing or invalid.',
-      };
-    }
-
-    // Bind the existing real Turn; never resend.
-    await ctx.writePhase(PHASES.CONFIRMED, {
-      actionSlotId,
-      continuationId,
-      turnId: reconciliation.turnId,
-      reconciled: true,
-    });
-    return { success: true, turnId: reconciliation.turnId, reconciled: true };
-  }
-
-  if (reconciliation.found === false) {
-    // Cannot prove whether request reached server → block.
-    const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
-    const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
-
+  // Check for 'matches' array
+  if (!Array.isArray(reconciliation.matches)) {
     if (!alreadyAmbiguous) {
       await ctx.writePhase(PHASES.AMBIGUOUS, {
         actionSlotId,
         continuationId,
-        reason: 'REQUEST_STARTED with no receipt; reconciliation found no Turn with this clientMessageId.',
+        reason: 'Reconciliation missing or invalid matches array.',
       });
     }
+    return {
+      error: 'BLOCKED_AMBIGUOUS_SEND',
+      reason: 'Reconciliation result must contain a matches array.',
+    };
+  }
 
+  // Copy matches to prevent mutation attacks
+  const matchesCopy = reconciliation.matches.map(m => ({ ...m }));
+
+  // Validate each match has exactly: turnId, actionSlotId, continuationId, clientMessageId, parentSessionId
+  const requiredFields = ['turnId', 'actionSlotId', 'continuationId', 'clientMessageId', 'parentSessionId'];
+  for (const match of matchesCopy) {
+    if (!match || typeof match !== 'object') {
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: 'Match in matches array is not an object.',
+        });
+      }
+      return {
+        error: 'BLOCKED_AMBIGUOUS_SEND',
+        reason: 'Malformed match in reconciliation result.',
+      };
+    }
+
+    for (const field of requiredFields) {
+      if (typeof match[field] !== 'string' || match[field].length === 0) {
+        if (!alreadyAmbiguous) {
+          await ctx.writePhase(PHASES.AMBIGUOUS, {
+            actionSlotId,
+            continuationId,
+            reason: `Match missing or invalid ${field}.`,
+          });
+        }
+        return {
+          error: 'BLOCKED_AMBIGUOUS_SEND',
+          reason: `Match missing valid ${field}.`,
+        };
+      }
+    }
+
+    // Validate bindings match the expected slot
+    if (match.actionSlotId !== actionSlotId) {
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: `Match actionSlotId mismatch: expected ${actionSlotId}, got ${match.actionSlotId}.`,
+        });
+      }
+      return {
+        error: 'BLOCKED_AMBIGUOUS_SEND',
+        reason: 'Match actionSlotId does not match expected slot.',
+      };
+    }
+
+    if (match.continuationId !== continuationId) {
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: `Match continuationId mismatch: expected ${continuationId}, got ${match.continuationId}.`,
+        });
+      }
+      return {
+        error: 'BLOCKED_AMBIGUOUS_SEND',
+        reason: 'Match continuationId does not match expected continuation.',
+      };
+    }
+
+    if (match.clientMessageId !== continuationId) {
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: `Match clientMessageId mismatch: expected ${continuationId}, got ${match.clientMessageId}.`,
+        });
+      }
+      return {
+        error: 'BLOCKED_AMBIGUOUS_SEND',
+        reason: 'Match clientMessageId does not equal continuationId.',
+      };
+    }
+  }
+
+  // Exactly zero matches → uncertain outcome
+  if (matchesCopy.length === 0) {
+    if (!alreadyAmbiguous) {
+      await ctx.writePhase(PHASES.AMBIGUOUS, {
+        actionSlotId,
+        continuationId,
+        reason: 'Zero matches: REQUEST_STARTED with no receipt; reconciliation found no Turn.',
+      });
+    }
     return {
       error: 'BLOCKED_AMBIGUOUS_SEND',
       reason: 'Request was started but outcome uncertain: no Turn found by clientMessageId and server does not dedupe. Blocking to prevent duplicate parent Turn.',
     };
   }
 
-  // Multiple or malformed reconciliation result (found not exactly true/false)
-  const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
-  const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
-  if (!alreadyAmbiguous) {
-    await ctx.writePhase(PHASES.AMBIGUOUS, {
-      actionSlotId,
-      continuationId,
-      reason: 'Reconciliation returned malformed result (found not true/false).',
-    });
+  // Multiple matches → ambiguous
+  if (matchesCopy.length > 1) {
+    if (!alreadyAmbiguous) {
+      await ctx.writePhase(PHASES.AMBIGUOUS, {
+        actionSlotId,
+        continuationId,
+        reason: `Multiple matches found: ${matchesCopy.length} Turns with same clientMessageId.`,
+      });
+    }
+    return {
+      error: 'BLOCKED_AMBIGUOUS_SEND',
+      reason: `Multiple matches (${matchesCopy.length}) found for clientMessageId. Cannot determine which Turn to bind.`,
+    };
   }
-  return {
-    error: 'BLOCKED_AMBIGUOUS_SEND',
-    reason: 'Reconciliation returned malformed result (found not true/false).',
-  };
+
+  // Exactly one match → bind
+  const match = matchesCopy[0];
+  await ctx.writePhase(PHASES.CONFIRMED, {
+    actionSlotId,
+    continuationId,
+    turnId: match.turnId,
+    parentSessionId: match.parentSessionId,
+    reconciled: true,
+  });
+  return { success: true, turnId: match.turnId, reconciled: true };
 }
 
 const RECOVER_KEYS = [

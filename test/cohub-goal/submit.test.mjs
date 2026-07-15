@@ -267,7 +267,7 @@ describe('submit', () => {
     ];
 
     mockContext.parentTurns = [
-      { turnId: 'turn-existing', clientMessageId: 'cont-123', sequence: 6 },
+      { turnId: 'turn-existing', clientMessageId: 'cont-123', actionSlotId: 'slot-123', parentSessionId: 'sess-parent', sequence: 6 },
     ];
 
     const result = await submitAction({
@@ -292,8 +292,16 @@ describe('submit', () => {
         unconsumedEvents: [],
       }),
       reconcileByClientMessageId: async (continuationId) => {
-        const turn = mockContext.parentTurns.find(t => t.clientMessageId === continuationId);
-        return turn ? { found: true, turnId: turn.turnId } : { found: false };
+        const matches = mockContext.parentTurns
+          .filter(t => t.clientMessageId === continuationId)
+          .map(t => ({
+            turnId: t.turnId,
+            actionSlotId: t.actionSlotId,
+            continuationId: continuationId,
+            clientMessageId: t.clientMessageId,
+            parentSessionId: t.parentSessionId,
+          }));
+        return { matches };
       },
       cohubSend: async () => {
         throw new Error('Should not send when already REQUEST_STARTED');
@@ -334,7 +342,7 @@ describe('submit', () => {
         inputWatermark: 2,
         unconsumedEvents: [],
       }),
-      reconcileByClientMessageId: async () => ({ found: false }),
+      reconcileByClientMessageId: async () => ({ matches: [] }),
       cohubSend: async () => {
         throw new Error('Should not send when ambiguous');
       },
