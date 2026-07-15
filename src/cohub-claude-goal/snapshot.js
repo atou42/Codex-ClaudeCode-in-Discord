@@ -3,10 +3,11 @@
  * Fresh reads every inspect, allowlisted fact domains only, canonical hash
  * excluding volatile values, exact watch-set provenance, merged-chain tracking.
  *
- * Security: Freezes inputs before access to prevent descriptor/getter/proxy attacks.
- * Detects cycles, validates field types, rejects symbol properties and prototype pollution.
+ * Security: STRICT BOUNDARY - detaches and freezes clone, never mutates caller objects.
+ * Rejects Proxy/getter/accessor/symbol before execution. Requires exact identity strings.
  */
 
+import util from 'node:util';
 import { canonicalHash } from '../../../claude-goal-foundation/src/cohub-claude-goal/canonical.js';
 
 const ALLOWLISTED_STATE_FIELDS = Object.freeze([
@@ -33,74 +34,114 @@ const ALLOWLISTED_WORKER_FIELDS = Object.freeze([
 const POLLUTION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
- * Deep freeze an object to prevent descriptor/getter/proxy execution.
- * Must be called before accessing any untrusted input fields.
+ * Validate and sanitize untrusted input into detached plain data.
+ * NEVER mutates input. Returns deeply frozen detached clone.
  */
-function deepFreeze(obj, seen = new WeakSet()) {
-  if (obj === null || typeof obj !== 'object') {
-    return obj;
+function sanitizeUntrusted(value, allowedKeys = null, seen = new Map()) {
+  // Primitives: return as-is (immutable by nature)
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
   }
 
-  if (seen.has(obj)) {
-    throw new TypeError('circular reference detected');
-  }
-  seen.add(obj);
-
-  // Freeze before accessing to prevent getters/proxies
-  Object.freeze(obj);
-
-  // Check for symbol properties
-  const symbols = Object.getOwnPropertySymbols(obj);
-  if (symbols.length > 0) {
-    throw new TypeError(`symbol properties not allowed: ${symbols.map(s => String(s)).join(', ')}`);
+  // Reject non-object types
+  if (typeof value !== 'object') {
+    throw new TypeError(`Unsupported type: ${typeof value}`);
   }
 
-  // Check for pollution keys
-  for (const key of Object.keys(obj)) {
-    if (POLLUTION_KEYS.has(key)) {
-      throw new TypeError(`prototype pollution key not allowed: ${key}`);
-    }
+  // Detect cycles
+  if (seen.has(value)) {
+    throw new TypeError('Circular reference detected');
   }
+  seen.set(value, true);
 
-  for (const key of Object.keys(obj)) {
-    const value = obj[key];
-    if (value && typeof value === 'object') {
-      deepFreeze(value, seen);
-    }
-  }
-
-  return obj;
-}
-
-function filterObject(obj, allowedFields) {
-  if (!obj || typeof obj !== 'object') return {};
-
-  // Deep freeze to prevent attacker hooks
   try {
-    deepFreeze(obj);
-  } catch (err) {
-    throw new TypeError(`filterObject: input validation failed: ${err.message}`);
-  }
-
-  const filtered = {};
-  for (const field of allowedFields) {
-    if (Object.hasOwn(obj, field)) {
-      filtered[field] = obj[field];
+    // CRITICAL: Detect Proxy before ANY property access
+    if (util.types.isProxy(value)) {
+      throw new TypeError('Proxy objects not allowed');
     }
+
+    // Check prototype - must be Object.prototype, Array.prototype, or null
+    const proto = Object.getPrototypeOf(value);
+    const isArray = Array.isArray(value);
+    if (!isArray && proto !== Object.prototype && proto !== null) {
+      throw new TypeError(`Invalid prototype: ${proto?.constructor?.name || 'unknown'}`);
+    }
+
+    // Inspect all own property keys using Reflect to avoid traps
+    const ownKeys = Reflect.ownKeys(value);
+
+    // Reject symbol properties
+    const symbols = ownKeys.filter(k => typeof k === 'symbol');
+    if (symbols.length > 0) {
+      throw new TypeError(`Symbol properties not allowed: ${symbols.map(s => String(s)).join(', ')}`);
+    }
+
+    // Get all descriptors at once
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+
+    // Check for accessor properties (getter/setter) without invoking them
+    for (const [key, desc] of Object.entries(descriptors)) {
+      if (desc.get || desc.set) {
+        throw new TypeError(`Accessor property not allowed: ${key}`);
+      }
+    }
+
+    // Check for pollution keys
+    for (const key of Object.keys(descriptors)) {
+      if (POLLUTION_KEYS.has(key)) {
+        throw new TypeError(`Prototype pollution key not allowed: ${key}`);
+      }
+    }
+
+    // Arrays: clone to new detached array, recursively sanitize elements
+    if (isArray) {
+      // Detect sparse arrays - count numeric indices only (descriptors includes 'length')
+      const numericKeys = Object.keys(descriptors).filter(k => !isNaN(parseInt(k, 10)));
+      if (value.length !== numericKeys.length) {
+        throw new TypeError('Sparse arrays not allowed');
+      }
+
+      const cloned = [];
+      for (let i = 0; i < value.length; i++) {
+        cloned[i] = sanitizeUntrusted(value[i], null, seen);
+      }
+      seen.delete(value);
+      return Object.freeze(cloned);
+    }
+
+    // Objects: clone to new detached null-prototype object
+    const cloned = Object.create(null);
+    const keys = Object.keys(descriptors);
+
+    // If allowedKeys specified, filter to only those keys
+    const keysToProcess = allowedKeys ? keys.filter(k => allowedKeys.includes(k)) : keys;
+
+    for (const key of keysToProcess) {
+      cloned[key] = sanitizeUntrusted(value[key], null, seen);
+    }
+
+    seen.delete(value);
+    return Object.freeze(cloned);
+  } finally {
+    seen.delete(value);
   }
-  return filtered;
 }
 
-function filterObjectAlreadyFrozen(obj, allowedFields) {
-  if (!obj || typeof obj !== 'object') return {};
-
-  const filtered = {};
-  for (const field of allowedFields) {
-    if (Object.hasOwn(obj, field)) {
-      filtered[field] = obj[field];
-    }
+/**
+ * Validate required identity string - must be exact non-empty string.
+ * NO fallback values permitted.
+ */
+function requireIdentityString(value, fieldName) {
+  if (typeof value !== 'string') {
+    throw new TypeError(`${fieldName} must be a string, got ${typeof value}`);
   }
-  return filtered;
+  if (value.trim() === '') {
+    throw new TypeError(`${fieldName} must not be empty or whitespace`);
+  }
+  return value;
 }
 
 function filterUndefined(obj, seen = new WeakSet()) {
@@ -150,6 +191,10 @@ function calculateCanonicalHash(snapshot) {
   canonical.parentSequence = snapshot.parentSequence;
   canonical.inputWatermark = snapshot.inputWatermark;
 
+  // CRITICAL: Include identity in hash so changing space/session changes hash
+  canonical.parentSpaceId = snapshot.parentSpaceId;
+  canonical.parentSessionId = snapshot.parentSessionId;
+
   // canonicalHash from foundation already sorts keys and handles exact serialization
   return canonicalHash(canonical);
 }
@@ -170,21 +215,22 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
       };
     }
 
-    // Freeze turn object before accessing
+    // Sanitize turn before accessing any fields
+    let sanitized;
     try {
-      deepFreeze(turn);
+      sanitized = sanitizeUntrusted(turn);
     } catch (err) {
       return {
         resolvedStatus: null,
         mergeChain: chain,
-        integrityError: { code: 'TURN_VALIDATION_FAILED', turnId: currentTurnId, message: err.message }
+        integrityError: { code: 'TURN_VALIDATION_FAILED', turnId: currentTurnId, message: String(err.message).slice(0, 200) }
       };
     }
 
     chain.push(currentTurnId);
 
-    if (turn.status === 'merged') {
-      const nextTurnId = turn.mergedIntoTurnId || turn.continuedByTurnId;
+    if (sanitized.status === 'merged') {
+      const nextTurnId = sanitized.mergedIntoTurnId || sanitized.continuedByTurnId;
       if (!nextTurnId) {
         return {
           resolvedStatus: null,
@@ -199,7 +245,7 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
 
     // Terminal status reached
     return {
-      resolvedStatus: turn.status,
+      resolvedStatus: sanitized.status,
       mergeChain: chain.length > 1 ? chain : undefined,
       finalTurnId: currentTurnId
     };
@@ -215,6 +261,28 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
 export async function createSnapshot(goalInstance, cohubReader, ledger, localState) {
   const integrityErrors = [];
 
+  // CRITICAL: Require exact identity strings - NO fallbacks
+  let parentSpaceId, parentSessionId;
+  try {
+    parentSpaceId = requireIdentityString(localState.parentSpaceId, 'parentSpaceId');
+    parentSessionId = requireIdentityString(localState.parentSessionId, 'parentSessionId');
+  } catch (err) {
+    integrityErrors.push({
+      code: 'AUTHORITY_READ_FAILURE',
+      field: 'identity',
+      message: String(err.message).slice(0, 200)
+    });
+
+    return Object.freeze({
+      goalInstance,
+      snapshotHash: 'error',
+      integrityErrors: Object.freeze(integrityErrors),
+      decision: 'BLOCKED',
+      stale: true,
+      observedGeneration: localState.getGeneration?.() ?? localState.observedGeneration ?? 0
+    });
+  }
+
   // Fresh read all authority files
   let orchestrationState;
   let gateLog;
@@ -222,68 +290,85 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
   let parentIndex;
 
   try {
-    const spaceId = localState.parentSpaceId || 'default-space';
-    orchestrationState = await cohubReader.readRunFile(spaceId, 'orchestration_state.json');
-    gateLog = await cohubReader.readRunFile(spaceId, 'stage_gate_log.json');
-    manifest = await cohubReader.readRunFile(spaceId, 'run_manifest.json');
-    parentIndex = await cohubReader.getSessionIndex(spaceId, localState.parentSessionId || 'default-session');
-
-    // Freeze all inputs immediately after read to prevent attacker hooks
-    deepFreeze(orchestrationState);
-    deepFreeze(gateLog);
-    deepFreeze(manifest);
-    deepFreeze(parentIndex);
+    orchestrationState = await cohubReader.readRunFile(parentSpaceId, 'orchestration_state.json');
+    gateLog = await cohubReader.readRunFile(parentSpaceId, 'stage_gate_log.json');
+    manifest = await cohubReader.readRunFile(parentSpaceId, 'run_manifest.json');
+    parentIndex = await cohubReader.getSessionIndex(parentSpaceId, parentSessionId);
   } catch (err) {
     integrityErrors.push({
       code: 'AUTHORITY_READ_FAILURE',
       field: 'cohubReader',
-      message: err.message
+      message: 'authority file read failed'
     });
 
-    return {
+    return Object.freeze({
       goalInstance,
+      parentSpaceId,
+      parentSessionId,
       snapshotHash: 'error',
       integrityErrors: Object.freeze(integrityErrors),
       decision: 'BLOCKED',
       stale: true,
       observedGeneration: localState.getGeneration?.() ?? localState.observedGeneration ?? 0
-    };
+    });
   }
 
   // Capture generation after all reads
   const observedGeneration = localState.getGeneration?.() ?? localState.observedGeneration ?? 0;
 
-  // Validate critical fields - inputs already frozen
-  let filteredState;
-  let filteredGates;
+  // Sanitize all inputs into detached clones - NEVER mutates caller objects
+  let sanitizedState, sanitizedGates, sanitizedManifest, sanitizedParentIndex;
 
   try {
-    if (!orchestrationState || typeof orchestrationState.status !== 'string') {
-      integrityErrors.push({
-        code: 'ORCHESTRATION_STATE_INVALID',
-        field: 'orchestration_state.status',
-        message: 'status field missing or invalid'
-      });
-    }
-
-    // Filter to allowlisted fact domains - inputs already frozen by deepFreeze above
-    filteredState = filterObjectAlreadyFrozen(orchestrationState, ALLOWLISTED_STATE_FIELDS);
-    filteredGates = filterObjectAlreadyFrozen(gateLog, ALLOWLISTED_GATE_FIELDS);
+    sanitizedState = sanitizeUntrusted(orchestrationState, ALLOWLISTED_STATE_FIELDS);
+    sanitizedGates = sanitizeUntrusted(gateLog, ALLOWLISTED_GATE_FIELDS);
+    sanitizedManifest = sanitizeUntrusted(manifest);
+    sanitizedParentIndex = sanitizeUntrusted(parentIndex);
   } catch (err) {
     integrityErrors.push({
       code: 'INPUT_VALIDATION_FAILED',
-      field: 'orchestrationState',
-      message: err.message
+      field: 'sanitization',
+      message: String(err.message).slice(0, 200)
     });
 
-    return {
+    // Must return BLOCKED on validation failure
+    const blockedSnapshot = {
       goalInstance,
+      parentSpaceId,
+      parentSessionId,
       snapshotHash: 'error',
       integrityErrors: Object.freeze(integrityErrors),
       decision: 'BLOCKED',
       stale: true,
-      observedGeneration
+      observedGeneration,
+      workflowStatus: null,
+      stageStatus: null,
+      nextAction: null,
+      humanWait: null,
+      gates: Object.freeze([]),
+      tasks: Object.freeze([]),
+      workerStates: Object.freeze([]),
+      receipts: Object.freeze([]),
+      manifestId: null,
+      parentSequence: null,
+      currentParentSequence: null,
+      inputWatermark: null,
+      progressFingerprint: 'error',
+      blockingReason: 'Input validation failed',
+      watchSet: Object.freeze([]),
+      migrationVerdict: null
     };
+
+    return Object.freeze(blockedSnapshot);
+  }
+
+  // Validate critical fields from sanitized data
+  if (!sanitizedState || typeof sanitizedState.status !== 'string') {
+    integrityErrors.push({
+      code: 'ORCHESTRATION_STATE_INVALID',
+      field: 'status',
+      message: 'status field missing or invalid'
+    });
   }
 
   // Track worker states with merged-chain resolution
@@ -298,7 +383,7 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
         integrityErrors.push({
           code: 'WORKER_WRONG_SPACE',
           field: `trackedTurns[${tracked.turnId}].spaceId`,
-          message: `space ${tracked.spaceId} not in allowed list`
+          message: 'space not in allowed list'
         });
         continue;
       }
@@ -307,7 +392,7 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
         integrityErrors.push({
           code: 'WORKER_WRONG_SESSION',
           field: `trackedTurns[${tracked.turnId}].sessionId`,
-          message: `session ${tracked.sessionId} not in allowed list`
+          message: 'session not in allowed list'
         });
         continue;
       }
@@ -319,22 +404,17 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
         tracked.turnId
       );
 
-      const workerState = {
+      // Create detached worker state
+      const workerState = Object.freeze({
         originalTurnId: tracked.turnId,
         turnId: tracked.turnId,
         spaceId: tracked.spaceId,
         sessionId: tracked.sessionId,
-        resolvedStatus: resolution.resolvedStatus || null
-      };
-
-      if (resolution.mergeChain) {
-        workerState.mergeChain = resolution.mergeChain;
-        // For merged chains, set mergedIntoTurnId to the final turn
-        workerState.mergedIntoTurnId = resolution.finalTurnId;
-      }
-      if (resolution.integrityError) {
-        workerState.integrityError = resolution.integrityError;
-      }
+        resolvedStatus: resolution.resolvedStatus || null,
+        mergeChain: resolution.mergeChain ? Object.freeze([...resolution.mergeChain]) : undefined,
+        mergedIntoTurnId: resolution.finalTurnId || undefined,
+        integrityError: resolution.integrityError ? Object.freeze({ ...resolution.integrityError }) : undefined
+      });
 
       workerStates.push(workerState);
 
@@ -344,10 +424,10 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
     }
   }
 
-  // Calculate progress fingerprint
+  // Calculate progress fingerprint from sanitized data
   const progressFingerprint = calculateProgressFingerprint(
-    filteredState,
-    filteredGates,
+    sanitizedState,
+    sanitizedGates,
     workerStates
   );
 
@@ -357,30 +437,31 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
   let blockingReason = null;
 
   // REG-67-01: Historical fixture rule
-  if (filteredState.tasks && Array.isArray(filteredState.tasks)) {
-    const materials = filteredState.tasks.find((t) => t && t.id === 'materials');
-    const geography = filteredState.tasks.find((t) => t && t.id === 'geography');
-    const geographyReplacement = filteredState.tasks.find((t) => t && t.id === 'geography-replacement');
+  if (sanitizedState.tasks && Array.isArray(sanitizedState.tasks)) {
+    const materials = sanitizedState.tasks.find((t) => t && t.id === 'materials');
+    const geography = sanitizedState.tasks.find((t) => t && t.id === 'geography');
+    const geographyReplacement = sanitizedState.tasks.find((t) => t && t.id === 'geography-replacement');
 
     if (
       materials?.count === '148/148' &&
       geographyReplacement?.status === 'COMPLETED' &&
       geography?.status === 'DISPATCHED'
     ) {
-      const receipts = ledger.replacementReceipts || [];
+      // Clone ledger receipts into detached array
+      const receipts = ledger.replacementReceipts ? [...ledger.replacementReceipts] : [];
       const hasReplacementReceipt = receipts.some(
         (r) => r && r.workerId === geographyReplacement.workerId
       );
 
       if (!hasReplacementReceipt) {
         decision = 'RECONCILE_AND_FAN_IN';
-        nextActions = [
-          {
+        nextActions = Object.freeze([
+          Object.freeze({
             type: 'REGISTER_REPLACEMENT_RECEIPT',
             workerId: geographyReplacement.workerId || 'unknown',
             originalTaskId: geography?.id || 'geography'
-          }
-        ];
+          })
+        ]);
         blockingReason = 'replacement geography lacks binding receipt';
       }
     }
@@ -388,57 +469,74 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
 
   // Migration verdict
   let migrationVerdict = null;
-  if (localState.migrationMode && orchestrationState.parent) {
-    const hasUnboundReceipt = ledger.replacementReceipts?.length === 0 ||
-      ledger.replacementReceipts.some((r) => !r.bound);
+  if (localState.migrationMode && sanitizedState.parent) {
+    const receipts = ledger.replacementReceipts ? [...ledger.replacementReceipts] : [];
+    const hasUnboundReceipt = receipts.length === 0 || receipts.some((r) => !r.bound);
 
     if (hasUnboundReceipt) {
       migrationVerdict = 'UNBOUND_REPLACEMENT_RECEIPT';
     }
   }
 
-  // Build watch set from provenance
+  // Build watch set from provenance - deeply frozen
   const watchSet = [];
 
-  if (localState.parentSpaceId && localState.parentSessionId) {
-    watchSet.push({
-      spaceId: localState.parentSpaceId,
-      sessionId: localState.parentSessionId,
-      role: 'parent'
-    });
-  }
+  watchSet.push(Object.freeze({
+    spaceId: parentSpaceId,
+    sessionId: parentSessionId,
+    role: 'parent'
+  }));
 
   for (const worker of workerStates) {
-    watchSet.push({
+    watchSet.push(Object.freeze({
       spaceId: worker.spaceId,
       sessionId: worker.sessionId,
       turnId: worker.turnId,
       role: 'worker'
-    });
+    }));
   }
 
   // Check for staleness
-  const currentParentSequence = parentIndex?.sequence ?? localState.parentSequence;
+  const currentParentSequence = sanitizedParentIndex?.sequence ?? localState.parentSequence;
   const stale = localState.expectedParentSequence !== undefined &&
     currentParentSequence !== localState.expectedParentSequence;
 
+  // Clone ledger receipts to detached array - deep clone to prevent shared references
+  const detachedReceipts = ledger.replacementReceipts
+    ? Object.freeze(ledger.replacementReceipts.map(r => {
+        // Deep clone each receipt
+        const cloned = {};
+        for (const key of Object.keys(r)) {
+          const value = r[key];
+          if (value && typeof value === 'object') {
+            cloned[key] = Array.isArray(value) ? [...value] : { ...value };
+          } else {
+            cloned[key] = value;
+          }
+        }
+        return Object.freeze(cloned);
+      }))
+    : Object.freeze([]);
+
   const snapshot = {
     goalInstance,
-    workflowStatus: filteredState.status,
-    stageStatus: filteredState.stage,
-    nextAction: filteredState.nextAction,
-    humanWait: filteredState.humanWait,
-    gates: filteredGates.gates || [],
-    tasks: filteredState.tasks || [],
+    parentSpaceId,
+    parentSessionId,
+    workflowStatus: sanitizedState.status,
+    stageStatus: sanitizedState.stage,
+    nextAction: sanitizedState.nextAction,
+    humanWait: sanitizedState.humanWait,
+    gates: sanitizedGates.gates || Object.freeze([]),
+    tasks: sanitizedState.tasks || Object.freeze([]),
     workerStates: Object.freeze(workerStates),
-    receipts: (ledger.replacementReceipts || []),
-    manifestId: manifest?.id || null,
+    receipts: detachedReceipts,
+    manifestId: sanitizedManifest?.id || null,
     parentSequence: currentParentSequence,
     currentParentSequence,
     inputWatermark: localState.lastConsumedUserTurn || null,
     progressFingerprint,
     decision,
-    nextActions: nextActions ? Object.freeze(nextActions) : undefined,
+    nextActions: nextActions || undefined,
     blockingReason,
     watchSet: Object.freeze(watchSet),
     integrityErrors: integrityErrors.length > 0 ? Object.freeze(integrityErrors) : undefined,
@@ -455,17 +553,18 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
 export function calculateProgressFingerprint(state, gates, workerStates) {
   const fingerprintInput = {};
 
-  if (state?.status !== undefined && state.status !== null) {
+  // Access sanitized fields safely - no optional chaining on untrusted
+  if (state && state.status !== undefined && state.status !== null) {
     fingerprintInput.status = state.status;
   }
-  if (state?.stage !== undefined && state.stage !== null) {
+  if (state && state.stage !== undefined && state.stage !== null) {
     fingerprintInput.stage = state.stage;
   }
-  if (state?.nextAction !== undefined && state.nextAction !== null) {
+  if (state && state.nextAction !== undefined && state.nextAction !== null) {
     fingerprintInput.nextAction = state.nextAction;
   }
 
-  if (state?.tasks) {
+  if (state && state.tasks) {
     fingerprintInput.tasks = state.tasks.map((t) => {
       const task = { id: t.id };
       if (t.status !== undefined && t.status !== null) task.status = t.status;
@@ -474,7 +573,7 @@ export function calculateProgressFingerprint(state, gates, workerStates) {
     });
   }
 
-  if (gates?.gates) {
+  if (gates && gates.gates) {
     fingerprintInput.gates = gates.gates.map((g) => {
       const gate = { id: g.id };
       if (g.verdict !== undefined && g.verdict !== null) gate.verdict = g.verdict;

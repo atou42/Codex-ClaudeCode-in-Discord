@@ -3,10 +3,11 @@
  * Event deduplication by ID and logical terminal family, generation race protocol,
  * reconnect full reconciliation, user input watermark tracking.
  *
- * Security: Freezes event inputs before access, validates all unconsumed user turns
- * between watermark and latest (not just the last turn), protects against attacker hooks.
+ * Security: STRICT BOUNDARY - validates events before execution, never mutates caller
+ * seenSet until batch validates, rejects Proxy/getter before any property access.
  */
 
+import util from 'node:util';
 import { createSnapshot } from './snapshot.js';
 
 function makeLogicalTerminalKey(spaceId, sessionId, turnId, status) {
@@ -14,32 +15,98 @@ function makeLogicalTerminalKey(spaceId, sessionId, turnId, status) {
 }
 
 /**
- * Freeze event object before accessing to prevent descriptor/getter/proxy attacks.
+ * Validate event structure before ANY property access.
+ * MUST detect Proxy/getter/accessor before execution.
  */
-function freezeEvent(event) {
-  if (event && typeof event === 'object') {
-    Object.freeze(event);
-    // Access fields to trigger any getters/proxies now (will throw if malicious)
-    const _ = event.id;
-    const __ = event.spaceId;
-    const ___ = event.sessionId;
-    const ____ = event.turnId;
-    const _____ = event.status;
+function validateEvent(event) {
+  if (!event || typeof event !== 'object') {
+    throw new TypeError('Event must be an object');
   }
-  return event;
+
+  // CRITICAL: Detect Proxy before any property access
+  if (util.types.isProxy(event)) {
+    throw new TypeError('Proxy objects not allowed');
+  }
+
+  // Check prototype
+  const proto = Object.getPrototypeOf(event);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new TypeError('Invalid event prototype');
+  }
+
+  // Get descriptors to check for accessors without invoking them
+  const descriptors = Object.getOwnPropertyDescriptors(event);
+
+  // Reject accessor properties
+  for (const [key, desc] of Object.entries(descriptors)) {
+    if (desc.get || desc.set) {
+      throw new TypeError(`Accessor property not allowed in event: ${key}`);
+    }
+  }
+
+  // Reject symbol properties
+  const symbols = Object.getOwnPropertySymbols(event);
+  if (symbols.length > 0) {
+    throw new TypeError('Symbol properties not allowed in event');
+  }
+
+  // NOW safe to access fields (no getters/proxies can execute)
+  if (typeof event.id !== 'string' || event.id.trim() === '') {
+    throw new TypeError('Event id must be a non-empty string');
+  }
+  if (typeof event.spaceId !== 'string') {
+    throw new TypeError('Event spaceId must be a string');
+  }
+  if (typeof event.sessionId !== 'string') {
+    throw new TypeError('Event sessionId must be a string');
+  }
+  if (typeof event.turnId !== 'string') {
+    throw new TypeError('Event turnId must be a string');
+  }
+  if (typeof event.status !== 'string') {
+    throw new TypeError('Event status must be a string');
+  }
+
+  // Freeze to prevent mutation (but this is caller's object, so clone first if needed)
+  return Object.freeze({
+    id: event.id,
+    spaceId: event.spaceId,
+    sessionId: event.sessionId,
+    turnId: event.turnId,
+    status: event.status
+  });
 }
 
+/**
+ * Deduplicate events by ID and logical terminal family.
+ * CRITICAL: Must validate ALL events before updating seenSet.
+ * If any event is malformed, seenSet must remain unchanged (no partial state).
+ */
 export function deduplicateEvents(events, seenSet) {
-  const deduplicated = [];
+  if (!Array.isArray(events)) {
+    throw new TypeError('events must be an array');
+  }
 
+  if (!seenSet || typeof seenSet.add !== 'function') {
+    throw new TypeError('seenSet must be a Set');
+  }
+
+  // Phase 1: Validate ALL events first (before mutating seenSet)
+  const validated = [];
   for (const event of events) {
-    // Freeze and validate before accessing
     try {
-      freezeEvent(event);
+      const validatedEvent = validateEvent(event);
+      validated.push(validatedEvent);
     } catch (err) {
+      // On ANY validation error, throw without modifying seenSet
       throw new Error(`deduplicateEvents: malicious event detected: ${err.message}`);
     }
+  }
 
+  // Phase 2: Now safe to process and update seenSet
+  const deduplicated = [];
+
+  for (const event of validated) {
     let isDuplicate = false;
 
     // Check event ID duplication
@@ -59,7 +126,7 @@ export function deduplicateEvents(events, seenSet) {
       isDuplicate = true;
     }
 
-    // Always record the event ID and logical key for auditing
+    // Record in seenSet
     seenSet.add(event.id);
     seenSet.add(logicalKey);
 
@@ -75,14 +142,33 @@ export function deduplicateEvents(events, seenSet) {
 /**
  * Detects ALL unconsumed user input between lastConsumedUserTurn and the latest turn.
  * Spec requirement: not just the last turn, but all unconsumed user turns.
+ * MUST sanitize parentIndex before accessing nested fields.
  */
 function detectUnconsumedUserInput(parentIndex, lastConsumedUserTurn) {
-  if (!parentIndex?.turns) return false;
+  if (!parentIndex || typeof parentIndex !== 'object') {
+    return false;
+  }
+
+  // Validate parentIndex structure before access
+  if (util.types.isProxy(parentIndex)) {
+    throw new TypeError('Proxy not allowed in parentIndex');
+  }
+
+  const turns = parentIndex.turns;
+  const turnsMetadata = parentIndex.turns_metadata;
+
+  if (!turns || !Array.isArray(turns)) {
+    return false;
+  }
 
   const userTurns = [];
-  for (const turnId of parentIndex.turns) {
-    const metadata = parentIndex.turns_metadata?.[turnId];
-    if (metadata?.role === 'user') {
+  for (const turnId of turns) {
+    if (!turnsMetadata || typeof turnsMetadata !== 'object') {
+      continue;
+    }
+
+    const metadata = turnsMetadata[turnId];
+    if (metadata && typeof metadata === 'object' && metadata.role === 'user') {
       userTurns.push(turnId);
     }
   }
@@ -114,31 +200,51 @@ export async function reconcile(goalInstance, cohubReader, ledger, localState) {
 
   // Generation race detection
   if (generationBefore !== generationAfter) {
-    return {
+    return Object.freeze({
       snapshot,
       stale: true,
       mustReconcile: true,
       observedGeneration: generationAfter,
       reason: 'generation_changed_during_read'
-    };
+    });
   }
 
-  // Check for unconsumed user input
-  let parentIndex;
+  // Check for unconsumed user input - must validate identity first
+  let parentSpaceId, parentSessionId;
   try {
-    const spaceId = localState.parentSpaceId || 'default-space';
-    const sessionId = localState.parentSessionId || 'default-session';
-    parentIndex = await cohubReader.getSessionIndex(spaceId, sessionId);
+    if (typeof localState.parentSpaceId !== 'string' || localState.parentSpaceId.trim() === '') {
+      throw new TypeError('parentSpaceId required');
+    }
+    if (typeof localState.parentSessionId !== 'string' || localState.parentSessionId.trim() === '') {
+      throw new TypeError('parentSessionId required');
+    }
+    parentSpaceId = localState.parentSpaceId;
+    parentSessionId = localState.parentSessionId;
   } catch (err) {
-    return {
-      snapshot: {
+    return Object.freeze({
+      snapshot: Object.freeze({
         ...snapshot,
         decision: 'BLOCKED',
-        blockingReason: `parent index read failure: ${err.message}`
-      },
+        blockingReason: 'missing required identity'
+      }),
       stale: true,
       hasUnconsumedInput: false
-    };
+    });
+  }
+
+  let parentIndex;
+  try {
+    parentIndex = await cohubReader.getSessionIndex(parentSpaceId, parentSessionId);
+  } catch (err) {
+    return Object.freeze({
+      snapshot: Object.freeze({
+        ...snapshot,
+        decision: 'BLOCKED',
+        blockingReason: 'parent index read failure'
+      }),
+      stale: true,
+      hasUnconsumedInput: false
+    });
   }
 
   const hasUnconsumedInput = detectUnconsumedUserInput(
@@ -147,15 +253,15 @@ export async function reconcile(goalInstance, cohubReader, ledger, localState) {
   );
 
   if (hasUnconsumedInput) {
-    return {
-      snapshot: {
+    return Object.freeze({
+      snapshot: Object.freeze({
         ...snapshot,
         decision: 'BLOCKED_UNCONSUMED_INPUT',
         blockingReason: 'unconsumed user input in parent session'
-      },
+      }),
       stale: true,
       hasUnconsumedInput: true
-    };
+    });
   }
 
   // Migration verdict for REG-67-01
@@ -163,21 +269,21 @@ export async function reconcile(goalInstance, cohubReader, ledger, localState) {
 
   // Reconnect reconciliation
   if (localState.reconnected) {
-    return {
+    return Object.freeze({
       snapshot,
       stale: false,
       hasUnconsumedInput,
       migrationVerdict,
       reconnected: true,
       reason: 'full_reconciliation_after_reconnect'
-    };
+    });
   }
 
-  return {
+  return Object.freeze({
     snapshot,
     stale: snapshot.stale || false,
     hasUnconsumedInput,
     migrationVerdict,
     observedGeneration: generationAfter
-  };
+  });
 }
