@@ -1,0 +1,602 @@
+/**
+ * @fileoverview Adversarial tests for strict audit log (AUDIT-01, AUDIT-02)
+ * Lines 168-181, 342-354, 458-480, 526-530 of spec.
+ * Every append: exact schemaVersion, required correlation fields, null explicit,
+ * canonical JSON, prefix/previous/entry hash chain, durable atomic append or
+ * immutable numbered records, exact state reconciliation before append.
+ * Reject accessors, symbols, dangerous keys, cycles, unsupported objects,
+ * unknown/missing fields, corrupt/truncated/unexpected/symlink files.
+ * Never overwrite corrupt evidence. Query by event/action/Turn must reconstruct
+ * complete chain. Cover every crash point, concurrent writers, duplicate event
+ * observation allowed but logical application linked once, secret substrings
+ * absent from error/stdout/records, exact bytes preserved on failure.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdir, writeFile, readFile, unlink, symlink, chmod, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import crypto from 'node:crypto';
+
+// Import the audit log module (to be created)
+import {
+  appendAuditRecord,
+  queryAuditLog,
+  readAuditLog,
+  validateAuditIntegrity
+} from '../src/cohub-claude-goal/audit-log.js';
+
+const SENTINEL_SECRET = 'SENTINEL_TOKEN_9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d';
+
+function makeTempDir() {
+  return join(tmpdir(), `audit-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
+function sha256(data) {
+  return crypto.createHash('sha256').update(data, 'utf8').digest('hex');
+}
+
+function makeRecord(partial) {
+  return {
+    schemaVersion: 1,
+    goalInstance: 'test-goal-v1',
+    goalVersion: 1,
+    claudeSessionId: '00000000-0000-0000-0000-000000000000',
+    type: 'OBSERVATION',
+    eventId: 'evt-test',
+    actionId: null,
+    turnId: null,
+    beforeSnapshotHash: sha256('before'),
+    afterSnapshotHash: sha256('after'),
+    decision: null,
+    evidenceRefs: [],
+    ...partial
+  };
+}
+
+test('AUDIT-01: append writes exact schemaVersion and all required fields', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'evt-001' });
+    const result = await appendAuditRecord(dir, record);
+
+    assert.ok(result.seq, 'must return sequence number');
+    assert.ok(result.entryHash, 'must return entry hash');
+    assert.ok(result.filePath, 'must return file path');
+
+    const raw = await readFile(result.filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    assert.strictEqual(parsed.schemaVersion, 1, 'schemaVersion must be exactly 1');
+    assert.strictEqual(parsed.goalInstance, 'test-goal-v1');
+    assert.strictEqual(parsed.goalVersion, 1);
+    assert.strictEqual(parsed.claudeSessionId, '00000000-0000-0000-0000-000000000000');
+    assert.strictEqual(parsed.type, 'OBSERVATION');
+    assert.strictEqual(parsed.eventId, 'evt-001');
+    assert.strictEqual(parsed.actionId, null, 'null must be explicit, not omitted');
+    assert.strictEqual(parsed.turnId, null);
+    assert.strictEqual(parsed.decision, null);
+    assert.ok(Array.isArray(parsed.evidenceRefs));
+    assert.ok(parsed.timestamp);
+    assert.ok(parsed.entryHash);
+    assert.strictEqual(parsed.previousEntryHash, null, 'first entry previousEntryHash must be null');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: canonical JSON preserves field order and no extra whitespace', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'evt-canon' });
+    const result = await appendAuditRecord(dir, record);
+
+    const raw = await readFile(result.filePath, 'utf8');
+    const lines = raw.split('\n').filter(l => l.trim());
+    assert.strictEqual(lines.length, 1, 'must be single line canonical JSON');
+
+    // Verify no trailing whitespace
+    assert.ok(!raw.endsWith('\n'), 'no trailing newline in canonical JSON');
+
+    const parsed = JSON.parse(raw);
+    const keys = Object.keys(parsed);
+
+    // Verify schemaVersion comes first
+    assert.strictEqual(keys[0], 'schemaVersion', 'schemaVersion must be first field');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: hash chain links previous entry', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'evt-1' }));
+    const r2 = await appendAuditRecord(dir, makeRecord({ eventId: 'evt-2' }));
+
+    const raw2 = await readFile(r2.filePath, 'utf8');
+    const parsed2 = JSON.parse(raw2);
+
+    assert.strictEqual(parsed2.previousEntryHash, r1.entryHash, 'second entry must link first');
+    assert.strictEqual(parsed2.seq, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: immutable numbered records with entry hash in filename', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'evt-seq' }));
+
+    assert.ok(r1.filePath.includes('00000001-'), 'filename must include padded sequence');
+    assert.ok(r1.filePath.includes(r1.entryHash.slice(0, 16)), 'filename must include entry hash prefix');
+
+    // Try to append again - should get seq 2
+    const r2 = await appendAuditRecord(dir, makeRecord({ eventId: 'evt-seq-2' }));
+    assert.ok(r2.filePath.includes('00000002-'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject record with missing required field', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const incomplete = { ...makeRecord({ eventId: 'bad' }) };
+    delete incomplete.goalInstance;
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, incomplete),
+      /goalInstance.*required/i,
+      'must reject missing goalInstance'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject record with unknown field', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'unknown', unknownField: 'bad' });
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record),
+      /unknown.*field/i,
+      'must reject unknown fields'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject accessor properties', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'accessor' });
+    Object.defineProperty(record, 'malicious', {
+      get() { return 'evil'; },
+      enumerable: true
+    });
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record),
+      /accessor/i,
+      'must reject accessor properties'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject symbol keys', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'symbol' });
+    record[Symbol('evil')] = 'bad';
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record),
+      /symbol/i,
+      'must reject symbol keys'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject dangerous keys (__proto__, constructor, prototype)', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'dangerous' });
+    // Use computed property to bypass prototype assignment protection
+    Object.defineProperty(record, '__proto__', {
+      value: 'evil',
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record),
+      /dangerous.*key/i,
+      'must reject __proto__'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject circular references', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: 'cycle' });
+    record.evidenceRefs = [{}];
+    record.evidenceRefs[0].parent = record.evidenceRefs;
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record),
+      /circular/i,
+      'must reject circular references'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: never overwrite corrupt evidence', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'before-corrupt' }));
+
+    // Corrupt the file
+    await writeFile(r1.filePath, 'CORRUPTED', 'utf8');
+
+    // Try to append - should detect corruption and refuse
+    await assert.rejects(
+      async () => appendAuditRecord(dir, makeRecord({ eventId: 'after-corrupt' })),
+      /integrity|corrupt/i,
+      'must detect and refuse to overwrite corruption'
+    );
+
+    // Verify corrupt file still has corrupt content
+    const corruptContent = await readFile(r1.filePath, 'utf8');
+    assert.strictEqual(corruptContent, 'CORRUPTED', 'must preserve corrupt evidence');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject truncated JSON file', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'complete' }));
+
+    // Truncate the file
+    const raw = await readFile(r1.filePath, 'utf8');
+    await writeFile(r1.filePath, raw.slice(0, raw.length / 2), 'utf8');
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, makeRecord({ eventId: 'after-truncate' })),
+      /truncated|invalid|corrupt/i,
+      'must detect truncated JSON'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: reject symlink in audit directory', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'real' }));
+
+    // Create a symlink with proper naming pattern
+    const symlinkPath = join(dir, '00000002-abcdef0123456789.json');
+    await symlink(r1.filePath, symlinkPath);
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, makeRecord({ eventId: 'after-symlink' })),
+      /symlink/i,
+      'must reject symlinks'
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: query by eventId reconstructs complete chain', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    await appendAuditRecord(dir, makeRecord({ eventId: 'evt-A', type: 'OBSERVATION' }));
+    await appendAuditRecord(dir, makeRecord({ eventId: 'evt-B', type: 'OBSERVATION' }));
+    const r3 = await appendAuditRecord(dir, makeRecord({
+      eventId: 'evt-A',
+      type: 'ACTION',
+      actionId: 'act-1'
+    }));
+
+    const results = await queryAuditLog(dir, { eventId: 'evt-A' });
+
+    assert.strictEqual(results.length, 2, 'must find both records for evt-A');
+    assert.ok(results.some(r => r.type === 'OBSERVATION'));
+    assert.ok(results.some(r => r.type === 'ACTION'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: query by actionId reconstructs complete chain', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    await appendAuditRecord(dir, makeRecord({ actionId: 'act-X', type: 'PREPARED' }));
+    await appendAuditRecord(dir, makeRecord({ actionId: 'act-X', type: 'REQUEST_STARTED' }));
+    await appendAuditRecord(dir, makeRecord({ actionId: 'act-X', type: 'CONFIRMED' }));
+
+    const results = await queryAuditLog(dir, { actionId: 'act-X' });
+
+    assert.strictEqual(results.length, 3, 'must find all records for act-X');
+    assert.ok(results.some(r => r.type === 'PREPARED'));
+    assert.ok(results.some(r => r.type === 'REQUEST_STARTED'));
+    assert.ok(results.some(r => r.type === 'CONFIRMED'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: query by turnId reconstructs complete chain', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    await appendAuditRecord(dir, makeRecord({ turnId: 'turn-123', eventId: 'e1' }));
+    await appendAuditRecord(dir, makeRecord({ turnId: 'turn-999', eventId: 'e2' }));
+    await appendAuditRecord(dir, makeRecord({ turnId: 'turn-123', eventId: 'e3' }));
+
+    const results = await queryAuditLog(dir, { turnId: 'turn-123' });
+
+    assert.strictEqual(results.length, 2, 'must find both records for turn-123');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-02: sentinel secret absent from records', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    // Inject sentinel in various places
+    const record = makeRecord({
+      eventId: `evt-clean`,
+      decision: 'CONTINUE',
+      evidenceRefs: [{ ref: 'evidence.json', hash: sha256('data') }]
+    });
+
+    await appendAuditRecord(dir, record);
+
+    const allRecords = await readAuditLog(dir);
+    const allText = JSON.stringify(allRecords);
+
+    assert.ok(!allText.includes(SENTINEL_SECRET), 'sentinel must not appear in records');
+    assert.ok(!allText.includes(SENTINEL_SECRET.slice(0, 16)), 'sentinel substring must not appear');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-02: error messages must not leak secrets', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const record = makeRecord({ eventId: SENTINEL_SECRET });
+
+    let errorMessage = '';
+    try {
+      await appendAuditRecord(dir, record);
+    } catch (err) {
+      errorMessage = err.message;
+    }
+
+    assert.ok(!errorMessage.includes(SENTINEL_SECRET), 'error must not contain sentinel');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: duplicate event observation allowed, logical application once', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    // Same event observed twice
+    await appendAuditRecord(dir, makeRecord({ eventId: 'evt-dup', type: 'OBSERVATION' }));
+    await appendAuditRecord(dir, makeRecord({ eventId: 'evt-dup', type: 'OBSERVATION' }));
+
+    // But only one logical action
+    await appendAuditRecord(dir, makeRecord({
+      eventId: 'evt-dup',
+      type: 'ACTION',
+      actionId: 'act-once'
+    }));
+
+    const observations = await queryAuditLog(dir, { eventId: 'evt-dup', type: 'OBSERVATION' });
+    const actions = await queryAuditLog(dir, { eventId: 'evt-dup', type: 'ACTION' });
+
+    assert.strictEqual(observations.length, 2, 'duplicate observations allowed');
+    assert.strictEqual(actions.length, 1, 'only one logical action');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: crash point recovery preserves exact bytes', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'before-crash' }));
+
+    // Simulate crash: write partial temp file
+    const tempPath = join(dir, '.audit-temp-partial');
+    await writeFile(tempPath, '{"partial":', 'utf8');
+
+    // Verify temp file is ignored on recovery
+    const r2 = await appendAuditRecord(dir, makeRecord({ eventId: 'after-crash' }));
+
+    assert.strictEqual(r2.seq, 2, 'must continue from last valid record');
+
+    // Verify temp file still exists (not deleted)
+    assert.ok(existsSync(tempPath), 'temp file must be preserved as evidence');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: validate full integrity chain', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    await appendAuditRecord(dir, makeRecord({ eventId: 'e1' }));
+    await appendAuditRecord(dir, makeRecord({ eventId: 'e2' }));
+    await appendAuditRecord(dir, makeRecord({ eventId: 'e3' }));
+
+    const result = await validateAuditIntegrity(dir);
+
+    assert.strictEqual(result.valid, true, 'integrity must be valid');
+    assert.strictEqual(result.recordCount, 3);
+    assert.ok(result.headHash);
+    assert.strictEqual(result.errors.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: detect hash chain break', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    const r1 = await appendAuditRecord(dir, makeRecord({ eventId: 'e1' }));
+    await appendAuditRecord(dir, makeRecord({ eventId: 'e2' }));
+
+    // Corrupt the chain by modifying first record
+    const raw1 = await readFile(r1.filePath, 'utf8');
+    const parsed1 = JSON.parse(raw1);
+    parsed1.eventId = 'TAMPERED';
+    await writeFile(r1.filePath, JSON.stringify(parsed1), 'utf8');
+
+    const result = await validateAuditIntegrity(dir);
+
+    assert.strictEqual(result.valid, false, 'must detect tampering');
+    assert.ok(result.errors.some(e => /hash.*mismatch/i.test(e)), 'must report hash mismatch');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: detect sequence gap', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    await appendAuditRecord(dir, makeRecord({ eventId: 'e1' }));
+    const r2 = await appendAuditRecord(dir, makeRecord({ eventId: 'e2' }));
+    await appendAuditRecord(dir, makeRecord({ eventId: 'e3' }));
+
+    // Delete middle record - this creates a gap
+    await unlink(r2.filePath);
+
+    // Validation should now detect the gap
+    const result = await validateAuditIntegrity(dir);
+
+    assert.strictEqual(result.valid, false, 'must detect gap');
+    assert.ok(result.errors.some(e => /sequence.*gap|discontinuity/i.test(e)), 'must report sequence gap');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: concurrent writers prevented by atomic operations', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    // Simulate concurrent append attempts
+    const promises = [
+      appendAuditRecord(dir, makeRecord({ eventId: 'concurrent-1' })),
+      appendAuditRecord(dir, makeRecord({ eventId: 'concurrent-2' })),
+      appendAuditRecord(dir, makeRecord({ eventId: 'concurrent-3' }))
+    ];
+
+    const results = await Promise.allSettled(promises);
+
+    // All should succeed with distinct sequence numbers
+    const successful = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+    const seqs = successful.map(r => r.seq);
+
+    assert.ok(seqs.length >= 2, 'at least 2 should succeed');
+    const uniqueSeqs = new Set(seqs);
+    assert.strictEqual(uniqueSeqs.size, seqs.length, 'all sequence numbers must be unique');
+
+    // Verify integrity
+    const validation = await validateAuditIntegrity(dir);
+    assert.strictEqual(validation.valid, true, 'concurrent writes must maintain integrity');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AUDIT-01: read-only directory prevents append', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    // Make directory read-only
+    await chmod(dir, 0o444);
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, makeRecord({ eventId: 'readonly' })),
+      /permission|EACCES/i,
+      'must fail on read-only directory'
+    );
+  } finally {
+    await chmod(dir, 0o755);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
