@@ -20,13 +20,13 @@ export const EXIT_CODES = {
 };
 
 // Local state machine from spec lines 144-167
-// Resume is legal ONLY from WAITING_COHUB (recoverable Cohub wait state).
-// PAUSED_USER/BLOCKED/DONE/INTEGRITY_FAILURE require launcher-controlled new /goal.
-// RUNNING_CLAUDE must never resume via CLI.
-const LEGAL_TRANSITIONS = {
+// Resume is legal from WAITING_COHUB (active wait), PAUSED_USER (after user gate settle),
+// BLOCKED (after blocker removed), and interrupted RUNNING_CLAUDE (crash recovery).
+// Launcher logic decides whether to resume active condition or send new /goal for settle.
+export const LEGAL_TRANSITIONS = {
   init: new Set(['NEW']),
   start: new Set(['NEW', 'READY']),
-  resume: new Set(['WAITING_COHUB']),
+  resume: new Set(['WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'RUNNING_CLAUDE']),
   doctor: new Set(['NEW', 'READY', 'RUNNING_CLAUDE', 'WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'DONE', 'INTEGRITY_FAILURE']),
   'dry-run': new Set(['NEW', 'READY', 'RUNNING_CLAUDE', 'WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'DONE']),
   status: new Set(['NEW', 'READY', 'RUNNING_CLAUDE', 'WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'DONE', 'INTEGRITY_FAILURE']),

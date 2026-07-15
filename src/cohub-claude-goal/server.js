@@ -22,8 +22,14 @@ const MAX_STRING_LENGTH = 10000;
 const MAX_DEPTH = 20;
 const MAX_TOTAL_BYTES = 100 * 1024; // 100KB input limit
 
-// Exact decision allowlist from spec
-const ALLOWED_DECISIONS = new Set(['CONTINUE', 'DISPATCH', 'RECEIVE', 'APPROVE', 'COMPLETE']);
+// Exact decision allowlist from action-slot.js integration worktree
+const ALLOWED_DECISIONS = new Set([
+  'action-start',
+  'worker-dispatch',
+  'user-gate-response',
+  'block-report',
+  'external-wait-register'
+]);
 
 // Exact watch role allowlist from spec
 const ALLOWED_WATCH_ROLES = new Set(['parent', 'worker', 'merged']);
@@ -78,6 +84,8 @@ const ERROR_MESSAGES = {
   INVALID_DECISION: 'decision not in allowlist',
   INVALID_EVIDENCE_REF: 'evidence reference invalid',
   INVALID_WATCH_ITEM: 'watch item invalid',
+  INVALID_TYPE: 'type does not match schema',
+  INVALID_LENGTH: 'length constraint violated',
 
   // Allowlist validation
   GOAL_NOT_ALLOWED: 'goal not in allowlist',
@@ -384,6 +392,16 @@ function validateArguments(toolName, args, schema) {
     }
   }
 
+  // Type validation for all tools: goalInstance must be string with length constraints
+  if ('goalInstance' in validated) {
+    if (typeof validated.goalInstance !== 'string') {
+      throw new MCPValidationError('INVALID_TYPE');
+    }
+    if (validated.goalInstance.length < 1 || validated.goalInstance.length > 200) {
+      throw new MCPValidationError('INVALID_LENGTH');
+    }
+  }
+
   // Semantic validation based on tool
   if (toolName === 'cohub_goal_submit') {
     validated.expectedSnapshotHash = validateHash(validated.expectedSnapshotHash);
@@ -414,19 +432,37 @@ function validateArguments(toolName, args, schema) {
 }
 
 /**
- * Secret-bearing field patterns that must not appear in output
+ * Exact known secret/raw field names that must not appear in output.
+ * Spec lines 348-354: no broad heuristics that reject legitimate fields
+ * like checkpointId, authorityMode, tokenBudget, keylessHash.
+ * This is an EXACT-MATCH set, not a pattern heuristic.
  */
-const SECRET_FIELD_PATTERNS = [
-  /token/i,
-  /secret/i,
-  /password/i,
-  /auth/i,
-  /credential/i,
-  /key/i
-];
+const KNOWN_SECRET_FIELDS = new Set([
+  // Auth secrets
+  'accessToken',
+  'refreshToken',
+  'cohubToken',
+  'password',
+  'secret',
+  'credential',
+  'credentials',
+  'apiKey',
+  'privateKey',
+  'bearerToken',
+  'authorization',
+  'cookie',
+  'SECRET_KEY',
+  // Raw environment / raw dependency internals
+  'env',
+  '_rawBody',
+  '_httpHeaders',
+  '_rawResponse',
+  '_headers'
+]);
 
 /**
- * Check for secret-bearing fields (fail-closed: presence = error)
+ * Check for exact known secret fields (fail-closed: presence = error).
+ * Does NOT use broad patterns that would reject legitimate fields.
  */
 function checkForSecrets(obj, path = 'output') {
   if (obj === null || typeof obj !== 'object') {
@@ -441,11 +477,9 @@ function checkForSecrets(obj, path = 'output') {
   }
 
   for (const key of Object.keys(obj)) {
-    // Check if key matches secret pattern
-    for (const pattern of SECRET_FIELD_PATTERNS) {
-      if (pattern.test(key)) {
-        throw new Error('SECRET_FIELD_IN_OUTPUT');
-      }
+    // Check if key exactly matches a known secret field
+    if (KNOWN_SECRET_FIELDS.has(key)) {
+      throw new Error('SECRET_FIELD_IN_OUTPUT');
     }
 
     // Recursively check nested objects

@@ -326,13 +326,15 @@ test('CLI - resume command', async (t) => {
     }
   });
 
-  await t.test('resume ILLEGAL from RUNNING_CLAUDE', async () => {
+  await t.test('resume LEGAL from RUNNING_CLAUDE (interrupted crash recovery)', async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
     try {
       const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
 
       const mockDeps = {
-        getLocalState: async () => 'RUNNING_CLAUDE'
+        getLocalState: async () => 'RUNNING_CLAUDE',
+        reconcile: async () => ({ status: 'ok' }),
+        launchClaude: async () => ({ exitCode: 0 })
       };
 
       const result = await runCommand('resume', {
@@ -340,8 +342,8 @@ test('CLI - resume command', async (t) => {
         deps: mockDeps
       });
 
-      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
-      assert.match(result.stderr, /illegal state.*resume.*RUNNING_CLAUDE/i);
+      // Spec lines 364-365: resume allows interrupted RUNNING_CLAUDE
+      assert.notEqual(result.exitCode, 2, 'RUNNING_CLAUDE must be legal for resume');
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
@@ -435,13 +437,15 @@ test('CLI - resume command', async (t) => {
     }
   });
 
-  await t.test('resume ILLEGAL from PAUSED_USER (needs launcher /goal)', async () => {
+  await t.test('resume LEGAL from PAUSED_USER (launcher sends new /goal)', async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
     try {
       const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
 
       const mockDeps = {
-        getLocalState: async () => 'PAUSED_USER'
+        getLocalState: async () => 'PAUSED_USER',
+        reconcile: async () => ({ status: 'ok' }),
+        launchClaude: async () => ({ exitCode: 0 })
       };
 
       const result = await runCommand('resume', {
@@ -449,20 +453,22 @@ test('CLI - resume command', async (t) => {
         deps: mockDeps
       });
 
-      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
-      assert.match(result.stderr, /illegal state.*resume.*PAUSED_USER/i);
+      // Spec lines 364-365: resume allows PAUSED_USER, launcher sends new /goal
+      assert.notEqual(result.exitCode, 2, 'PAUSED_USER must be legal for resume');
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
   });
 
-  await t.test('resume ILLEGAL from BLOCKED (needs launcher /goal)', async () => {
+  await t.test('resume LEGAL from BLOCKED (launcher sends new /goal after blocker removed)', async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
     try {
       const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
 
       const mockDeps = {
-        getLocalState: async () => 'BLOCKED'
+        getLocalState: async () => 'BLOCKED',
+        reconcile: async () => ({ status: 'ok' }),
+        launchClaude: async () => ({ exitCode: 0 })
       };
 
       const result = await runCommand('resume', {
@@ -470,8 +476,8 @@ test('CLI - resume command', async (t) => {
         deps: mockDeps
       });
 
-      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
-      assert.match(result.stderr, /illegal state.*resume.*BLOCKED/i);
+      // Spec lines 364-365: resume allows BLOCKED, launcher sends new /goal after blocker removed
+      assert.notEqual(result.exitCode, 2, 'BLOCKED must be legal for resume');
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
