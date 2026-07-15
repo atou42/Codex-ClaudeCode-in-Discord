@@ -218,7 +218,7 @@ test('verify: RUNNING must have exact next action or watchSet, never UNKNOWN', a
   const result = verify(MOCK_GOAL, { snapshot });
 
   assert.strictEqual(result.verdict, 'BLOCKED', 'Must return BLOCKED for UNKNOWN nextAction');
-  assert.match(result.reason, /UNKNOWN/i, 'Reason must mention UNKNOWN');
+  assert.match(result.reason, /INVALID_NEXT_ACTION/i, 'Reason must indicate invalid action');
 });
 
 test('verify: fake DONE with init checkpoint', async () => {
@@ -230,31 +230,38 @@ test('verify: fake DONE with init checkpoint', async () => {
     deliveryEvidence: {
       schemaVersion: '1.0',
       worldId: 'w1',
-      spaceId: 'sp1',
+      spaceId: 'sp_test', // Must match MOCK_GOAL.spaceId
       checkpointId: 'init_checkpoint', // fake!
       checkpointCreatedAt: '2026-07-15T10:00:00Z',
       manifestSha256: VALID_HASH,
       studioUrl: 'https://neta.art/w1',
-      cohubUrl: 'https://cohub.run/sp1',
+      cohubUrl: 'https://cohub.run/sp_test',
+      parentSessionId: 'sess_001',
+      parentTurnId: 'turn_001',
       desktopScreenshot: {
         sha256: VALID_HASH,
         width: 1440,
         height: 900,
         capturedAt: '2026-07-15T10:01:00Z',
-        manifestHash: VALID_HASH
+        manifestHash: VALID_HASH,
+        worldId: 'w1',
+        checkpointId: 'init_checkpoint'
       },
       mobileScreenshot: {
         sha256: VALID_HASH,
         width: 390,
         height: 844,
         capturedAt: '2026-07-15T10:01:00Z',
-        manifestHash: VALID_HASH
+        manifestHash: VALID_HASH,
+        worldId: 'w1',
+        checkpointId: 'init_checkpoint'
       },
       guestProbe: {
         status: 200,
         role: 'guest',
         requestHadCookie: false,
-        requestHadAuthorization: false
+        requestHadAuthorization: false,
+        observedWorldId: 'w1'
       },
       finalReport: VALID_HASH,
       gateLog: VALID_HASH,
@@ -267,7 +274,7 @@ test('verify: fake DONE with init checkpoint', async () => {
 
   assert.strictEqual(result.verdict, 'BLOCKED',
     'Must BLOCK fake completion with init checkpoint');
-  assert.match(result.reason, /init checkpoint.*forbidden/i);
+  assert.match(result.reason, /INIT_CHECKPOINT_FORBIDDEN/i);
 });
 
 test('verify: DONE requires all exact evidence fields', async () => {

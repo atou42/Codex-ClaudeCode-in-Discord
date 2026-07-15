@@ -163,7 +163,7 @@ test('detectNoProgress - tool action resets', () => {
   ];
   const currentFp = 'e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff';
 
-  const result = detectNoProgress(currentFp, history, { hadToolAction: true });
+  const result = detectNoProgress(currentFp, history, { hadToolAction: true, toolActionWasRelevant: true });
 
   assert.strictEqual(result.isNoProgress, false);
   assert.strictEqual(result.count, 0);

@@ -185,15 +185,17 @@ test('detectNoProgress - unknown fields in currentTurn not leaked', () => {
   }
 });
 
-test('detectNoProgress - symbol keys are not copied', () => {
+test('detectNoProgress - symbol keys are rejected', () => {
   const sym = Symbol('evil');
   const currentTurn = { hadToolAction: false };
   currentTurn[sym] = 'hidden';
 
-  const result = detectNoProgress(VALID_FP, [], currentTurn);
-
-  const symbols = Object.getOwnPropertySymbols(result);
-  assert.strictEqual(symbols.length, 0, 'No symbol properties should exist');
+  // Stricter implementation now rejects symbol keys rather than silently dropping
+  assert.throws(
+    () => detectNoProgress(VALID_FP, [], currentTurn),
+    /Symbol keys are not allowed/i,
+    'Symbol keys must be rejected'
+  );
 });
 
 test('detectNoProgress - all output variants are frozen', () => {

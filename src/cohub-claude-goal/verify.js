@@ -12,7 +12,7 @@
  * Gate names must be exact: proposal_approval, style_approval, studio_acceptance.
  * RUNNING must contain exact allowlisted next action or non-empty watchSet (never UNKNOWN).
  *
- * All snapshot input is sanitized through strict descriptor-walking validator.
+ * All input is sanitized through strict descriptor-walking validator BEFORE any use.
  * Output is descriptor-safe frozen object. Fail-closed on ambiguity.
  * No network, no package imports except sanitizer.
  */
@@ -21,6 +21,9 @@ import { sanitize, freezeOutput } from './sanitize.js';
 
 // Valid user gates per spec lines 317-320
 const VALID_USER_GATES = new Set(['proposal_approval', 'style_approval', 'studio_acceptance']);
+
+// Valid workflow states per spec
+const VALID_WORKFLOW_STATES = new Set(['IN_PROGRESS', 'WAITING_USER', 'BLOCKED', 'COMPLETE']);
 
 // Init checkpoint patterns to reject fake completion (spec line 336-338)
 const INIT_CHECKPOINT_PATTERNS = [/^init/i, /^initial/i, /_init$/i];
@@ -35,6 +38,16 @@ const VALID_NEXT_ACTIONS = new Set([
   'FINALIZE_DELIVERY'
 ]);
 
+// Closed blocker type set
+const VALID_BLOCKER_TYPES = new Set([
+  'UNBOUND_REPLACEMENT_RECEIPT',
+  'PERMISSION_DENIED',
+  'QUOTA_EXCEEDED',
+  'PLATFORM_ERROR',
+  'INTEGRITY_FAILURE',
+  'REPAIR_BUDGET_EXHAUSTED'
+]);
+
 /**
  * Verify current goal state and return deterministic verdict.
  *
@@ -43,11 +56,42 @@ const VALID_NEXT_ACTIONS = new Set([
  * @returns {object} Frozen verdict object with verdict, snapshotHash, reason, etc.
  */
 export function verify(goalInstance, options = {}) {
-  if (!goalInstance || typeof goalInstance !== 'object') {
-    throw new TypeError('goalInstance is required and must be an object');
+  // Sanitize ALL inputs BEFORE any destructuring or property access
+  // This prevents Proxy traps from executing before validation
+  let sanitizedGoal;
+  let sanitizedOptions;
+
+  try {
+    if (!goalInstance || typeof goalInstance !== 'object') {
+      throw new TypeError('goalInstance is required and must be an object');
+    }
+    sanitizedGoal = sanitize(goalInstance);
+
+    if (!options || typeof options !== 'object') {
+      throw new TypeError('options is required and must be an object');
+    }
+    sanitizedOptions = sanitize(options);
+  } catch (err) {
+    throw new TypeError(`Input sanitization failed: ${err.message}`);
   }
 
-  const { snapshot, expectedSnapshotHash } = options;
+  // Extract goal binding fields
+  const { goalId, version: goalVersion, spaceId: configuredSpaceId } = sanitizedGoal;
+
+  if (!goalId || typeof goalId !== 'string') {
+    throw new TypeError('goalInstance.goalId is required and must be a non-empty string');
+  }
+
+  if (!goalVersion || typeof goalVersion !== 'string') {
+    throw new TypeError('goalInstance.version is required and must be a non-empty string');
+  }
+
+  if (!configuredSpaceId || typeof configuredSpaceId !== 'string') {
+    throw new TypeError('goalInstance.spaceId is required and must be a non-empty string');
+  }
+
+  // Extract options
+  const { snapshot, expectedSnapshotHash } = sanitizedOptions;
 
   if (!snapshot || typeof snapshot !== 'object') {
     throw new TypeError('options.snapshot is required and must be an object');
@@ -73,19 +117,30 @@ export function verify(goalInstance, options = {}) {
   }
 
   // Enforce exact snapshot binding with same validation
-  if (expectedSnapshotHash !== undefined) {
+  if (expectedSnapshotHash !== undefined && expectedSnapshotHash !== null) {
     if (typeof expectedSnapshotHash !== 'string' || !/^[a-f0-9]{64}$/.test(expectedSnapshotHash)) {
       throw new TypeError('expectedSnapshotHash must be exactly 64 lowercase hex characters');
     }
     if (expectedSnapshotHash !== snapshotHash) {
       throw new Error(
-        `snapshot hash mismatch: expected ${expectedSnapshotHash}, got ${snapshotHash}`
+        `Snapshot hash mismatch: expected ${expectedSnapshotHash}, got ${snapshotHash}`
       );
     }
   }
 
   const orchestrationState = sanitizedSnapshot.orchestrationState || {};
   const { status } = orchestrationState;
+
+  // Validate workflow status
+  if (status && !VALID_WORKFLOW_STATES.has(status)) {
+    return freezeOutput({
+      verdict: 'BLOCKED',
+      snapshotHash,
+      reason: 'INVALID_WORKFLOW_STATE',
+      evidenceRefs: ['orchestrationState.status'],
+      missingEvidence: []
+    });
+  }
 
   // Check for migration doctor verdict (spec line 193)
   if (sanitizedSnapshot.migrationDoctor?.verdict === 'UNBOUND_REPLACEMENT_RECEIPT') {
@@ -105,7 +160,7 @@ export function verify(goalInstance, options = {}) {
         return freezeOutput({
           verdict: 'BLOCKED',
           snapshotHash,
-          reason: `Corrupt state: invalid stage status ${log.status} for ${stage}`,
+          reason: 'CORRUPT_STAGE_STATUS',
           evidenceRefs: ['stageGateLog'],
           missingEvidence: []
         });
@@ -113,10 +168,19 @@ export function verify(goalInstance, options = {}) {
     }
   }
 
-  // Check for explicit blocker
+  // Check for explicit blocker (must be closed type set)
   if (sanitizedSnapshot.blocker) {
     const { type, evidence } = sanitizedSnapshot.blocker;
     if (type && evidence) {
+      if (!VALID_BLOCKER_TYPES.has(type)) {
+        return freezeOutput({
+          verdict: 'BLOCKED',
+          snapshotHash,
+          reason: 'INVALID_BLOCKER_TYPE',
+          evidenceRefs: ['blocker.type'],
+          missingEvidence: []
+        });
+      }
       return freezeOutput({
         verdict: 'BLOCKED',
         snapshotHash,
@@ -146,7 +210,7 @@ export function verify(goalInstance, options = {}) {
 
   // Check for DONE (spec lines 334-346)
   if (status === 'COMPLETE') {
-    const doneResult = checkDoneConditions(sanitizedSnapshot, snapshotHash);
+    const doneResult = checkDoneConditions(sanitizedSnapshot, snapshotHash, configuredSpaceId);
     if (doneResult) {
       return doneResult;
     }
@@ -158,9 +222,11 @@ export function verify(goalInstance, options = {}) {
   const watchSet = sanitizedSnapshot.watchSet || [];
 
   // If orchestration is COMPLETE but evidence missing, return RUNNING with missing evidence list
-  // (no need for nextAction when just listing what's missing)
   if (status === 'COMPLETE') {
     const deliveryEvidence = sanitizedSnapshot.deliveryEvidence || {};
+    const missingEvidence = [];
+
+    // Required fields per spec line 340
     const requiredFields = [
       'schemaVersion',
       'worldId',
@@ -175,13 +241,14 @@ export function verify(goalInstance, options = {}) {
       'guestProbe',
       'finalReport',
       'gateLog',
-      'evidenceCreatedAt'
+      'evidenceCreatedAt',
+      'parentSessionId',
+      'parentTurnId'
     ];
 
-    const missingEvidence = [];
     for (const field of requiredFields) {
       if (!deliveryEvidence[field]) {
-        missingEvidence.push(field);
+        missingEvidence.push(`deliveryEvidence.${field}`);
       }
     }
 
@@ -192,8 +259,8 @@ export function verify(goalInstance, options = {}) {
     return freezeOutput({
       verdict: 'RUNNING',
       snapshotHash,
-      nextAction,
-      watchSet,
+      nextAction: { type: 'FINALIZE_DELIVERY' },
+      watchSet: [],
       reason: 'Missing delivery evidence for COMPLETE orchestration',
       evidenceRefs: [],
       missingEvidence
@@ -205,7 +272,7 @@ export function verify(goalInstance, options = {}) {
     return freezeOutput({
       verdict: 'BLOCKED',
       snapshotHash,
-      reason: 'RUNNING verdict requires exact next action or non-empty watchSet, not UNKNOWN',
+      reason: 'INVALID_NEXT_ACTION',
       evidenceRefs: [],
       missingEvidence: []
     });
@@ -215,20 +282,19 @@ export function verify(goalInstance, options = {}) {
     return freezeOutput({
       verdict: 'BLOCKED',
       snapshotHash,
-      reason: `Unknown next action type: ${nextAction.type}`,
+      reason: 'UNKNOWN_NEXT_ACTION_TYPE',
       evidenceRefs: [],
       missingEvidence: []
     });
   }
 
   // For normal IN_PROGRESS, nextAction or watchSet is optional (may be in transition)
-  // BLOCKED only if explicitly UNKNOWN, not if missing
+  // per spec lines 224-225
 
   // Determine reason based on state
   let reason = 'Orchestration in progress';
 
   if (sanitizedSnapshot.deliveryEvidence && status !== 'COMPLETE') {
-    // Delivery evidence present but orchestration not COMPLETE
     reason = 'Orchestration not COMPLETE yet';
   }
 
@@ -247,7 +313,7 @@ export function verify(goalInstance, options = {}) {
  * Check DONE conditions exhaustively (spec lines 334-346).
  * Returns frozen verdict if DONE, null if conditions not met, BLOCKED if fake completion.
  */
-function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
+function checkDoneConditions(sanitizedSnapshot, snapshotHash, configuredSpaceId) {
   const { orchestrationState, deliveryEvidence, studioAcceptance } = sanitizedSnapshot;
 
   if (orchestrationState.status !== 'COMPLETE') {
@@ -258,8 +324,19 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
     return null;
   }
 
-  // IMPORTANT: Check for init checkpoint FIRST before other evidence (spec line 336-338)
-  // This catches fake completion attempts early, even if other fields missing
+  // IMPORTANT: Check Space ID binding FIRST (spec line 336-340)
+  const { spaceId: evidenceSpaceId } = deliveryEvidence;
+  if (evidenceSpaceId !== configuredSpaceId) {
+    return freezeOutput({
+      verdict: 'BLOCKED',
+      snapshotHash,
+      reason: 'SPACE_ID_MISMATCH',
+      evidenceRefs: ['deliveryEvidence.spaceId', 'goalInstance.spaceId'],
+      missingEvidence: []
+    });
+  }
+
+  // Check for init checkpoint BEFORE other evidence (spec line 336-338)
   const { checkpointId } = deliveryEvidence;
   if (checkpointId) {
     const isInitCheckpoint = INIT_CHECKPOINT_PATTERNS.some(
@@ -270,7 +347,7 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
       return freezeOutput({
         verdict: 'BLOCKED',
         snapshotHash,
-        reason: `Fake completion: init checkpoint ${checkpointId} forbidden`,
+        reason: 'INIT_CHECKPOINT_FORBIDDEN',
         evidenceRefs: ['deliveryEvidence.checkpointId'],
         missingEvidence: []
       });
@@ -297,7 +374,9 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
     'guestProbe',
     'finalReport',
     'gateLog',
-    'evidenceCreatedAt'
+    'evidenceCreatedAt',
+    'parentSessionId',
+    'parentTurnId'
   ];
 
   const missing = required.filter(field => !deliveryEvidence[field]);
@@ -308,11 +387,11 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
   // Validate screenshots (spec line 342)
   const { desktopScreenshot, mobileScreenshot } = deliveryEvidence;
 
-  if (!validateScreenshot(desktopScreenshot, 1440, 900, deliveryEvidence.manifestSha256)) {
+  if (!validateScreenshot(desktopScreenshot, 1440, 900, deliveryEvidence.manifestSha256, deliveryEvidence.worldId, deliveryEvidence.checkpointId)) {
     return null;
   }
 
-  if (!validateScreenshot(mobileScreenshot, 390, 844, deliveryEvidence.manifestSha256)) {
+  if (!validateScreenshot(mobileScreenshot, 390, 844, deliveryEvidence.manifestSha256, deliveryEvidence.worldId, deliveryEvidence.checkpointId)) {
     return null;
   }
 
@@ -322,7 +401,9 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
     guestProbe.status !== 200 ||
     guestProbe.role !== 'guest' ||
     guestProbe.requestHadCookie !== false ||
-    guestProbe.requestHadAuthorization !== false
+    guestProbe.requestHadAuthorization !== false ||
+    !guestProbe.observedWorldId ||
+    guestProbe.observedWorldId !== deliveryEvidence.worldId
   ) {
     return null;
   }
@@ -342,6 +423,8 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
       'deliveryEvidence.guestProbe',
       'deliveryEvidence.finalReport',
       'deliveryEvidence.gateLog',
+      'deliveryEvidence.parentSessionId',
+      'deliveryEvidence.parentTurnId',
       'studioAcceptance'
     ],
     missingEvidence: []
@@ -351,14 +434,16 @@ function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
 /**
  * Validate screenshot evidence (spec line 342).
  */
-function validateScreenshot(screenshot, expectedWidth, expectedHeight, manifestHash) {
+function validateScreenshot(screenshot, expectedWidth, expectedHeight, manifestHash, worldId, checkpointId) {
   if (!screenshot) return false;
   if (!screenshot.sha256 || !/^[a-f0-9]{64}$/.test(screenshot.sha256)) return false;
   if (screenshot.width !== expectedWidth) return false;
   if (screenshot.height !== expectedHeight) return false;
   if (!screenshot.capturedAt) return false;
-  // manifestHash must also be exactly 64 lowercase hex
   if (!manifestHash || !/^[a-f0-9]{64}$/.test(manifestHash)) return false;
   if (screenshot.manifestHash !== manifestHash) return false;
+  // Spec line 342: screenshots must bind to worldId and checkpointId
+  if (screenshot.worldId !== worldId) return false;
+  if (screenshot.checkpointId !== checkpointId) return false;
   return true;
 }

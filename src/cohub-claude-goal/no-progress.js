@@ -9,7 +9,7 @@
  * Excludes prose, ETA, RETURN PASS words, and Turn completed alone.
  *
  * Canonical encoding must preserve nested keys/types and deterministic array order.
- * Do not sort away meaningful ordering or use JSON replacer incorrectly.
+ * Sorts ALL keys recursively, preserves types, never invokes toJSON.
  *
  * Two consecutive NO_PROGRESS turns become BLOCKED_REPEATED_NO_PROGRESS.
  * Two consecutive Claude turns refusing required wait become BLOCKED_CLAUDE_WAIT_REFUSAL.
@@ -17,8 +17,9 @@
  *
  * First NO_PROGRESS allows REPAIR_NO_PROGRESS template.
  * Prose, "Turn completed", and missing evidence never reset no-progress count.
- * Irrelevant tool actions (text only) do not count as progress.
+ * Tool actions must be authoritative MCP actions (inspect/submit/wait/verify) to count as progress.
  *
+ * All inputs sanitized BEFORE any property access.
  * Output is descriptor-safe frozen object. No network, no packages.
  */
 
@@ -28,7 +29,7 @@ import { sanitize, freezeOutput } from './sanitize.js';
 /**
  * Compute progress fingerprint from snapshot (spec line 191).
  * Stable across prose changes, changes only on real progress signals.
- * Preserves nested keys and types with canonical JSON encoding.
+ * Preserves nested keys and types with fully recursive canonical JSON encoding.
  *
  * @param {object} snapshot - Current snapshot
  * @returns {string} Deterministic fingerprint hex string (64 lowercase hex chars)
@@ -94,29 +95,8 @@ export function computeProgressFingerprint(snapshot) {
       ) : null
   };
 
-  // Sort arrays for determinism, preserving nested structure
-  if (Array.isArray(relevant.pendingWorkers)) {
-    relevant.pendingWorkers = [...relevant.pendingWorkers].sort();
-  }
-  if (Array.isArray(relevant.completedWorkers)) {
-    relevant.completedWorkers = [...relevant.completedWorkers].sort();
-  }
-
-  // Canonical JSON: sort top-level keys with a custom replacer that preserves all nested structure
-  // We cannot use Object.keys(relevant).sort() as the replacer because it filters out nested keys
-  const topLevelKeys = Object.keys(relevant).sort();
-  const canonical = JSON.stringify(relevant, (key, value) => {
-    // Root level: filter to sorted top-level keys
-    if (key === '') {
-      const sorted = {};
-      for (const k of topLevelKeys) {
-        sorted[k] = relevant[k];
-      }
-      return sorted;
-    }
-    // Nested levels: preserve all keys and values as-is
-    return value;
-  });
+  // Canonical JSON with RECURSIVE key sorting
+  const canonical = canonicalStringify(relevant);
 
   const hash = createHash('sha256').update(canonical, 'utf8').digest('hex');
 
@@ -126,6 +106,44 @@ export function computeProgressFingerprint(snapshot) {
   }
 
   return hash;
+}
+
+/**
+ * Canonical JSON stringify with RECURSIVE key sorting.
+ * Sorts object keys at ALL levels, preserves array order, preserves types.
+ * Never invokes toJSON, never sorts arrays.
+ *
+ * @param {any} value - Value to stringify
+ * @returns {string} Canonical JSON string
+ */
+function canonicalStringify(value) {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+
+  const type = typeof value;
+
+  if (type === 'string') return JSON.stringify(value);
+  if (type === 'number') return JSON.stringify(value);
+  if (type === 'boolean') return JSON.stringify(value);
+
+  if (Array.isArray(value)) {
+    // Preserve array order - do NOT sort
+    const items = value.map(item => canonicalStringify(item));
+    return '[' + items.join(',') + ']';
+  }
+
+  if (type === 'object') {
+    // Sort keys at THIS level
+    const keys = Object.keys(value).sort();
+    const pairs = keys.map(key => {
+      const keyStr = JSON.stringify(key);
+      const valStr = canonicalStringify(value[key]);
+      return keyStr + ':' + valStr;
+    });
+    return '{' + pairs.join(',') + '}';
+  }
+
+  throw new TypeError(`Unsupported type in canonical stringify: ${type}`);
 }
 
 /**
@@ -150,9 +168,25 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
     throw new TypeError('history must be an array');
   }
 
+  // Sanitize history array
+  let sanitizedHistory;
+  try {
+    sanitizedHistory = sanitize(history);
+  } catch (err) {
+    throw new TypeError(`History sanitization failed: ${err.message}`);
+  }
+
+  // Sanitize currentTurn BEFORE any property access
+  let sanitizedTurn;
+  try {
+    sanitizedTurn = sanitize(currentTurn);
+  } catch (err) {
+    throw new TypeError(`CurrentTurn sanitization failed: ${err.message}`);
+  }
+
   // Validate all historical fingerprints
-  for (let i = 0; i < history.length; i++) {
-    const entry = history[i];
+  for (let i = 0; i < sanitizedHistory.length; i++) {
+    const entry = sanitizedHistory[i];
     if (entry && entry.fingerprint && !/^[a-f0-9]{64}$/.test(entry.fingerprint)) {
       throw new TypeError(`history[${i}].fingerprint must be exactly 64 lowercase hex characters`);
     }
@@ -160,21 +194,25 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
 
   const {
     hadToolAction = false,
-    toolActionWasRelevant = true, // Default to true for backward compatibility
+    toolActionWasRelevant = false, // Changed: default to FALSE, not true
     verifyVerdict,
     snapshotRequiresWait,
     claudeCalledWait,
     snapshotAllowsSubmit,
     claudeCalledSubmit,
     hadFreshInspect,
-    hadFreshVerify
-  } = currentTurn;
+    hadFreshVerify,
+    hasNewWorker = false,
+    hasExternalWait = false,
+    hasLegalUserGate = false,
+    hasEvidenceBlocker = false
+  } = sanitizedTurn;
 
   // Check Claude wait refusal (two consecutive turns)
   let isClaudeWaitRefusal = false;
   if (verifyVerdict === 'RUNNING' && snapshotRequiresWait === true && claudeCalledWait === false) {
     // Check if previous turn also refused wait
-    const prevTurn = history[history.length - 1];
+    const prevTurn = sanitizedHistory[sanitizedHistory.length - 1];
     if (
       prevTurn &&
       prevTurn.verifyVerdict === 'RUNNING' &&
@@ -201,7 +239,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
     hadFreshInspect === false &&
     hadFreshVerify === false
   ) {
-    const prevTurn = history[history.length - 1];
+    const prevTurn = sanitizedHistory[sanitizedHistory.length - 1];
     if (
       prevTurn &&
       prevTurn.verifyVerdict === 'RUNNING' &&
@@ -222,6 +260,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
   }
 
   // Tool action resets progress tracking ONLY if relevant
+  // Relevant means: authoritative MCP action (inspect/submit/wait/verify)
   // Irrelevant tool actions (text generation only) do not reset
   if (hadToolAction && toolActionWasRelevant) {
     return freezeOutput({
@@ -233,12 +272,24 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
     });
   }
 
+  // New worker, external wait, legal user gate, or evidence blocker resets progress
+  if (hasNewWorker || hasExternalWait || hasLegalUserGate || hasEvidenceBlocker) {
+    return freezeOutput({
+      isNoProgress: false,
+      isClaudeWaitRefusal,
+      count: 0,
+      shouldBlock: false,
+      allowRepair: false
+    });
+  }
+
   // Count consecutive no-progress turns with same fingerprint
   let consecutiveCount = 0;
-  for (let i = history.length - 1; i >= 0; i--) {
-    const prev = history[i];
-    const prevRelevant = prev.hadToolAction ? (prev.toolActionWasRelevant !== false) : false;
-    if (prev.fingerprint === currentFingerprint && !prevRelevant) {
+  for (let i = sanitizedHistory.length - 1; i >= 0; i--) {
+    const prev = sanitizedHistory[i];
+    const prevRelevant = prev.hadToolAction ? (prev.toolActionWasRelevant === true) : false;
+    const prevHasProgress = prev.hasNewWorker || prev.hasExternalWait || prev.hasLegalUserGate || prev.hasEvidenceBlocker;
+    if (prev.fingerprint === currentFingerprint && !prevRelevant && !prevHasProgress) {
       consecutiveCount++;
     } else {
       break;
@@ -246,7 +297,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
   }
 
   // Fingerprint change resets
-  if (consecutiveCount === 0 && history.length > 0 && history[history.length - 1].fingerprint !== currentFingerprint) {
+  if (consecutiveCount === 0 && sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].fingerprint !== currentFingerprint) {
     return freezeOutput({
       isNoProgress: false,
       isClaudeWaitRefusal,
