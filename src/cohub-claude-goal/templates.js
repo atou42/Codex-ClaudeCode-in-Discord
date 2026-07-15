@@ -2,26 +2,57 @@
  * @fileoverview Immutable continuation and native-goal templates.
  * Fixed renderer only, no arbitrary prompt text. Deterministic output.
  * All remote/prose/path fields are untrusted data, encoded safely.
- * Dangerous keys, circular references, unknown keys rejected.
  *
- * SECURITY: Descriptor-walking validator never reads through property access.
- * No getters, setters, toJSON, Proxy traps, functions, symbols, or custom prototypes invoked.
- * Proxy objects are rejected before any trap can run.
+ * SECURITY MODEL:
+ * - One descriptor-walking, Proxy-first, getter-free, exact-schema sanitizer.
+ *   types.isProxy() runs BEFORE Array.isArray / Object.getPrototypeOf / Reflect.ownKeys.
+ * - Validation returns a DETACHED sanitized clone; rendering reads only that clone.
+ *   The attacker input is never read twice, closing the mutation race.
+ * - Every string, object, array is exact-schema validated: no accessors, symbols,
+ *   dangerous keys, non-enumerable properties, unknown keys, custom prototypes,
+ *   sparse arrays, cycles, shared references, non-finite numbers, unsupported values,
+ *   invalid Unicode/control characters, or excessive depth/bytes.
+ * - Length-prefixed canonical JSON so bound content cannot escape into instructions.
+ *
+ * SCHEMA CONTRACT (integrated, authoritative — spec lines 216-228, 252-280):
+ *   renderContinuationPrompt input top level:
+ *     goalInstance, goalVersion, actionSlot, continuationId, snapshotHash,
+ *     expectedParentSequence, expectedInputWatermark, decisionCode, runPath,
+ *     registeredEventRefs, expectedNextAction
+ *   actionSlot exact fields:
+ *     actionSlotId, continuationId, expectedParentSequence, expectedInputWatermark,
+ *     goalVersion, snapshotHash, decisionCode, attempt
+ *   Every actionSlot binding (except actionSlotId + attempt) must EXACTLY equal
+ *   its corresponding top-level field, else INVALID_ACTION_SLOT / ACTION_SLOT_MISMATCH.
  */
 
 import { types } from 'node:util';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+// Byte and length bounds (exact, enforced).
 const MAX_INPUT_BYTES = 50000;
-const VALID_DECISIONS = new Set([
-  'continue',
-  'continue_with_verify',
-  'continue_with_wait',
-  'reopen_gate',
-  'approve_proposal',
-  'approve_style'
+const MAX_STRING_BYTES = 8192;
+const MAX_DEPTH = 12;
+const MAX_EVENT_REFS = 1000;
+const MAX_EVENT_REF_BYTES = 512;
+const MAX_RUN_PATH_BYTES = 4096;
+const MAX_EXPECTED_NEXT_ACTION_STRING = 200;
+const MAX_GOAL_INSTANCE_BYTES = 512;
+const MAX_GOAL_VERSION_BYTES = 128;
+const MAX_CONTINUATION_ID_BYTES = 256;
+
+// Integrated decision-code allowlist (spec-authoritative). No invented codes,
+// no user-approval operations that bypass the parent workflow guard.
+const VALID_DECISION_CODES = new Set([
+  'action-start',
+  'worker-dispatch',
+  'user-gate-response',
+  'block-report',
+  'external-wait-register'
 ]);
 
+// Top-level continuation schema (exact).
 const CONTINUATION_SCHEMA = new Set([
   'goalInstance',
   'goalVersion',
@@ -30,29 +61,112 @@ const CONTINUATION_SCHEMA = new Set([
   'snapshotHash',
   'expectedParentSequence',
   'expectedInputWatermark',
-  'decision',
+  'decisionCode',
   'runPath',
   'registeredEventRefs',
   'expectedNextAction'
 ]);
 
-// Valid actionSlot fields (whitelist)
+// actionSlot exact schema (integrated contract).
 const ACTION_SLOT_SCHEMA = new Set([
-  'id',
-  'type',
-  'phase',
-  'event',
-  'note',
-  'data'
+  'actionSlotId',
+  'continuationId',
+  'expectedParentSequence',
+  'expectedInputWatermark',
+  'goalVersion',
+  'snapshotHash',
+  'decisionCode',
+  'attempt'
 ]);
+
+// expectedNextAction structured schema (bounded, allowlisted keys).
+const EXPECTED_NEXT_ACTION_SCHEMA = new Set(['type', 'reason']);
+const EXPECTED_NEXT_ACTION_TYPES = new Set([
+  'inspect',
+  'submit',
+  'wait',
+  'verify'
+]);
+
+const SHA256_REGEX = /^[a-f0-9]{64}$/;
+
+/**
+ * Validate string contains no invalid control characters, Unicode format/direction
+ * control chars, BOM, or lone surrogates. Tab/LF/CR allowed.
+ */
+function hasInvalidControlChars(str) {
+  if (typeof str !== 'string') return false;
+
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+
+    // ASCII control characters (reject except tab/LF/CR)
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
+      return true;
+    }
+    if (code === 0) return true;
+
+    // Unicode format and direction control characters (U+200B-U+206F)
+    if (code >= 0x200B && code <= 0x206F) {
+      return true;
+    }
+
+    // BOM (U+FEFF)
+    if (code === 0xFEFF) {
+      return true;
+    }
+
+    // Lone surrogates (U+D800-U+DFFF)
+    if (code >= 0xD800 && code <= 0xDFFF) {
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        // High surrogate - must be followed by low surrogate
+        if (i + 1 >= str.length) {
+          return true;
+        }
+        const nextCode = str.charCodeAt(i + 1);
+        if (nextCode < 0xDC00 || nextCode > 0xDFFF) {
+          return true;
+        }
+        i++; // Skip the low surrogate
+      } else {
+        // Low surrogate without preceding high surrogate
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Check if value is a plain object (not array, null, or other types).
+ * Rejects Proxy objects and objects with custom prototypes.
+ */
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  // Reject Proxy objects BEFORE any operation
+  if (types.isProxy(value)) {
+    return false;
+  }
+
+  const proto = Object.getPrototypeOf(value);
+
+  // Only allow Object.prototype or null prototype (from Object.create(null))
+  if (proto !== Object.prototype && proto !== null) {
+    return false;
+  }
+
+  return true;
+}
 
 /**
  * Descriptor-walking exact validator. Never reads values through property access.
- * Returns canonical JSON string or throws.
+ * Returns a DETACHED canonical JSON string or throws. The returned clone is safe
+ * to render; the original input is never touched again.
  */
 function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
-  const MAX_DEPTH = 20;
-
   if (depth > MAX_DEPTH) {
     throw new Error('MAX_DEPTH_EXCEEDED: nesting too deep');
   }
@@ -79,7 +193,7 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
   }
 
   if (type === 'string') {
-    // Validate string (no reading needed, already a primitive)
+    // Validate string
     for (let i = 0; i < value.length; i++) {
       const code = value.charCodeAt(i);
 
@@ -92,7 +206,6 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
       }
 
       // Reject Unicode format and direction control characters (U+200B-U+206F)
-      // Includes: zero-width space, zero-width joiner, LRM, RLM, LRE, RLE, LRO, RLO, etc.
       if (code >= 0x200B && code <= 0x206F) {
         throw new Error('INVALID_STRING: contains Unicode format or direction control characters');
       }
@@ -102,9 +215,8 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
         throw new Error('INVALID_STRING: contains byte order mark');
       }
 
-      // Reject lone surrogates (U+D800-U+DFFF)
+      // Reject lone surrogates
       if (code >= 0xD800 && code <= 0xDFFF) {
-        // Check if it's part of a valid surrogate pair
         if (code >= 0xD800 && code <= 0xDBFF) {
           // High surrogate - must be followed by low surrogate
           if (i + 1 >= value.length) {
@@ -121,6 +233,12 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
         }
       }
     }
+
+    const bytes = Buffer.byteLength(value, 'utf8');
+    if (bytes > MAX_STRING_BYTES) {
+      throw new Error(`STRING_TOO_LARGE: string is ${bytes} bytes, max ${MAX_STRING_BYTES}`);
+    }
+
     return JSON.stringify(value);
   }
 
@@ -244,7 +362,7 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
 }
 
 /**
- * Encode value as length-prefixed canonical JSON
+ * Encode value as length-prefixed canonical JSON.
  */
 function encodeAsLengthPrefixedJSON(value) {
   const canonical = validateAndCanonicalizeValue(value);
@@ -253,98 +371,13 @@ function encodeAsLengthPrefixedJSON(value) {
 }
 
 /**
- * Check if value is a plain object (not array, null, or other types)
- * Rejects Proxy objects and objects with custom prototypes
- */
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-
-  // Reject Proxy objects before any operation
-  if (types.isProxy(value)) {
-    return false;
-  }
-
-  const proto = Object.getPrototypeOf(value);
-
-  // Only allow Object.prototype or null prototype (from Object.create(null))
-  if (proto !== Object.prototype && proto !== null) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Check for __proto__ descriptor (separate check after isPlainObject passes)
- */
-function hasProtoDescriptor(value) {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
-  const protoDesc = Object.getOwnPropertyDescriptor(value, '__proto__');
-  return protoDesc !== undefined;
-}
-
-/**
- * Validate string contains no control characters except tab/newline/carriage return
- * Also rejects Unicode format/direction control chars, BOM, and lone surrogates
- */
-function hasInvalidControlChars(str) {
-  if (typeof str !== 'string') return false;
-
-  for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
-
-    // ASCII control characters
-    if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
-      return true;
-    }
-    if (code === 0) return true;
-
-    // Unicode format and direction control characters
-    if (code >= 0x200B && code <= 0x206F) {
-      return true;
-    }
-
-    // BOM
-    if (code === 0xFEFF) {
-      return true;
-    }
-
-    // Lone surrogates
-    if (code >= 0xD800 && code <= 0xDFFF) {
-      if (code >= 0xD800 && code <= 0xDBFF) {
-        // High surrogate - must be followed by low surrogate
-        if (i + 1 >= str.length) {
-          return true;
-        }
-        const nextCode = str.charCodeAt(i + 1);
-        if (nextCode < 0xDC00 || nextCode > 0xDFFF) {
-          return true;
-        }
-        i++; // Skip the low surrogate
-      } else {
-        // Low surrogate without preceding high surrogate
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Validate actionSlot structure without reading through property access
+ * Validate actionSlot structure (integrated contract).
+ * EXACT schema: actionSlotId, continuationId, expectedParentSequence,
+ * expectedInputWatermark, goalVersion, snapshotHash, decisionCode, attempt.
  */
 function validateActionSlot(actionSlot, seen = new Set()) {
   if (!isPlainObject(actionSlot)) {
     throw new Error('INVALID_ACTION_SLOT: actionSlot must be a plain object');
-  }
-
-  // Check for __proto__ descriptor (catches descriptor-based attacks)
-  if (hasProtoDescriptor(actionSlot)) {
-    throw new Error('DANGEROUS_KEY: actionSlot contains __proto__ descriptor');
   }
 
   // Check for cycles
@@ -376,82 +409,151 @@ function validateActionSlot(actionSlot, seen = new Set()) {
     if (desc.get || desc.set) {
       throw new Error(`GETTER_SETTER: actionSlot.${key} has getter or setter`);
     }
+  }
 
-    const value = desc.value;
+  // Check all required fields present
+  for (const requiredKey of ACTION_SLOT_SCHEMA) {
+    if (!Object.hasOwn(actionSlot, requiredKey)) {
+      throw new Error(`MISSING_ACTION_SLOT_FIELD: required field "${requiredKey}" missing from actionSlot`);
+    }
+  }
+}
 
-    // Recursively validate nested structures
-    if (key === 'event' && Array.isArray(value)) {
-      // Check for cycles in array itself
-      if (seen.has(value)) {
-        throw new Error('CIRCULAR_REFERENCE: circular reference in event array');
-      }
-      seen.add(value);
+/**
+ * Validate runPath: must be normalized relative path, no traversal/absolute/backslash/NUL.
+ */
+function validateRunPath(runPath) {
+  if (typeof runPath !== 'string' || runPath.trim() === '') {
+    throw new Error('INVALID_RUN_PATH: runPath must be a non-empty string');
+  }
 
-      // event field can be an array - validate each element
-      for (let i = 0; i < value.length; i++) {
-        const elemDesc = Object.getOwnPropertyDescriptor(value, i);
-        if (!elemDesc) {
-          throw new Error('SPARSE_ARRAY: event array contains holes');
-        }
-        if (elemDesc.get || elemDesc.set) {
-          throw new Error('GETTER_SETTER: event array element has getter/setter');
-        }
+  if (hasInvalidControlChars(runPath)) {
+    throw new Error('INVALID_RUN_PATH: runPath contains invalid control characters');
+  }
 
-        const elem = elemDesc.value;
-        if (typeof elem === 'object' && elem !== null) {
-          // Check for cycles
-          if (seen.has(elem)) {
-            throw new Error('CIRCULAR_REFERENCE: circular reference in event array element');
-          }
+  const bytes = Buffer.byteLength(runPath, 'utf8');
+  if (bytes > MAX_RUN_PATH_BYTES) {
+    throw new Error(`INVALID_RUN_PATH: runPath is ${bytes} bytes, max ${MAX_RUN_PATH_BYTES}`);
+  }
 
-          // Nested object in event array
-          if (!isPlainObject(elem)) {
-            throw new Error('INVALID_EVENT_ELEMENT: event array element must be plain object');
-          }
+  // Reject absolute paths
+  if (runPath.startsWith('/')) {
+    throw new Error('INVALID_RUN_PATH: runPath must not be absolute');
+  }
 
-          seen.add(elem);
+  // Reject backslashes (Windows-style paths, ambiguity)
+  if (runPath.includes('\\')) {
+    throw new Error('INVALID_RUN_PATH: runPath must not contain backslashes');
+  }
 
-          const nestedKeys = Reflect.ownKeys(elem);
-          for (const nk of nestedKeys) {
-            if (typeof nk === 'symbol') {
-              throw new Error('SYMBOL_KEY: event array element contains symbol key');
-            }
-            if (DANGEROUS_KEYS.has(nk)) {
-              throw new Error(`DANGEROUS_KEY: event element contains "${nk}"`);
-            }
+  // Reject path traversal
+  if (runPath.includes('../') || runPath.includes('/..') || runPath === '..') {
+    throw new Error('INVALID_RUN_PATH: runPath must not contain traversal (..)');
+  }
+}
 
-            const nestedDesc = Object.getOwnPropertyDescriptor(elem, nk);
-            if (nestedDesc && (nestedDesc.get || nestedDesc.set)) {
-              throw new Error('GETTER_SETTER: nested event element has getter/setter');
-            }
-          }
-        }
-      }
+/**
+ * Validate registeredEventRefs: bounded array of exact non-empty event ID strings.
+ */
+function validateRegisteredEventRefs(registeredEventRefs) {
+  if (!Array.isArray(registeredEventRefs)) {
+    throw new Error('INVALID_REGISTERED_EVENT_REFS: registeredEventRefs must be an array');
+  }
 
-      // Check for extra array properties
-      const arrayKeys = Reflect.ownKeys(value);
-      for (const ak of arrayKeys) {
-        if (typeof ak === 'symbol') {
-          throw new Error('SYMBOL_KEY: event array has symbol key');
-        }
-        if (ak !== 'length') {
-          const asNum = Number(ak);
-          if (!Number.isInteger(asNum) || asNum < 0 || asNum >= value.length) {
-            throw new Error(`EXTRA_ARRAY_PROPERTY: event array has unexpected property "${ak}"`);
-          }
-        }
-      }
-    } else if (typeof value === 'object' && value !== null) {
-      // Check for cycles in nested objects
-      if (seen.has(value)) {
-        throw new Error('CIRCULAR_REFERENCE: circular reference in actionSlot');
+  if (registeredEventRefs.length > MAX_EVENT_REFS) {
+    throw new Error(`INVALID_REGISTERED_EVENT_REFS: too many event refs (${registeredEventRefs.length}, max ${MAX_EVENT_REFS})`);
+  }
+
+  // Validate array elements via descriptors
+  for (let i = 0; i < registeredEventRefs.length; i++) {
+    const desc = Object.getOwnPropertyDescriptor(registeredEventRefs, i);
+    if (!desc) {
+      throw new Error('SPARSE_ARRAY: registeredEventRefs contains holes');
+    }
+    if (desc.get || desc.set) {
+      throw new Error('GETTER_SETTER: registeredEventRefs element has getter/setter');
+    }
+    if (typeof desc.value !== 'string') {
+      throw new Error('INVALID_REGISTERED_EVENT_REFS: all event refs must be strings');
+    }
+    if (desc.value.trim() === '') {
+      throw new Error('INVALID_REGISTERED_EVENT_REFS: event refs must be non-empty');
+    }
+    const bytes = Buffer.byteLength(desc.value, 'utf8');
+    if (bytes > MAX_EVENT_REF_BYTES) {
+      throw new Error(`INVALID_REGISTERED_EVENT_REFS: event ref is ${bytes} bytes, max ${MAX_EVENT_REF_BYTES}`);
+    }
+  }
+
+  // Check for extra array properties
+  const refKeys = Reflect.ownKeys(registeredEventRefs);
+  for (const key of refKeys) {
+    if (typeof key === 'symbol') {
+      throw new Error('SYMBOL_KEY: registeredEventRefs has symbol key');
+    }
+    if (key !== 'length') {
+      const asNum = Number(key);
+      if (!Number.isInteger(asNum) || asNum < 0 || asNum >= registeredEventRefs.length) {
+        throw new Error(`EXTRA_ARRAY_PROPERTY: registeredEventRefs has unexpected property "${key}"`);
       }
     }
   }
 }
 
 /**
- * Validate continuation input schema and security properties
+ * Validate expectedNextAction: bounded allowlisted/structured value consistent with decisionCode.
+ */
+function validateExpectedNextAction(expectedNextAction) {
+  if (typeof expectedNextAction === 'string') {
+    if (expectedNextAction.trim() === '') {
+      throw new Error('INVALID_EXPECTED_NEXT_ACTION: expectedNextAction string must be non-empty');
+    }
+    if (expectedNextAction.length > MAX_EXPECTED_NEXT_ACTION_STRING) {
+      throw new Error(`INVALID_EXPECTED_NEXT_ACTION: string too long (${expectedNextAction.length}, max ${MAX_EXPECTED_NEXT_ACTION_STRING})`);
+    }
+    return;
+  }
+
+  if (isPlainObject(expectedNextAction)) {
+    const ownKeys = Reflect.ownKeys(expectedNextAction);
+    for (const key of ownKeys) {
+      if (typeof key === 'symbol') {
+        throw new Error('SYMBOL_KEY: expectedNextAction contains symbol key');
+      }
+      if (DANGEROUS_KEYS.has(key)) {
+        throw new Error(`DANGEROUS_KEY: expectedNextAction contains "${key}"`);
+      }
+      if (!EXPECTED_NEXT_ACTION_SCHEMA.has(key)) {
+        throw new Error(`UNKNOWN_KEY: unexpected key "${key}" in expectedNextAction`);
+      }
+
+      const desc = Object.getOwnPropertyDescriptor(expectedNextAction, key);
+      if (desc && (desc.get || desc.set)) {
+        throw new Error(`GETTER_SETTER: expectedNextAction.${key} has getter or setter`);
+      }
+    }
+
+    // Validate type field if present
+    if (Object.hasOwn(expectedNextAction, 'type')) {
+      const typeDesc = Object.getOwnPropertyDescriptor(expectedNextAction, 'type');
+      const typeValue = typeDesc.value;
+      if (typeof typeValue !== 'string') {
+        throw new Error('INVALID_EXPECTED_NEXT_ACTION: type must be a string');
+      }
+      if (!EXPECTED_NEXT_ACTION_TYPES.has(typeValue)) {
+        throw new Error(`INVALID_EXPECTED_NEXT_ACTION: type "${typeValue}" not allowed`);
+      }
+    }
+
+    return;
+  }
+
+  throw new Error('INVALID_EXPECTED_NEXT_ACTION: must be string or plain object');
+}
+
+/**
+ * Validate continuation input schema and security properties.
+ * Integrated contract: exact top-level schema with actionSlot field bindings.
  */
 function validateContinuationInput(input) {
   // Must be plain object
@@ -493,7 +595,7 @@ function validateContinuationInput(input) {
   const snapshotHashDesc = Object.getOwnPropertyDescriptor(input, 'snapshotHash');
   const expectedParentSequenceDesc = Object.getOwnPropertyDescriptor(input, 'expectedParentSequence');
   const expectedInputWatermarkDesc = Object.getOwnPropertyDescriptor(input, 'expectedInputWatermark');
-  const decisionDesc = Object.getOwnPropertyDescriptor(input, 'decision');
+  const decisionCodeDesc = Object.getOwnPropertyDescriptor(input, 'decisionCode');
   const runPathDesc = Object.getOwnPropertyDescriptor(input, 'runPath');
   const registeredEventRefsDesc = Object.getOwnPropertyDescriptor(input, 'registeredEventRefs');
   const expectedNextActionDesc = Object.getOwnPropertyDescriptor(input, 'expectedNextAction');
@@ -520,8 +622,8 @@ function validateContinuationInput(input) {
   if (expectedInputWatermarkDesc?.get || expectedInputWatermarkDesc?.set) {
     throw new Error('GETTER_SETTER: expectedInputWatermark has getter or setter');
   }
-  if (decisionDesc?.get || decisionDesc?.set) {
-    throw new Error('GETTER_SETTER: decision has getter or setter');
+  if (decisionCodeDesc?.get || decisionCodeDesc?.set) {
+    throw new Error('GETTER_SETTER: decisionCode has getter or setter');
   }
   if (runPathDesc?.get || runPathDesc?.set) {
     throw new Error('GETTER_SETTER: runPath has getter or setter');
@@ -541,18 +643,26 @@ function validateContinuationInput(input) {
   const snapshotHash = snapshotHashDesc.value;
   const expectedParentSequence = expectedParentSequenceDesc.value;
   const expectedInputWatermark = expectedInputWatermarkDesc.value;
-  const decision = decisionDesc.value;
+  const decisionCode = decisionCodeDesc.value;
   const runPath = runPathDesc.value;
   const registeredEventRefs = registeredEventRefsDesc.value;
   const expectedNextAction = expectedNextActionDesc.value;
 
-  // Validate individual fields
+  // Validate individual top-level fields
   if (typeof goalInstance !== 'string' || goalInstance.trim() === '') {
     throw new Error('INVALID_GOAL_INSTANCE: goalInstance must be a non-empty string');
+  }
+  const goalInstanceBytes = Buffer.byteLength(goalInstance, 'utf8');
+  if (goalInstanceBytes > MAX_GOAL_INSTANCE_BYTES) {
+    throw new Error(`INVALID_GOAL_INSTANCE: too large (${goalInstanceBytes} bytes, max ${MAX_GOAL_INSTANCE_BYTES})`);
   }
 
   if (typeof goalVersion !== 'string' || goalVersion.trim() === '') {
     throw new Error('INVALID_GOAL_VERSION: goalVersion must be a non-empty string');
+  }
+  const goalVersionBytes = Buffer.byteLength(goalVersion, 'utf8');
+  if (goalVersionBytes > MAX_GOAL_VERSION_BYTES) {
+    throw new Error(`INVALID_GOAL_VERSION: too large (${goalVersionBytes} bytes, max ${MAX_GOAL_VERSION_BYTES})`);
   }
 
   validateActionSlot(actionSlot);
@@ -560,65 +670,68 @@ function validateContinuationInput(input) {
   if (typeof continuationId !== 'string' || continuationId.trim() === '') {
     throw new Error('INVALID_CONTINUATION_ID: continuationId must be a non-empty string');
   }
+  const continuationIdBytes = Buffer.byteLength(continuationId, 'utf8');
+  if (continuationIdBytes > MAX_CONTINUATION_ID_BYTES) {
+    throw new Error(`INVALID_CONTINUATION_ID: too large (${continuationIdBytes} bytes, max ${MAX_CONTINUATION_ID_BYTES})`);
+  }
 
-  if (typeof snapshotHash !== 'string' || !/^[a-f0-9]{64}$/.test(snapshotHash)) {
+  if (typeof snapshotHash !== 'string' || !SHA256_REGEX.test(snapshotHash)) {
     throw new Error('INVALID_SNAPSHOT_HASH: snapshotHash must be a 64-character hex string');
   }
 
-  if (!Number.isInteger(expectedParentSequence) || expectedParentSequence < 0) {
-    throw new Error('INVALID_EXPECTED_PARENT_SEQUENCE: expectedParentSequence must be a non-negative integer');
+  if (!Number.isInteger(expectedParentSequence) || expectedParentSequence < 0 || !Number.isSafeInteger(expectedParentSequence)) {
+    throw new Error('INVALID_EXPECTED_PARENT_SEQUENCE: expectedParentSequence must be a non-negative safe integer');
   }
 
-  if (!Number.isInteger(expectedInputWatermark) || expectedInputWatermark < 0) {
-    throw new Error('INVALID_EXPECTED_INPUT_WATERMARK: expectedInputWatermark must be a non-negative integer');
+  if (!Number.isInteger(expectedInputWatermark) || expectedInputWatermark < 0 || !Number.isSafeInteger(expectedInputWatermark)) {
+    throw new Error('INVALID_EXPECTED_INPUT_WATERMARK: expectedInputWatermark must be a non-negative safe integer');
   }
 
-  if (!VALID_DECISIONS.has(decision)) {
-    throw new Error(`INVALID_DECISION: decision must be one of ${[...VALID_DECISIONS].join(', ')}`);
+  if (!VALID_DECISION_CODES.has(decisionCode)) {
+    throw new Error(`INVALID_DECISION_CODE: decisionCode must be one of ${[...VALID_DECISION_CODES].join(', ')}`);
   }
 
-  if (typeof runPath !== 'string' || runPath.trim() === '') {
-    throw new Error('INVALID_RUN_PATH: runPath must be a non-empty string');
+  validateRunPath(runPath);
+  validateRegisteredEventRefs(registeredEventRefs);
+  validateExpectedNextAction(expectedNextAction);
+
+  // Now validate actionSlot field bindings (exact match to top-level fields)
+  const actionSlotContinuationIdDesc = Object.getOwnPropertyDescriptor(actionSlot, 'continuationId');
+  const actionSlotExpectedParentSequenceDesc = Object.getOwnPropertyDescriptor(actionSlot, 'expectedParentSequence');
+  const actionSlotExpectedInputWatermarkDesc = Object.getOwnPropertyDescriptor(actionSlot, 'expectedInputWatermark');
+  const actionSlotGoalVersionDesc = Object.getOwnPropertyDescriptor(actionSlot, 'goalVersion');
+  const actionSlotSnapshotHashDesc = Object.getOwnPropertyDescriptor(actionSlot, 'snapshotHash');
+  const actionSlotDecisionCodeDesc = Object.getOwnPropertyDescriptor(actionSlot, 'decisionCode');
+  const actionSlotAttemptDesc = Object.getOwnPropertyDescriptor(actionSlot, 'attempt');
+
+  if (actionSlotContinuationIdDesc.value !== continuationId) {
+    throw new Error('ACTION_SLOT_MISMATCH: actionSlot.continuationId does not match top-level continuationId');
   }
 
-  if (hasInvalidControlChars(runPath)) {
-    throw new Error('INVALID_RUN_PATH: runPath contains invalid control characters');
+  if (actionSlotExpectedParentSequenceDesc.value !== expectedParentSequence) {
+    throw new Error('ACTION_SLOT_MISMATCH: actionSlot.expectedParentSequence does not match top-level expectedParentSequence');
   }
 
-  if (!Array.isArray(registeredEventRefs)) {
-    throw new Error('INVALID_REGISTERED_EVENT_REFS: registeredEventRefs must be an array');
+  if (actionSlotExpectedInputWatermarkDesc.value !== expectedInputWatermark) {
+    throw new Error('ACTION_SLOT_MISMATCH: actionSlot.expectedInputWatermark does not match top-level expectedInputWatermark');
   }
 
-  // Validate array elements via descriptors
-  for (let i = 0; i < registeredEventRefs.length; i++) {
-    const desc = Object.getOwnPropertyDescriptor(registeredEventRefs, i);
-    if (!desc) {
-      throw new Error('SPARSE_ARRAY: registeredEventRefs contains holes');
-    }
-    if (desc.get || desc.set) {
-      throw new Error('GETTER_SETTER: registeredEventRefs element has getter/setter');
-    }
-    if (typeof desc.value !== 'string') {
-      throw new Error('INVALID_REGISTERED_EVENT_REFS: all event refs must be strings');
-    }
+  if (actionSlotGoalVersionDesc.value !== goalVersion) {
+    throw new Error('ACTION_SLOT_MISMATCH: actionSlot.goalVersion does not match top-level goalVersion');
   }
 
-  // Check for extra array properties on registeredEventRefs
-  const refKeys = Reflect.ownKeys(registeredEventRefs);
-  for (const key of refKeys) {
-    if (typeof key === 'symbol') {
-      throw new Error('SYMBOL_KEY: registeredEventRefs has symbol key');
-    }
-    if (key !== 'length') {
-      const asNum = Number(key);
-      if (!Number.isInteger(asNum) || asNum < 0 || asNum >= registeredEventRefs.length) {
-        throw new Error(`EXTRA_ARRAY_PROPERTY: registeredEventRefs has unexpected property "${key}"`);
-      }
-    }
+  if (actionSlotSnapshotHashDesc.value !== snapshotHash) {
+    throw new Error('ACTION_SLOT_MISMATCH: actionSlot.snapshotHash does not match top-level snapshotHash');
   }
 
-  if (typeof expectedNextAction !== 'string' || expectedNextAction.trim() === '') {
-    throw new Error('INVALID_EXPECTED_NEXT_ACTION: expectedNextAction must be a non-empty string');
+  if (actionSlotDecisionCodeDesc.value !== decisionCode) {
+    throw new Error('ACTION_SLOT_MISMATCH: actionSlot.decisionCode does not match top-level decisionCode');
+  }
+
+  // Validate attempt field
+  const attempt = actionSlotAttemptDesc.value;
+  if (!Number.isInteger(attempt) || attempt < 0 || !Number.isSafeInteger(attempt)) {
+    throw new Error('INVALID_ATTEMPT: attempt must be a non-negative safe integer');
   }
 
   // Check total input size using canonical encoding
@@ -644,7 +757,7 @@ export function renderContinuationPrompt(input) {
   const snapshotHashDesc = Object.getOwnPropertyDescriptor(input, 'snapshotHash');
   const expectedParentSequenceDesc = Object.getOwnPropertyDescriptor(input, 'expectedParentSequence');
   const expectedInputWatermarkDesc = Object.getOwnPropertyDescriptor(input, 'expectedInputWatermark');
-  const decisionDesc = Object.getOwnPropertyDescriptor(input, 'decision');
+  const decisionCodeDesc = Object.getOwnPropertyDescriptor(input, 'decisionCode');
   const runPathDesc = Object.getOwnPropertyDescriptor(input, 'runPath');
   const registeredEventRefsDesc = Object.getOwnPropertyDescriptor(input, 'registeredEventRefs');
   const expectedNextActionDesc = Object.getOwnPropertyDescriptor(input, 'expectedNextAction');
@@ -657,7 +770,7 @@ export function renderContinuationPrompt(input) {
   const encodedSnapshotHash = encodeAsLengthPrefixedJSON(snapshotHashDesc.value);
   const encodedParentSequence = encodeAsLengthPrefixedJSON(expectedParentSequenceDesc.value);
   const encodedInputWatermark = encodeAsLengthPrefixedJSON(expectedInputWatermarkDesc.value);
-  const encodedDecision = encodeAsLengthPrefixedJSON(decisionDesc.value);
+  const encodedDecisionCode = encodeAsLengthPrefixedJSON(decisionCodeDesc.value);
   const encodedRunPath = encodeAsLengthPrefixedJSON(runPathDesc.value);
   const encodedEventRefs = encodeAsLengthPrefixedJSON(registeredEventRefsDesc.value);
   const encodedNextAction = encodeAsLengthPrefixedJSON(expectedNextActionDesc.value);
@@ -672,7 +785,7 @@ Continuation ID: ${encodedContinuationId}
 Snapshot Hash: ${encodedSnapshotHash}
 Expected Parent Sequence: ${encodedParentSequence}
 Expected Input Watermark: ${encodedInputWatermark}
-Decision: ${encodedDecision}
+Decision Code: ${encodedDecisionCode}
 Run Path: ${encodedRunPath}
 Registered Event Refs: ${encodedEventRefs}
 Expected Next Action: ${encodedNextAction}
@@ -694,6 +807,7 @@ Every state assertion must be traceable to a fresh read or confirmed write.`;
 
 /**
  * Render native goal condition for Claude /goal.
+ * Launcher-owned, <4000 chars, rejects injection/format controls, safely encodes goalInstance.
  * Semantically settles only on fresh verify DONE|PAUSED_USER|BLOCKED.
  * Only DONE ends macro goal.
  */
@@ -701,6 +815,11 @@ export function renderNativeGoalCondition(goalInstance) {
   // Validate goal instance
   if (typeof goalInstance !== 'string' || goalInstance.trim() === '') {
     throw new Error('INVALID_GOAL_INSTANCE: goalInstance must be a non-empty string');
+  }
+
+  const goalInstanceBytes = Buffer.byteLength(goalInstance, 'utf8');
+  if (goalInstanceBytes > MAX_GOAL_INSTANCE_BYTES) {
+    throw new Error(`INVALID_GOAL_INSTANCE: too large (${goalInstanceBytes} bytes, max ${MAX_GOAL_INSTANCE_BYTES})`);
   }
 
   // Reject newlines and control characters (potential injection)
