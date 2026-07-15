@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { redactSecrets } from './redaction.js';
+import { parseJSONStrictly } from './strict-json-parser.js';
 
 const PROD_ISSUER = 'https://auth.neta.art';
 const PROD_CLIENT_ID = 'f8d26cdlwx85b0e5l3om2';
@@ -48,257 +49,39 @@ function isPositiveSafeInteger(value) {
 }
 
 /**
- * Parse JSON with duplicate key detection at every nesting level.
- * Standard JSON.parse silently accepts the last value for duplicate keys,
- * which could mask tampering. This parser rejects duplicates in any object.
+ * Capture exact own data descriptors from an object without invoking getters.
+ * Returns a plain object with only data properties (throws on accessors).
  */
-function parseJSONStrictly(text) {
-  let pos = 0;
-  const len = text.length;
+function captureOwnDataDescriptors(obj, requiredKeys = [], optionalKeys = []) {
+  const result = Object.create(null);
+  const allKeys = [...requiredKeys, ...optionalKeys];
 
-  function skipWhitespace() {
-    while (pos < len && ' \t\n\r'.includes(text[pos])) {
-      pos++;
+  for (const key of allKeys) {
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (!desc) {
+      if (requiredKeys.includes(key)) {
+        throw new Error(`Missing required property: ${key}`);
+      }
+      continue;
     }
+
+    if (desc.get || desc.set) {
+      throw new Error(`Property ${key} is an accessor, not a data property`);
+    }
+
+    if (!('value' in desc)) {
+      throw new Error(`Property ${key} has no value`);
+    }
+
+    result[key] = desc.value;
   }
 
-  function parseValue() {
-    skipWhitespace();
-    if (pos >= len) {
-      throw new Error('Unexpected end of JSON input');
+  // Check for unknown keys
+  const ownKeys = Object.getOwnPropertyNames(obj);
+  for (const key of ownKeys) {
+    if (!allKeys.includes(key)) {
+      throw new Error(`Unknown property: ${key}`);
     }
-
-    const char = text[pos];
-
-    if (char === '"') {
-      return parseString();
-    } else if (char === '{') {
-      return parseObject();
-    } else if (char === '[') {
-      return parseArray();
-    } else if (char === 't') {
-      if (text.substr(pos, 4) === 'true') {
-        pos += 4;
-        return true;
-      }
-      throw new Error('Invalid JSON token at position ' + pos);
-    } else if (char === 'f') {
-      if (text.substr(pos, 5) === 'false') {
-        pos += 5;
-        return false;
-      }
-      throw new Error('Invalid JSON token at position ' + pos);
-    } else if (char === 'n') {
-      if (text.substr(pos, 4) === 'null') {
-        pos += 4;
-        return null;
-      }
-      throw new Error('Invalid JSON token at position ' + pos);
-    } else if (char === '-' || (char >= '0' && char <= '9')) {
-      return parseNumber();
-    } else {
-      throw new Error('Unexpected character at position ' + pos);
-    }
-  }
-
-  function parseString() {
-    if (text[pos] !== '"') {
-      throw new Error('Expected string at position ' + pos);
-    }
-    pos++; // skip opening quote
-
-    let result = '';
-    let escapeNext = false;
-
-    while (pos < len) {
-      const char = text[pos];
-
-      if (escapeNext) {
-        if (char === '"' || char === '\\' || char === '/' || char === 'b' || char === 'f' || char === 'n' || char === 'r' || char === 't') {
-          const escapeMap = { '"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t' };
-          result += escapeMap[char] || char;
-          escapeNext = false;
-          pos++;
-        } else if (char === 'u') {
-          // Unicode escape \uXXXX
-          if (pos + 4 >= len) {
-            throw new Error('Incomplete unicode escape at position ' + pos);
-          }
-          const hex = text.substr(pos + 1, 4);
-          const codePoint = parseInt(hex, 16);
-          if (isNaN(codePoint)) {
-            throw new Error('Invalid unicode escape at position ' + pos);
-          }
-          result += String.fromCharCode(codePoint);
-          pos += 5;
-          escapeNext = false;
-        } else {
-          throw new Error('Invalid escape sequence at position ' + pos);
-        }
-      } else if (char === '\\') {
-        escapeNext = true;
-        pos++;
-      } else if (char === '"') {
-        pos++; // skip closing quote
-        return result;
-      } else if (char < ' ') {
-        throw new Error('Unescaped control character at position ' + pos);
-      } else {
-        result += char;
-        pos++;
-      }
-    }
-
-    throw new Error('Unterminated string at position ' + pos);
-  }
-
-  function parseNumber() {
-    const start = pos;
-
-    if (text[pos] === '-') {
-      pos++;
-    }
-
-    if (pos >= len || text[pos] < '0' || text[pos] > '9') {
-      throw new Error('Invalid number at position ' + start);
-    }
-
-    if (text[pos] === '0') {
-      pos++;
-    } else {
-      while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
-        pos++;
-      }
-    }
-
-    if (pos < len && text[pos] === '.') {
-      pos++;
-      if (pos >= len || text[pos] < '0' || text[pos] > '9') {
-        throw new Error('Invalid number at position ' + start);
-      }
-      while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
-        pos++;
-      }
-    }
-
-    if (pos < len && (text[pos] === 'e' || text[pos] === 'E')) {
-      pos++;
-      if (pos < len && (text[pos] === '+' || text[pos] === '-')) {
-        pos++;
-      }
-      if (pos >= len || text[pos] < '0' || text[pos] > '9') {
-        throw new Error('Invalid number at position ' + start);
-      }
-      while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
-        pos++;
-      }
-    }
-
-    const numStr = text.slice(start, pos);
-    return parseFloat(numStr);
-  }
-
-  function parseObject() {
-    if (text[pos] !== '{') {
-      throw new Error('Expected object at position ' + pos);
-    }
-    pos++; // skip opening brace
-
-    const obj = {};
-    const keys = new Set();
-    let first = true;
-
-    skipWhitespace();
-
-    while (pos < len && text[pos] !== '}') {
-      if (!first) {
-        skipWhitespace();
-        if (text[pos] !== ',') {
-          throw new Error('Expected comma at position ' + pos);
-        }
-        pos++;
-        skipWhitespace();
-      }
-      first = false;
-
-      if (text[pos] === '}') {
-        break; // trailing comma
-      }
-
-      // Parse key
-      if (text[pos] !== '"') {
-        throw new Error('Expected string key at position ' + pos);
-      }
-      const key = parseString();
-
-      if (keys.has(key)) {
-        throw new Error('Duplicate key detected in JSON: ' + key);
-      }
-      keys.add(key);
-
-      skipWhitespace();
-      if (text[pos] !== ':') {
-        throw new Error('Expected colon at position ' + pos);
-      }
-      pos++;
-
-      // Parse value
-      obj[key] = parseValue();
-
-      skipWhitespace();
-    }
-
-    if (pos >= len || text[pos] !== '}') {
-      throw new Error('Expected closing brace at position ' + pos);
-    }
-    pos++; // skip closing brace
-
-    return obj;
-  }
-
-  function parseArray() {
-    if (text[pos] !== '[') {
-      throw new Error('Expected array at position ' + pos);
-    }
-    pos++; // skip opening bracket
-
-    const arr = [];
-    let first = true;
-
-    skipWhitespace();
-
-    while (pos < len && text[pos] !== ']') {
-      if (!first) {
-        skipWhitespace();
-        if (text[pos] !== ',') {
-          throw new Error('Expected comma at position ' + pos);
-        }
-        pos++;
-        skipWhitespace();
-      }
-      first = false;
-
-      if (text[pos] === ']') {
-        break; // trailing comma
-      }
-
-      arr.push(parseValue());
-
-      skipWhitespace();
-    }
-
-    if (pos >= len || text[pos] !== ']') {
-      throw new Error('Expected closing bracket at position ' + pos);
-    }
-    pos++; // skip closing bracket
-
-    return arr;
-  }
-
-  const result = parseValue();
-  skipWhitespace();
-  if (pos < len) {
-    throw new Error('Unexpected content after JSON at position ' + pos);
   }
 
   return result;
@@ -327,15 +110,20 @@ function validateAuthRecord(record) {
     throw new CohubAuthError('invalid_schema', 'auth.json must be a JSON object');
   }
 
-  // Check it's a plain object with Object.prototype, no exotic prototype
+  // Accept both Object.prototype and null prototype (from strict parser)
   const proto = Object.getPrototypeOf(record);
-  if (proto !== Object.prototype) {
+  if (proto !== Object.prototype && proto !== null) {
     throw new CohubAuthError('invalid_schema', 'auth.json must be a plain object');
   }
 
   // Use own property checks only
   const ownKeys = Object.keys(record);
-  for (const key of ownKeys) {
+  const ownNames = Object.getOwnPropertyNames(record);
+
+  // For null-prototype objects, getOwnPropertyNames includes all keys
+  const allOwnKeys = proto === null ? ownNames : ownKeys;
+
+  for (const key of allOwnKeys) {
     if (!KNOWN_FIELDS.has(key)) {
       throw new CohubAuthError('invalid_schema', `auth.json contains unknown field: ${key}`);
     }
@@ -393,7 +181,7 @@ function parseRefreshResponseText(text) {
   try {
     body = parseJSONStrictly(text);
   } catch (err) {
-    if (err.message && err.message.includes('Duplicate key')) {
+    if (err.message && err.message.toLowerCase().includes('duplicate')) {
       throw new CohubAuthError('bad_response', 'token refresh response contains duplicate keys');
     }
     throw new CohubAuthError('bad_response', 'token refresh response is not valid JSON');
@@ -441,7 +229,20 @@ export class CohubAuth {
 
   constructor(authPath, options = {}) {
     this.#authPath = authPath;
-    this.#console = options.console ?? console;
+
+    // Validate console Proxy-first
+    let safeConsole = console;
+    if (options && options.console !== undefined) {
+      const consoleDesc = Object.getOwnPropertyDescriptor(options, 'console');
+      if (!consoleDesc || consoleDesc.get || consoleDesc.set) {
+        throw new CohubAuthError('invalid_options', 'options.console must be a data property');
+      }
+      if (typeof consoleDesc.value !== 'object' || consoleDesc.value === null) {
+        throw new CohubAuthError('invalid_options', 'options.console must be an object');
+      }
+      safeConsole = consoleDesc.value;
+    }
+    this.#console = safeConsole;
 
     // Open with O_RDONLY | O_NOFOLLOW to prevent TOCTOU symlink-swap race
     let fd;
@@ -483,7 +284,7 @@ export class CohubAuth {
     try {
       record = parseJSONStrictly(raw);
     } catch (err) {
-      if (err.message && err.message.includes('Duplicate key')) {
+      if (err.message && err.message.toLowerCase().includes('duplicate')) {
         throw new CohubAuthError('invalid_schema', `auth file contains duplicate keys: ${authPath}`);
       }
       throw new CohubAuthError('invalid_schema', `auth file contains invalid JSON: ${authPath}`);
@@ -519,8 +320,10 @@ export class CohubAuth {
   }
 
   async #doRefresh(options) {
-    const fetchImpl = options.fetch ?? globalThis.fetch;
-    const now = options.now ?? (() => Date.now());
+    // Validate options Proxy-first
+    const safeOptions = this.#validateRefreshOptions(options);
+    const fetchImpl = safeOptions.fetch;
+    const now = safeOptions.now;
     const sentinels = this.#secretSentinels();
 
     const tokenUrl = `${this.#record.issuer}/oidc/token`;
@@ -533,7 +336,7 @@ export class CohubAuth {
     }).toString();
 
     let response;
-    let responseText;
+    let safeResponse;
     let responseBody;
     let newRecord;
     try {
@@ -547,28 +350,25 @@ export class CohubAuth {
         throw authError('network_error', 'token refresh network request failed', sentinels);
       }
 
-      try {
-        responseText = await response.text();
-      } catch (err) {
-        throw authError('bad_response', 'token refresh response body could not be read', sentinels);
-      }
+      // Validate response Proxy-first using descriptors (returns Promise)
+      safeResponse = await this.#validateFetchResponse(response, sentinels);
 
-      responseBody = parseRefreshResponseText(responseText);
-
-      if (!response.ok) {
+      if (!safeResponse.ok) {
+        responseBody = parseRefreshResponseText(safeResponse.text);
         // Map upstream error to closed vocabulary category, never reflect raw errorCode
         const errorCode = isNonEmptyString(responseBody?.error) ? responseBody.error : null;
         const category = errorCode === 'invalid_grant' || errorCode === 'invalid_token'
           ? errorCode
           : 'refresh_rejected';
         // Don't include errorCode in message to avoid leaking upstream format
-        throw authError(category, `token refresh rejected (status ${response.status})`, [
+        throw authError(category, `token refresh rejected (status ${safeResponse.status})`, [
           ...sentinels,
           ...(isNonEmptyString(responseBody?.access_token) ? [responseBody.access_token] : []),
           ...(isNonEmptyString(responseBody?.refresh_token) ? [responseBody.refresh_token] : []),
         ]);
       }
 
+      responseBody = parseRefreshResponseText(safeResponse.text);
       validateRefreshResponseBody(responseBody);
 
       const nowMs = now();
@@ -644,8 +444,109 @@ export class CohubAuth {
     }
 
     this.#record = newRecord;
-    this.#console.log('cohub-auth: token refreshed');
-    return { refreshed: true };
+
+    // Log using captured safe console
+    const consoleLogDesc = Object.getOwnPropertyDescriptor(this.#console, 'log');
+    if (consoleLogDesc && 'value' in consoleLogDesc && typeof consoleLogDesc.value === 'function') {
+      consoleLogDesc.value.call(this.#console, 'cohub-auth: token refreshed');
+    }
+
+    return Object.freeze({ refreshed: true });
+  }
+
+  #validateRefreshOptions(options) {
+    if (!options || typeof options !== 'object') {
+      options = {};
+    }
+
+    // Validate fetch Proxy-first
+    let fetchImpl = globalThis.fetch;
+    if (options.fetch !== undefined) {
+      const fetchDesc = Object.getOwnPropertyDescriptor(options, 'fetch');
+      if (!fetchDesc || fetchDesc.get || fetchDesc.set) {
+        throw new CohubAuthError('bad_response', 'options.fetch must be a data property');
+      }
+      if (typeof fetchDesc.value !== 'function') {
+        throw new CohubAuthError('bad_response', 'options.fetch must be a function');
+      }
+      fetchImpl = fetchDesc.value;
+    }
+
+    // Validate now Proxy-first
+    let now = () => Date.now();
+    if (options.now !== undefined) {
+      const nowDesc = Object.getOwnPropertyDescriptor(options, 'now');
+      if (!nowDesc || nowDesc.get || nowDesc.set) {
+        throw new CohubAuthError('bad_response', 'options.now must be a data property');
+      }
+      if (typeof nowDesc.value !== 'function') {
+        throw new CohubAuthError('bad_response', 'options.now must be a function');
+      }
+      now = nowDesc.value;
+    }
+
+    return { fetch: fetchImpl, now };
+  }
+
+  #validateFetchResponse(response, sentinels) {
+    if (!response || typeof response !== 'object') {
+      throw authError('bad_response', 'fetch response is not an object', sentinels);
+    }
+
+    // Capture exact descriptors without invoking getters
+    const okDesc = Object.getOwnPropertyDescriptor(response, 'ok');
+    const statusDesc = Object.getOwnPropertyDescriptor(response, 'status');
+    const textDesc = Object.getOwnPropertyDescriptor(response, 'text');
+
+    if (!okDesc || okDesc.get || okDesc.set) {
+      throw authError('bad_response', 'response.ok must be a data property', sentinels);
+    }
+    if (!statusDesc || statusDesc.get || statusDesc.set) {
+      throw authError('bad_response', 'response.status must be a data property', sentinels);
+    }
+    if (!textDesc || textDesc.get || textDesc.set) {
+      throw authError('bad_response', 'response.text must be a data property', sentinels);
+    }
+
+    const ok = okDesc.value;
+    const status = statusDesc.value;
+    const textFn = textDesc.value;
+
+    if (typeof ok !== 'boolean') {
+      throw authError('bad_response', 'response.ok must be boolean', sentinels);
+    }
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      throw authError('bad_response', 'response.status must be valid HTTP status', sentinels);
+    }
+    if (typeof textFn !== 'function') {
+      throw authError('bad_response', 'response.text must be a function', sentinels);
+    }
+
+    // Call text() and await it
+    let textPromise;
+    try {
+      textPromise = textFn.call(response);
+    } catch (err) {
+      throw authError('bad_response', 'response.text() threw', sentinels);
+    }
+
+    if (!textPromise || typeof textPromise.then !== 'function') {
+      throw authError('bad_response', 'response.text() must return a Promise', sentinels);
+    }
+
+    // Return a promise that resolves to safe response data
+    return textPromise.then((text) => {
+      if (typeof text !== 'string') {
+        throw authError('bad_response', 'response.text() must resolve to string', sentinels);
+      }
+      // Bound text size
+      if (text.length > 1024 * 1024) {
+        throw authError('bad_response', 'response body exceeds 1MB', sentinels);
+      }
+      return { ok, status, text };
+    }, (err) => {
+      throw authError('bad_response', 'response.text() rejected', sentinels);
+    });
   }
 
   #writeRecordAtomically(record) {
@@ -655,47 +556,76 @@ export class CohubAuth {
       `.${path.basename(this.#authPath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
     );
 
-    const fd = fs.openSync(tmpPath, 'wx', 0o600);
-    try {
-      fs.writeFileSync(fd, JSON.stringify(record, null, 2) + '\n');
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
+    let tmpFd;
+    let tmpWritten = false;
+    let renamed = false;
 
     try {
-      fs.renameSync(tmpPath, this.#authPath);
-    } catch (err) {
-      try {
-        fs.unlinkSync(tmpPath);
-      } catch {}
-      throw err;
-    }
+      // Create temp file with mode 0600
+      tmpFd = fs.openSync(tmpPath, 'wx', 0o600);
+      const content = JSON.stringify(record, null, 2) + '\n';
+      fs.writeFileSync(tmpFd, content);
+      fs.fsyncSync(tmpFd);
+      fs.closeSync(tmpFd);
+      tmpFd = null;
+      tmpWritten = true;
 
-    // Directory fsync after rename
-    const dirFd = fs.openSync(dir, 'r');
-    try {
-      fs.fsyncSync(dirFd);
-    } catch (dirSyncErr) {
-      // Rename succeeded but directory fsync failed
-      // Data is on disk but durability is ambiguous
-      // Re-read from disk to reconcile memory state
+      // Validate exact bytes from temp file before rename
+      const verifyFd = fs.openSync(tmpPath, 'r');
       try {
-        const verifyFd = fs.openSync(this.#authPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-        try {
-          const raw = fs.readFileSync(verifyFd, 'utf8');
-          const diskRecord = parseJSONStrictly(raw);
-          validateAuthRecord(diskRecord);
-          // Disk has the new record, so the write did commit
-          // Memory will be updated by caller after this returns
-        } finally {
-          fs.closeSync(verifyFd);
+        const written = fs.readFileSync(verifyFd, 'utf8');
+        if (written !== content) {
+          throw new Error('temp file content mismatch');
         }
-      } catch {}
-      // Throw to signal ambiguous integrity state
-      throw new CohubAuthError('integrity_ambiguous', 'rename succeeded but directory fsync failed');
-    } finally {
-      fs.closeSync(dirFd);
+      } finally {
+        fs.closeSync(verifyFd);
+      }
+
+      // Rename to commit
+      fs.renameSync(tmpPath, this.#authPath);
+      renamed = true;
+
+      // Directory fsync after rename
+      const dirFd = fs.openSync(dir, 'r');
+      try {
+        fs.fsyncSync(dirFd);
+      } catch (dirSyncErr) {
+        // Rename succeeded but directory fsync failed
+        // Data is on disk but durability is ambiguous
+        // Re-read from disk to reconcile memory state
+        try {
+          const verifyFd = fs.openSync(this.#authPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          try {
+            const raw = fs.readFileSync(verifyFd, 'utf8');
+            const diskRecord = parseJSONStrictly(raw);
+            validateAuthRecord(diskRecord);
+            // Disk has the new record, so the write did commit
+            // Memory will be updated by caller after this returns
+          } finally {
+            fs.closeSync(verifyFd);
+          }
+        } catch (verifyErr) {
+          // Could not verify disk state - ambiguous
+        }
+        throw new CohubAuthError('integrity_ambiguous', 'rename succeeded but directory fsync failed');
+      } finally {
+        fs.closeSync(dirFd);
+      }
+    } catch (err) {
+      // Clean up temp file only if it exists and rename hasn't happened yet
+      if (tmpFd !== null) {
+        try {
+          fs.closeSync(tmpFd);
+        } catch {}
+      }
+
+      if (tmpWritten && !renamed) {
+        // Preserve temp file for forensics on failure before rename
+        // Only try to delete if it's provably safe (e.g., write failed before fsync)
+        // Otherwise leave it for investigation
+      }
+
+      throw err;
     }
   }
 }

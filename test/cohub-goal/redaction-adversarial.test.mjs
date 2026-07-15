@@ -153,29 +153,25 @@ describe('redaction adversarial acceptance', () => {
     });
   });
 
-  describe('cycles preserved only for supported values', () => {
-    it('should preserve cycles in plain objects', () => {
+  describe('cycles rejected for security', () => {
+    it('should reject cycles in plain objects', () => {
       const obj = { name: 'test' };
       obj.self = obj;
-      const result = redactSecrets(obj);
-      assert.equal(result.self, result);
+      assert.throws(() => redactSecrets(obj), TypeError);
     });
 
-    it('should preserve cycles in arrays', () => {
+    it('should reject cycles in arrays', () => {
       const arr = [1, 2];
       arr.push(arr);
-      const result = redactSecrets(arr);
-      assert.equal(result[2], result);
+      assert.throws(() => redactSecrets(arr), TypeError);
     });
 
-    it('should preserve cycles in Error graph', () => {
+    it('should reject cycles in Error graph', () => {
       const err1 = new Error('err1');
       const err2 = new Error('err2');
       err1.cause = err2;
       err2.cause = err1;
-      const result = redactSecrets(err1);
-      assert.ok(result.cause instanceof Error);
-      assert.equal(result.cause.cause, result);
+      assert.throws(() => redactSecrets(err1), TypeError);
     });
 
     it('should throw when cycle involves unsupported type (Map)', () => {

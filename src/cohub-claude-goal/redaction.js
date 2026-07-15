@@ -15,27 +15,29 @@ const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const JWT_PATTERN = /\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi;
 
-const SAFE_PROTOTYPES = new Set([Object.prototype, null]);
-
-function isPlainObject(val) {
-  const proto = Object.getPrototypeOf(val);
-  return SAFE_PROTOTYPES.has(proto);
-}
+const MAX_OBJECT_SIZE = 5000; // max keys across all objects
+const MAX_STRING_LENGTH = 500 * 1024; // 500KB
 
 function isSecretKey(key) {
   return SECRET_KEYS.has(String(key).toLowerCase());
 }
 
 /**
- * Recursively redact secrets from plain objects, arrays and Errors.
- * Fail closed: throws on any accessor property, function, symbol, dangerous
- * key, collision, sparse array, extra array property, or unsupported type.
+ * Recursively redact secrets from plain objects, arrays and native Errors.
+ * Proxy-first: validates descriptors before reading any property.
+ * Fail closed: throws on accessor, function, symbol, dangerous key, cycle,
+ * shared reference, sparse array, extra array property, or unsupported type.
+ * Returns deep-frozen detached objects with null prototype.
  * Never invokes user code (getters, constructors, or functions).
  */
 export function redactSecrets(value, options = {}) {
-  // Check for explicit undefined or non-array sentinels before destructuring
+  // Validate options Proxy-first
   if (options && Object.prototype.hasOwnProperty.call(options, 'sentinels')) {
-    if (!Array.isArray(options.sentinels)) {
+    const sentinelsDesc = Object.getOwnPropertyDescriptor(options, 'sentinels');
+    if (!sentinelsDesc || sentinelsDesc.get || sentinelsDesc.set) {
+      throw new TypeError('redactSecrets: options.sentinels must be a data property');
+    }
+    if (!Array.isArray(sentinelsDesc.value)) {
       throw new TypeError('redactSecrets: sentinels must be an array');
     }
   }
@@ -45,8 +47,13 @@ export function redactSecrets(value, options = {}) {
   const cleanSentinels = sentinels.filter((s) => typeof s === 'string' && s.length > 0);
 
   const seen = new WeakMap();
+  const seenForSharing = new WeakMap();
+  let totalKeys = 0;
 
   function redactString(str) {
+    if (str.length > MAX_STRING_LENGTH) {
+      throw new TypeError('redactSecrets: string exceeds maximum length');
+    }
     let result = str;
     result = result.replace(JWT_PATTERN, '[REDACTED_TOKEN]');
     result = result.replace(BEARER_PATTERN, '[REDACTED_TOKEN]');
@@ -68,11 +75,11 @@ export function redactSecrets(value, options = {}) {
 
   function redactKeyedEntry(key, desc, copy, usedKeys) {
     if (desc.get || desc.set) {
-      const safeKey = typeof key === 'string' ? redactString(key) : String(key);
-      throw new TypeError(`redactSecrets: refusing to invoke accessor property "${safeKey}"`);
+      // Never include the actual key name - it might contain secrets
+      throw new TypeError('redactSecrets: refusing to invoke accessor property');
     }
     if (!('value' in desc)) {
-      throw new TypeError(`redactSecrets: unsupported property descriptor for "${String(key)}"`);
+      throw new TypeError('redactSecrets: unsupported property descriptor');
     }
 
     if (typeof key === 'symbol') {
@@ -80,13 +87,13 @@ export function redactSecrets(value, options = {}) {
     }
 
     if (DANGEROUS_KEYS.has(key)) {
-      throw new TypeError(`redactSecrets: dangerous key "${key}" not allowed`);
+      throw new TypeError(`redactSecrets: dangerous key not allowed`);
     }
 
     const outKey = typeof key === 'string' ? redactKeyName(key) : key;
 
     if (usedKeys.has(outKey)) {
-      throw new TypeError(`redactSecrets: key collision after redaction: "${String(outKey)}"`);
+      throw new TypeError('redactSecrets: key collision after redaction');
     }
     usedKeys.add(outKey);
 
@@ -103,74 +110,86 @@ export function redactSecrets(value, options = {}) {
     }
 
     for (const key of keys) {
+      totalKeys++;
+      if (totalKeys > MAX_OBJECT_SIZE) {
+        throw new TypeError('redactSecrets: object size exceeds maximum');
+      }
       const desc = Object.getOwnPropertyDescriptor(source, key);
       redactKeyedEntry(key, desc, copy, usedKeys);
     }
   }
 
   function redactErrorLike(val) {
+    // Accept native Error types and custom Error subclasses
     const proto = Object.getPrototypeOf(val);
+
+    // Check if it's in the Error prototype chain
+    let current = proto;
+    let isErrorType = false;
+    let depth = 0;
+    while (current !== null && depth < 10) {
+      if (current === Error.prototype) {
+        isErrorType = true;
+        break;
+      }
+      current = Object.getPrototypeOf(current);
+      depth++;
+    }
+
+    if (!isErrorType) {
+      throw new TypeError('redactSecrets: only Error types are supported');
+    }
+
     const redactedErr = Object.create(proto);
     seen.set(val, redactedErr);
+    seenForSharing.set(val, true);
 
-    // Read name, message, stack through own property descriptors to avoid invoking user-defined getters
-    // Note: native Error.stack is often an accessor, which is safe to invoke
+    // Read name through own property descriptor to avoid invoking user-defined getters
     const nameDesc = Object.getOwnPropertyDescriptor(val, 'name');
     if (nameDesc) {
       if (nameDesc.get || nameDesc.set) {
-        throw new TypeError('redactSecrets: Error.name is a user-defined accessor own property');
+        throw new TypeError('redactSecrets: Error.name is a user-defined accessor');
       }
       redactedErr.name = nameDesc.value;
     } else {
-      // Not an own property, read from prototype chain (standard Error.name behavior)
+      // Not an own property, read from prototype (standard Error.name behavior)
       redactedErr.name = val.name;
     }
 
     const messageDesc = Object.getOwnPropertyDescriptor(val, 'message');
     if (messageDesc) {
       if (messageDesc.get || messageDesc.set) {
-        throw new TypeError('redactSecrets: Error.message is a user-defined accessor own property');
+        throw new TypeError('redactSecrets: Error.message is a user-defined accessor');
       }
       redactedErr.message = redactString(String(messageDesc.value));
     } else {
       redactedErr.message = redactString(String(val.message));
     }
 
-    // Stack is special: native Error.stack is often an accessor, so we allow reading it
-    // We only reject if user added a custom accessor to an Error instance
+    // Stack: check if it's an own property with accessor
     const stackDesc = Object.getOwnPropertyDescriptor(val, 'stack');
-    if (stackDesc && 'value' in stackDesc) {
-      // Own data property
-      if (typeof stackDesc.value === 'string') {
-        redactedErr.stack = redactString(stackDesc.value);
-      }
-    } else if (stackDesc && (stackDesc.get || stackDesc.set)) {
-      // Own accessor - check if it looks like native or user-defined
-      // Native stack accessors are safe, but user-defined ones could leak secrets
-      // Heuristic: if it's on a plain Error instance, it's likely native
-      // For safety in adversarial contexts, we'll allow reading val.stack but only if proto is Error.prototype
-      const isStandardError = proto === Error.prototype ||
-                              proto === TypeError.prototype ||
-                              proto === RangeError.prototype ||
-                              proto === ReferenceError.prototype ||
-                              proto === SyntaxError.prototype;
-      if (isStandardError && typeof val.stack === 'string') {
-        redactedErr.stack = redactString(val.stack);
-      } else if (!isStandardError) {
-        // Custom Error subclass with accessor stack - risky, but allow reading for now
+    if (stackDesc) {
+      if (stackDesc.get || stackDesc.set) {
+        // Check if it's enumerable - user-defined accessors are typically enumerable
+        if (stackDesc.enumerable) {
+          throw new TypeError('redactSecrets: Error.stack is a user-defined accessor');
+        }
+        // Native Error.stack accessor (non-enumerable) - safe to read
         if (typeof val.stack === 'string') {
           redactedErr.stack = redactString(val.stack);
         }
+      } else if (typeof stackDesc.value === 'string') {
+        redactedErr.stack = redactString(stackDesc.value);
       }
     } else if (typeof val.stack === 'string') {
-      // Stack is inherited or auto-generated
+      // Stack is inherited or auto-generated - safe to read
       redactedErr.stack = redactString(val.stack);
     }
 
     if (Object.prototype.hasOwnProperty.call(val, 'cause')) {
       const causeDesc = Object.getOwnPropertyDescriptor(val, 'cause');
       if (causeDesc.get || causeDesc.set) {
-        throw new TypeError('redactSecrets: Error.cause is a user-defined accessor property');
+        throw new TypeError('redactSecrets: Error.cause is a user-defined accessor');
       }
       redactedErr.cause = redact(causeDesc.value);
     }
@@ -185,11 +204,15 @@ export function redactSecrets(value, options = {}) {
 
     for (const key of keys) {
       if (key === 'message' || key === 'name' || key === 'stack' || key === 'cause') continue;
+      totalKeys++;
+      if (totalKeys > MAX_OBJECT_SIZE) {
+        throw new TypeError('redactSecrets: object size exceeds maximum');
+      }
       const desc = Object.getOwnPropertyDescriptor(val, key);
       redactKeyedEntry(key, desc, redactedErr, usedKeys);
     }
 
-    return redactedErr;
+    return Object.freeze(redactedErr);
   }
 
   function redact(val) {
@@ -209,13 +232,31 @@ export function redactSecrets(value, options = {}) {
       throw new TypeError('redactSecrets: symbol values are not supported');
     }
 
+    if (typeof val === 'bigint') {
+      throw new TypeError('redactSecrets: BigInt values are not supported');
+    }
+
+    if (typeof val === 'number') {
+      if (!Number.isFinite(val)) {
+        throw new TypeError('redactSecrets: non-finite numbers are not supported');
+      }
+      return val;
+    }
+
     if (typeof val !== 'object') {
       return val;
     }
 
+    // Reject cycles: if seen, it's a cycle
     if (seen.has(val)) {
-      return seen.get(val);
+      throw new TypeError('redactSecrets: cycles are not allowed');
     }
+
+    // Reject shared references: if seen for sharing check, it's shared
+    if (seenForSharing.has(val)) {
+      throw new TypeError('redactSecrets: shared references are not allowed');
+    }
+    seenForSharing.set(val, true);
 
     if (val instanceof Error) {
       return redactErrorLike(val);
@@ -230,7 +271,7 @@ export function redactSecrets(value, options = {}) {
       for (const key of keys) {
         const index = Number(key);
         if (!Number.isInteger(index) || index < 0 || index >= val.length) {
-          throw new TypeError(`redactSecrets: array has non-numeric own property "${key}"`);
+          throw new TypeError('redactSecrets: array has non-numeric own property');
         }
       }
 
@@ -246,29 +287,30 @@ export function redactSecrets(value, options = {}) {
           throw new TypeError(`redactSecrets: array has a hole at index ${i}`);
         }
         if (desc.get || desc.set) {
-          throw new TypeError(`redactSecrets: refusing to invoke accessor property "${i}"`);
+          throw new TypeError('redactSecrets: refusing to invoke accessor property');
         }
         if (!('value' in desc)) {
-          throw new TypeError(`redactSecrets: unsupported property descriptor for array index "${i}"`);
+          throw new TypeError('redactSecrets: unsupported property descriptor for array index');
         }
         copy.push(redact(desc.value));
       }
-      return copy;
+
+      seenForSharing.delete(val); // Remove before returning
+      return Object.freeze(copy);
     }
 
-    if (isPlainObject(val)) {
-      const copy = {};
-      seen.set(val, copy);
-      cloneOwnProperties(val, copy);
-      return copy;
-    }
-
-    // Avoid reading val.constructor which could be a getter
+    // Check if plain object (Object.prototype or null prototype only)
     const proto = Object.getPrototypeOf(val);
-    // Do not access proto.constructor.name which could invoke a getter
-    throw new TypeError(
-      `redactSecrets: cannot safely redact unsupported object type`
-    );
+    if (proto !== Object.prototype && proto !== null) {
+      throw new TypeError('redactSecrets: cannot safely redact unsupported object type');
+    }
+
+    const copy = Object.create(null);
+    seen.set(val, copy);
+    cloneOwnProperties(val, copy);
+
+    seenForSharing.delete(val); // Remove before returning
+    return Object.freeze(copy);
   }
 
   return redact(value);
