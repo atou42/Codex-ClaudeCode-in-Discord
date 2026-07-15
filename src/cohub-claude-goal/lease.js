@@ -10,6 +10,7 @@ export const LEASE_FILE_NAME = 'lease.json';
 
 const REQUIRED_LOCK_FIELDS = ['pid', 'processStartTime', 'host', 'acquiredAt', 'nonce', 'goalInstance'];
 const ALLOWED_LOCK_FIELDS = new Set(REQUIRED_LOCK_FIELDS);
+const TAKEOVER_LOCK_SUFFIX = '.takeover-lock';
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object') return false;
@@ -42,6 +43,9 @@ function assertValidLockSchema(lock, lockPath) {
   if (typeof lock.host !== 'string' || lock.host.length === 0) {
     throw new IntegrityError(`lease: lock file ${lockPath} host must be a nonempty string`);
   }
+  if (typeof lock.goalInstance !== 'string' || lock.goalInstance.length === 0) {
+    throw new IntegrityError(`lease: lock file ${lockPath} goalInstance must be a non-empty string, got ${JSON.stringify(lock.goalInstance)}`);
+  }
 }
 
 export function isProcessAlive(pid) {
@@ -60,14 +64,24 @@ export function isProcessAlive(pid) {
 }
 
 async function readLockOrNull(lockPath) {
-  let raw;
+  let fd;
   try {
-    raw = await fsPromises.readFile(lockPath, 'utf8');
+    fd = await fsPromises.open(lockPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   } catch (err) {
     if (err.code === 'ENOENT') {
       return null;
     }
+    if (err.code === 'ELOOP') {
+      throw new IntegrityError(`lease: ${lockPath} is a symlink; rejecting to prevent TOCTOU attacks`);
+    }
     throw err;
+  }
+
+  let raw;
+  try {
+    raw = await fd.readFile('utf8');
+  } finally {
+    await fd.close();
   }
 
   let parsed;
@@ -96,10 +110,19 @@ function ownProcessStartTime() {
  * to be provided and to resolve successfully (recording the dead owner to an
  * audit ledger) before the old lock is archived and replaced atomically.
  * Never shells out to any command to make this determination.
+ *
+ * Concurrent takeover attempts are serialized via an exclusive takeover lock
+ * to ensure exactly one winner.
  */
 export async function acquireLease(dir, options = {}) {
   const { goalInstance, auditDeadOwnerTakeover, processIdentityProvider } = options;
+
+  if (typeof goalInstance !== 'string' || goalInstance.length === 0) {
+    throw new Error('acquireLease: options.goalInstance is required and must be a non-empty string');
+  }
+
   const lockPath = path.join(dir, LEASE_FILE_NAME);
+  const takeoverLockPath = lockPath + TAKEOVER_LOCK_SUFFIX;
 
   const existing = await readLockOrNull(lockPath);
 
@@ -137,13 +160,83 @@ export async function acquireLease(dir, options = {}) {
       );
     }
 
-    await auditDeadOwnerTakeover(existing);
+    // Acquire exclusive takeover lock to serialize concurrent takeover attempts
+    let takeoverLockFd;
+    try {
+      takeoverLockFd = await fsPromises.open(
+        takeoverLockPath,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+        0o600
+      );
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        throw new LeaseConflictError(
+          `lease: another process is currently taking over the dead lease; retry`,
+        );
+      }
+      throw err;
+    }
 
-    const archivePath = path.join(dir, `${LEASE_FILE_NAME}.dead-${Date.now()}-${existing.nonce}`);
-    const oldBytes = await fsPromises.readFile(lockPath);
-    await writeFileAtomic(archivePath, oldBytes, { mode: 0o600 });
+    try {
+      await takeoverLockFd.write(`${process.pid}\n`, 0, 'utf8');
+      await takeoverLockFd.sync();
+
+      // Re-read the lease under the takeover lock to detect if another process
+      // already completed takeover
+      const recheck = await readLockOrNull(lockPath);
+      if (!recheck) {
+        throw new LeaseConflictError(
+          `lease: dead lease disappeared during takeover; another process may have taken over`,
+        );
+      }
+      if (recheck.nonce !== existing.nonce) {
+        throw new LeaseConflictError(
+          `lease: dead lease was replaced by another process during takeover`,
+        );
+      }
+
+      // Run the audit callback
+      await auditDeadOwnerTakeover(existing);
+
+      // Archive the exact old lock bytes before replacement
+      const archivePath = path.join(dir, `${LEASE_FILE_NAME}.dead-${Date.now()}-${existing.nonce}`);
+      let oldBytesFd;
+      try {
+        oldBytesFd = await fsPromises.open(lockPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      } catch (err) {
+        if (err.code === 'ELOOP') {
+          throw new IntegrityError(`lease: ${lockPath} became a symlink during takeover`);
+        }
+        throw err;
+      }
+      const oldBytes = await oldBytesFd.readFile();
+      await oldBytesFd.close();
+      await writeFileAtomic(archivePath, oldBytes, { mode: 0o600 });
+
+      // Create the new lock atomically, replacing the old one
+      const newLock = {
+        pid: process.pid,
+        processStartTime: ownProcessStartTime(),
+        host: os.hostname(),
+        acquiredAt: new Date().toISOString(),
+        nonce: crypto.randomBytes(16).toString('hex'),
+        goalInstance,
+      };
+
+      await writeFileAtomic(lockPath, JSON.stringify(newLock, null, 2), { mode: 0o600, allowReplace: true });
+
+      return { lock: newLock };
+    } finally {
+      await takeoverLockFd.close();
+      try {
+        await fsPromises.unlink(takeoverLockPath);
+      } catch (err) {
+        // Best effort cleanup; ignore errors
+      }
+    }
   }
 
+  // No existing lease; create new one
   const newLock = {
     pid: process.pid,
     processStartTime: ownProcessStartTime(),
@@ -153,7 +246,7 @@ export async function acquireLease(dir, options = {}) {
     goalInstance,
   };
 
-  await writeFileAtomic(lockPath, JSON.stringify(newLock, null, 2), { mode: 0o600, allowReplace: !!existing });
+  await writeFileAtomic(lockPath, JSON.stringify(newLock, null, 2), { mode: 0o600, allowReplace: false });
 
   return { lock: newLock };
 }
@@ -162,18 +255,55 @@ export async function acquireLease(dir, options = {}) {
  * Releases the lease only if the on-disk lock still matches lock's nonce
  * exactly. If a different owner already holds the lease (different nonce),
  * this is a no-op rather than an error or a deletion of someone else's lock.
+ * Uses file descriptor-based read and conditional unlink to prevent race
+ * where another process acquires between read and unlink.
  */
 export async function releaseLease(dir, lock) {
   const lockPath = path.join(dir, LEASE_FILE_NAME);
-  const existing = await readLockOrNull(lockPath);
-  if (!existing || existing.nonce !== lock.nonce) {
-    return;
-  }
-  await fsPromises.unlink(lockPath);
-  const dirFd = await fsPromises.open(dir, fs.constants.O_RDONLY);
+
+  let fd;
   try {
-    await dirFd.sync();
+    fd = await fsPromises.open(lockPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return; // Already released
+    }
+    if (err.code === 'ELOOP') {
+      throw new IntegrityError(`lease: ${lockPath} is a symlink during release`);
+    }
+    throw err;
+  }
+
+  try {
+    const raw = await fd.readFile('utf8');
+    let existing;
+    try {
+      existing = JSON.parse(raw);
+    } catch (err) {
+      // Corrupt lock; not our lock, don't delete
+      return;
+    }
+
+    if (!existing || existing.nonce !== lock.nonce) {
+      // Not our lock anymore
+      return;
+    }
+
+    // Our lock is still there; now we can safely unlink
+    // Close fd before unlinking
+    await fd.close();
+    fd = null;
+
+    await fsPromises.unlink(lockPath);
+    const dirFd = await fsPromises.open(dir, fs.constants.O_RDONLY);
+    try {
+      await dirFd.sync();
+    } finally {
+      await dirFd.close();
+    }
   } finally {
-    await dirFd.close();
+    if (fd) {
+      await fd.close();
+    }
   }
 }
