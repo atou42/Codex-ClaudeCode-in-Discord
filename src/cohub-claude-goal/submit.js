@@ -295,15 +295,71 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
 
   const reconciliation = await reconcileByClientMessageId(continuationId);
 
-  if (!reconciliation || typeof reconciliation !== 'object') {
+  // Validate reconciliation is exact own plain object with no accessors, inherited props, or cycles
+  if (!reconciliation || typeof reconciliation !== 'object' || Array.isArray(reconciliation)) {
+    const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+    const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
+    if (!alreadyAmbiguous) {
+      await ctx.writePhase(PHASES.AMBIGUOUS, {
+        actionSlotId,
+        continuationId,
+        reason: 'Reconciliation returned invalid result (not a plain object).',
+      });
+    }
     return {
       error: 'BLOCKED_AMBIGUOUS_SEND',
       reason: 'Reconciliation returned invalid result.',
     };
   }
 
+  // Check for accessors or non-Object prototype
+  const proto = Object.getPrototypeOf(reconciliation);
+  if (proto !== Object.prototype && proto !== null) {
+    const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+    const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
+    if (!alreadyAmbiguous) {
+      await ctx.writePhase(PHASES.AMBIGUOUS, {
+        actionSlotId,
+        continuationId,
+        reason: 'Reconciliation returned object with non-plain prototype.',
+      });
+    }
+    return {
+      error: 'BLOCKED_AMBIGUOUS_SEND',
+      reason: 'Reconciliation returned invalid result.',
+    };
+  }
+
+  const descriptors = Object.getOwnPropertyDescriptors(reconciliation);
+  for (const key of Object.keys(descriptors)) {
+    if (descriptors[key].get || descriptors[key].set) {
+      const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+      const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: 'Reconciliation returned object with accessor properties.',
+        });
+      }
+      return {
+        error: 'BLOCKED_AMBIGUOUS_SEND',
+        reason: 'Reconciliation returned invalid result.',
+      };
+    }
+  }
+
   if (reconciliation.found === true) {
-    if (!reconciliation.turnId || typeof reconciliation.turnId !== 'string') {
+    if (!reconciliation.turnId || typeof reconciliation.turnId !== 'string' || reconciliation.turnId.length === 0) {
+      const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+      const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
+      if (!alreadyAmbiguous) {
+        await ctx.writePhase(PHASES.AMBIGUOUS, {
+          actionSlotId,
+          continuationId,
+          reason: 'Reconciliation found=true but turnId is missing or invalid.',
+        });
+      }
       return {
         error: 'BLOCKED_AMBIGUOUS_SEND',
         reason: 'Reconciliation found=true but turnId is missing or invalid.',
@@ -339,7 +395,16 @@ async function reconcileStartedSlot({ ctx, actionSlotId, continuationId, reconci
     };
   }
 
-  // Multiple or malformed reconciliation result
+  // Multiple or malformed reconciliation result (found not exactly true/false)
+  const slotEntries = ctx.ledger.filter(e => e.actionSlotId === actionSlotId);
+  const alreadyAmbiguous = slotEntries.some(e => e.phase === PHASES.AMBIGUOUS);
+  if (!alreadyAmbiguous) {
+    await ctx.writePhase(PHASES.AMBIGUOUS, {
+      actionSlotId,
+      continuationId,
+      reason: 'Reconciliation returned malformed result (found not true/false).',
+    });
+  }
   return {
     error: 'BLOCKED_AMBIGUOUS_SEND',
     reason: 'Reconciliation returned malformed result (found not true/false).',
