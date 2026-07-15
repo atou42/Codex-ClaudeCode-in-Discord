@@ -234,6 +234,27 @@ export async function replayLedger(dir) {
   };
 }
 
+function validateLockRecord(record, lockPath) {
+  if (!isPlainObject(record)) {
+    throw new IntegrityError(`ledger append: lock ${lockPath} is not a valid JSON object`);
+  }
+  const requiredFields = ['pid', 'acquiredAt', 'nonce'];
+  for (const field of requiredFields) {
+    if (!Object.prototype.hasOwnProperty.call(record, field)) {
+      throw new IntegrityError(`ledger append: lock ${lockPath} missing required field "${field}"`);
+    }
+  }
+  if (typeof record.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(record.nonce)) {
+    throw new IntegrityError(`ledger append: lock ${lockPath} nonce must be 32-char lowercase hex`);
+  }
+  if (typeof record.pid !== 'number' || !Number.isInteger(record.pid)) {
+    throw new IntegrityError(`ledger append: lock ${lockPath} pid must be an integer`);
+  }
+  if (typeof record.acquiredAt !== 'string') {
+    throw new IntegrityError(`ledger append: lock ${lockPath} acquiredAt must be a string`);
+  }
+}
+
 export async function appendLedgerEntry(dir, fields, options = {}) {
   for (const key of REQUIRED_INPUT_FIELDS) {
     if (!Object.prototype.hasOwnProperty.call(fields, key)) {
@@ -241,65 +262,125 @@ export async function appendLedgerEntry(dir, fields, options = {}) {
     }
   }
 
-  // DEFECT-2: Validate goalInstance is a non-empty string
-  if (typeof fields.goalInstance !== 'string' || fields.goalInstance.length === 0) {
-    throw new Error('ledger append: goalInstance must be a non-empty string');
+  // Validate goalInstance is a non-empty, non-whitespace string
+  if (typeof fields.goalInstance !== 'string' || fields.goalInstance.trim().length === 0) {
+    throw new Error('ledger append: goalInstance must be a non-empty string without only whitespace');
   }
 
-  // DEFECT-1: Acquire exclusive append lock to serialize concurrent appends.
+  // Acquire exclusive append lock to serialize concurrent appends.
   // The lock lives in the goal dir (not ledger/) so replayLedger's strict
   // directory scan never sees it.
   const ledgerDir = path.join(dir, 'ledger');
   const appendLockPath = path.join(dir, `ledger${APPEND_LOCK_SUFFIX}`);
 
   let appendLockFd;
+  let lockNonce;
+  let lockIno;
+  let primaryError = null;
+  let cleanupError = null;
+
   try {
     appendLockFd = await fsPromises.open(
       appendLockPath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
       0o600
     );
   } catch (err) {
     if (err.code === 'EEXIST') {
-      // Check if lock is stale (older than 30 seconds)
-      let lockStat;
+      // Lock exists; open with O_NOFOLLOW to prevent symlink traversal
+      let lockFdInspect;
       try {
-        lockStat = await fsPromises.stat(appendLockPath);
-        const lockAge = Date.now() - lockStat.mtimeMs;
-        if (lockAge > 30000) {
-          // Try to read lock contents for forensics
-          let lockContent = null;
-          try {
-            lockContent = await fsPromises.readFile(appendLockPath, 'utf8');
-          } catch (readErr) {
-            // Ignore read errors
-          }
+        lockFdInspect = await fsPromises.open(
+          appendLockPath,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+        );
+      } catch (openErr) {
+        if (openErr.code === 'ELOOP' || openErr.code === 'EMLINK') {
           throw new IntegrityError(
-            `ledger append: stale append lock detected (age: ${Math.round(lockAge / 1000)}s, content: ${lockContent || 'unreadable'}); manual intervention required`
+            `ledger append: lock path is a symlink; manual intervention required`
           );
         }
-      } catch (statErr) {
-        if (statErr.code !== 'ENOENT') {
-          throw statErr;
-        }
-        // Lock disappeared between open attempt and stat; retry would be safe but we'll fail for clarity
+        throw new IntegrityError(
+          `ledger append: cannot inspect existing lock: ${openErr.message}`
+        );
       }
-      throw new IntegrityError(
-        `ledger append: another process is currently appending to the ledger; retry`
-      );
+
+      try {
+        // Use fstat to get metadata via descriptor (no symlink traversal)
+        const lockStat = await lockFdInspect.stat();
+
+        if (!lockStat.isFile()) {
+          throw new IntegrityError(
+            `ledger append: lock path is not a regular file; manual intervention required`
+          );
+        }
+
+        const lockAge = Date.now() - lockStat.mtimeMs;
+
+        // Read lock content via descriptor with bounded size
+        const maxLockSize = 4096;
+        const buffer = Buffer.allocUnsafe(Math.min(lockStat.size, maxLockSize));
+        const { bytesRead } = await lockFdInspect.read(buffer, 0, buffer.length, 0);
+
+        let lockRecord;
+        try {
+          const lockContent = buffer.toString('utf8', 0, bytesRead);
+          lockRecord = JSON.parse(lockContent);
+        } catch (parseErr) {
+          // Lock file exists but has corrupt/incomplete JSON.
+          // If fresh (<30s), likely mid-write race - treat as busy.
+          // If stale (>30s), it's truly corrupt - require intervention.
+          if (lockAge > 30000) {
+            throw new IntegrityError(
+              `ledger append: stale lock file is corrupt or malformed JSON; manual intervention required`
+            );
+          }
+          throw new IntegrityError(
+            `ledger append: another process is currently appending to the ledger; retry`
+          );
+        }
+
+        // Validate lock schema before using its fields
+        validateLockRecord(lockRecord, appendLockPath);
+
+        if (lockAge > 30000) {
+          throw new IntegrityError(
+            `ledger append: stale append lock detected (age: ${Math.round(lockAge / 1000)}s, nonce: ${lockRecord.nonce}); manual intervention required`
+          );
+        }
+
+        throw new IntegrityError(
+          `ledger append: another process is currently appending to the ledger; retry`
+        );
+      } finally {
+        await lockFdInspect.close();
+      }
     }
     throw err;
   }
 
   try {
-    // Write lock metadata with descriptor validation
+    // Generate nonce and capture inode for cleanup verification
+    lockNonce = crypto.randomBytes(16).toString('hex');
     const lockData = JSON.stringify({
       pid: process.pid,
       acquiredAt: new Date().toISOString(),
-      nonce: crypto.randomBytes(16).toString('hex'),
+      nonce: lockNonce,
     });
     await appendLockFd.write(lockData, 0, 'utf8');
     await appendLockFd.sync();
+
+    // Capture lock inode for later identity verification
+    const lockStat = await appendLockFd.stat();
+    lockIno = lockStat.ino;
+
+    // Fsync parent directory to ensure lock is durable
+    const goalDirFd = await fsPromises.open(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      await goalDirFd.sync();
+    } finally {
+      await goalDirFd.close();
+    }
 
     // Re-read ledger under lock to detect concurrent changes
     const replay = await replayLedger(dir);
@@ -356,15 +437,91 @@ export async function appendLedgerEntry(dir, fields, options = {}) {
     }
 
     return { entry };
+  } catch (err) {
+    primaryError = err;
+    throw err;
   } finally {
     // Always close and remove lock, even on error
     if (appendLockFd) {
-      await appendLockFd.close();
       try {
-        await fsPromises.unlink(appendLockPath);
-      } catch (unlinkErr) {
-        // If unlink fails, preserve forensic evidence but continue
-        // The stale lock detection will catch it on next append
+        await appendLockFd.close();
+      } catch (closeErr) {
+        cleanupError = closeErr;
+      }
+
+      // Verify lock identity before unlinking
+      if (lockNonce && lockIno !== undefined) {
+        try {
+          // Open lock again with O_NOFOLLOW to verify it's still our lock
+          const verifyFd = await fsPromises.open(
+            appendLockPath,
+            fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+          );
+
+          try {
+            const verifyStat = await verifyFd.stat();
+
+            // Verify inode matches what we created
+            if (verifyStat.ino !== lockIno) {
+              cleanupError = new IntegrityError(
+                `ledger append: lock inode changed during operation (expected ${lockIno}, got ${verifyStat.ino}); refusing to unlink`
+              );
+              throw cleanupError;
+            }
+
+            // Read and verify nonce matches
+            const buffer = Buffer.allocUnsafe(4096);
+            const { bytesRead } = await verifyFd.read(buffer, 0, buffer.length, 0);
+            const lockContent = buffer.toString('utf8', 0, bytesRead);
+            let lockRecord;
+            try {
+              lockRecord = JSON.parse(lockContent);
+            } catch (parseErr) {
+              cleanupError = new IntegrityError(
+                `ledger append: lock content changed to invalid JSON; refusing to unlink`
+              );
+              throw cleanupError;
+            }
+
+            if (lockRecord.nonce !== lockNonce) {
+              cleanupError = new IntegrityError(
+                `ledger append: lock nonce changed during operation; refusing to unlink`
+              );
+              throw cleanupError;
+            }
+          } finally {
+            await verifyFd.close();
+          }
+
+          // Identity verified; safe to unlink
+          await fsPromises.unlink(appendLockPath);
+
+          // Fsync parent directory after unlink
+          const goalDirFd = await fsPromises.open(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+          try {
+            await goalDirFd.sync();
+          } finally {
+            await goalDirFd.close();
+          }
+        } catch (unlinkErr) {
+          if (!cleanupError) {
+            cleanupError = unlinkErr;
+          }
+        }
+      }
+    }
+
+    // Preserve both primary and cleanup errors
+    if (cleanupError) {
+      if (primaryError) {
+        // Both errors occurred; use AggregateError to preserve both
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          `ledger append failed with cleanup error: ${primaryError.message}; cleanup: ${cleanupError.message}`
+        );
+      } else {
+        // Only cleanup error
+        throw cleanupError;
       }
     }
   }
