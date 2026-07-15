@@ -486,6 +486,103 @@ test('MCP server boundary - bounded output', async (t) => {
 });
 
 test('MCP server boundary - typed errors', async (t) => {
+  await t.test('returned objects are deeply frozen and descriptor-safe', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    // Success response
+    const successResponse = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test' }
+      }
+    });
+
+    assert.equal(Object.isFrozen(successResponse), true, 'response must be frozen');
+    assert.equal(Object.isFrozen(successResponse.content), true, 'content array must be frozen');
+    assert.equal(Object.isFrozen(successResponse.content[0]), true, 'content items must be frozen');
+
+    // No accessor descriptors anywhere in the response
+    const checkDescriptors = (obj, path = 'response') => {
+      if (obj === null || typeof obj !== 'object') return;
+      for (const key of Object.getOwnPropertyNames(obj)) {
+        const desc = Object.getOwnPropertyDescriptor(obj, key);
+        assert.equal(desc.get, undefined, `${path}.${key} must not have getter`);
+        assert.equal(desc.set, undefined, `${path}.${key} must not have setter`);
+        checkDescriptors(obj[key], `${path}.${key}`);
+      }
+    };
+    checkDescriptors(successResponse);
+
+    // Mutation attempts must fail silently or throw, never succeed
+    try { successResponse.isError = true; } catch { /* frozen throws in strict mode */ }
+    assert.equal(successResponse.isError, undefined, 'mutation must not succeed');
+
+    // Error response also frozen
+    const errorResponse = await server.handleRequest({
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: {}
+      }
+    });
+
+    assert.equal(Object.isFrozen(errorResponse), true, 'error response must be frozen');
+    assert.equal(Object.isFrozen(errorResponse.content[0]), true, 'error content must be frozen');
+    checkDescriptors(errorResponse, 'errorResponse');
+  });
+
+  await t.test('validation errors use specific codes not INTERNAL_ERROR', async () => {
+    const { createServer } = await import('../../src/cohub-claude-goal/server.js');
+    const server = createServer(createMockDeps());
+
+    // Test MISSING_FIELD
+    const missingFieldRequest = {
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: {}
+      }
+    };
+
+    const missingFieldResponse = await server.handleRequest(missingFieldRequest);
+    assert.equal(missingFieldResponse.isError, true);
+    const missingFieldError = JSON.parse(missingFieldResponse.content[0].text);
+    assert.equal(missingFieldError.code, 'MISSING_FIELD');
+    assert.match(missingFieldError.message, /goalInstance.*required/i);
+
+    // Test UNKNOWN_FIELD
+    const unknownFieldRequest = {
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: { goalInstance: 'test', extraField: 'bad' }
+      }
+    };
+
+    const unknownFieldResponse = await server.handleRequest(unknownFieldRequest);
+    assert.equal(unknownFieldResponse.isError, true);
+    const unknownFieldError = JSON.parse(unknownFieldResponse.content[0].text);
+    assert.equal(unknownFieldError.code, 'UNKNOWN_FIELD');
+    assert.match(unknownFieldError.message, /unknown field.*extraField/i);
+
+    // Test INVALID_ARGUMENTS (non-plain object)
+    const invalidArgsRequest = {
+      method: 'tools/call',
+      params: {
+        name: 'cohub_goal_inspect',
+        arguments: []  // Array instead of object
+      }
+    };
+
+    const invalidArgsResponse = await server.handleRequest(invalidArgsRequest);
+    assert.equal(invalidArgsResponse.isError, true);
+    const invalidArgsError = JSON.parse(invalidArgsResponse.content[0].text);
+    assert.equal(invalidArgsError.code, 'INVALID_ARGUMENTS');
+    assert.match(invalidArgsError.message, /plain object/i);
+  });
+
   await t.test('returns structured error for invalid schema', async () => {
     const { createServer } = await import('../../src/cohub-claude-goal/server.js');
     const server = createServer(createMockDeps());

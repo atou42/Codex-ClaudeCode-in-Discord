@@ -260,36 +260,58 @@ test('CLI - start command', async (t) => {
   });
 });
 
-test('CLI - resume command', async (t) => {
-  await t.test('resume only allowed in recoverable states', async () => {
-    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
-    try {
-      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+test('CLI - exact command set', async (t) => {
+  await t.test('exposes exactly 8 commands', async () => {
+    const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
 
-      const mockDeps = {
-        getLocalState: async () => 'NEW'
-      };
+    const validCommands = [
+      'init', 'doctor', 'dry-run', 'start', 'resume', 'status', 'verify', 'pause'
+    ];
 
-      const result = await runCommand('resume', {
-        goalPath: join(tmpDir, 'goal.json'),
-        deps: mockDeps
+    assert.equal(validCommands.length, 8, 'must have exactly 8 commands');
+
+    // All valid commands should be recognized
+    for (const cmd of validCommands) {
+      const result = await runCommand(cmd, {
+        goalPath: '/tmp/test',
+        deps: {
+          getLocalState: async () => {
+            // Return a state that's legal for this command
+            if (cmd === 'init') return 'NEW';
+            if (cmd === 'start') return 'READY';
+            if (cmd === 'resume') return 'WAITING_COHUB';
+            if (cmd === 'pause') return 'RUNNING_CLAUDE';
+            return 'READY';
+          },
+          inspect: async () => ({ snapshotHash: 'x', localState: 'READY' }),
+          verify: async () => ({ verdict: 'RUNNING' }),
+          getLedger: async () => ({ entries: [] }),
+          checkClaudeGoal: async () => ({ available: true }),
+          checkMCPServer: async () => ({ available: true }),
+          checkCohubREST: async () => ({ available: true }),
+          checkWebSocket: async () => ({ available: true })
+        }
       });
-
-      assert.equal(result.exitCode > 0, true);
-      assert.match(result.stderr, /cannot resume.*NEW/i);
-    } finally {
-      await rm(tmpDir, { recursive: true, force: true });
+      // Should not error with "unknown command"
+      assert.equal(result.stderr.includes('unknown command'), false, `${cmd} should be recognized`);
     }
-  });
 
-  await t.test('resume succeeds in PAUSED_USER state', async () => {
+    // Invalid command should fail
+    const result = await runCommand('fake-command', {
+      goalPath: '/tmp/test'
+    });
+    assert.match(result.stderr, /unknown command/i);
+  });
+});
+
+test('CLI - resume command', async (t) => {
+  await t.test('resume ONLY legal from WAITING_COHUB', async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
     try {
       const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
 
       const mockDeps = {
-        getLocalState: async () => 'PAUSED_USER',
-        reconcileUserInput: async () => ({ resolved: true }),
+        getLocalState: async () => 'WAITING_COHUB',
         resumeClaude: async () => ({ exitCode: 0 })
       };
 
@@ -304,14 +326,13 @@ test('CLI - resume command', async (t) => {
     }
   });
 
-  await t.test('resume fails if blocking reason still exists', async () => {
+  await t.test('resume ILLEGAL from RUNNING_CLAUDE', async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
     try {
       const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
 
       const mockDeps = {
-        getLocalState: async () => 'BLOCKED',
-        checkBlockingReason: async () => ({ stillBlocked: true, reason: 'quota exceeded' })
+        getLocalState: async () => 'RUNNING_CLAUDE'
       };
 
       const result = await runCommand('resume', {
@@ -319,12 +340,143 @@ test('CLI - resume command', async (t) => {
         deps: mockDeps
       });
 
-      assert.equal(result.exitCode, EXIT_CODES.BLOCKED);
-      assert.match(result.stderr, /quota exceeded/i);
+      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
+      assert.match(result.stderr, /illegal state.*resume.*RUNNING_CLAUDE/i);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  await t.test('resume ILLEGAL from NEW', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
+    try {
+      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+
+      const mockDeps = {
+        getLocalState: async () => 'NEW'
+      };
+
+      const result = await runCommand('resume', {
+        goalPath: join(tmpDir, 'goal.json'),
+        deps: mockDeps
+      });
+
+      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
+      assert.match(result.stderr, /illegal state.*resume.*NEW/i);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('resume ILLEGAL from READY', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
+    try {
+      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+
+      const mockDeps = {
+        getLocalState: async () => 'READY'
+      };
+
+      const result = await runCommand('resume', {
+        goalPath: join(tmpDir, 'goal.json'),
+        deps: mockDeps
+      });
+
+      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
+      assert.match(result.stderr, /illegal state.*resume.*READY/i);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('resume ILLEGAL from DONE (settled state)', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
+    try {
+      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+
+      const mockDeps = {
+        getLocalState: async () => 'DONE'
+      };
+
+      const result = await runCommand('resume', {
+        goalPath: join(tmpDir, 'goal.json'),
+        deps: mockDeps
+      });
+
+      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
+      assert.match(result.stderr, /illegal state.*resume.*DONE/i);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('resume ILLEGAL from INTEGRITY_FAILURE (settled state)', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
+    try {
+      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+
+      const mockDeps = {
+        getLocalState: async () => 'INTEGRITY_FAILURE',
+        getLedger: async () => {
+          throw new Error('INTEGRITY_FAILURE: corrupt ledger');
+        }
+      };
+
+      const result = await runCommand('resume', {
+        goalPath: join(tmpDir, 'goal.json'),
+        deps: mockDeps
+      });
+
+      // Integrity check happens before state validation, so we get INTEGRITY_FAILURE exit code
+      assert.equal(result.exitCode, EXIT_CODES.INTEGRITY_FAILURE);
+      assert.match(result.stderr, /integrity/i);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('resume ILLEGAL from PAUSED_USER (needs launcher /goal)', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
+    try {
+      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+
+      const mockDeps = {
+        getLocalState: async () => 'PAUSED_USER'
+      };
+
+      const result = await runCommand('resume', {
+        goalPath: join(tmpDir, 'goal.json'),
+        deps: mockDeps
+      });
+
+      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
+      assert.match(result.stderr, /illegal state.*resume.*PAUSED_USER/i);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('resume ILLEGAL from BLOCKED (needs launcher /goal)', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cohub-goal-test-'));
+    try {
+      const { runCommand } = await import('../../src/cohub-claude-goal/cli.js');
+
+      const mockDeps = {
+        getLocalState: async () => 'BLOCKED'
+      };
+
+      const result = await runCommand('resume', {
+        goalPath: join(tmpDir, 'goal.json'),
+        deps: mockDeps
+      });
+
+      assert.equal(result.exitCode, 2); // ILLEGAL_STATE
+      assert.match(result.stderr, /illegal state.*resume.*BLOCKED/i);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
 });
 
 test('CLI - status command', async (t) => {

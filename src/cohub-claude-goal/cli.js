@@ -1,6 +1,6 @@
 /**
  * @fileoverview CLI commands with state machine (spec lines 342-374, CLI-01).
- * Commands: init/doctor/dry-run/start/resume/status/verify/pause.
+ * Commands: init/doctor/dry-run/start/resume/status/verify/pause (8 commands).
  * Exact legal/illegal local states, stable exit codes, zero remote mutation
  * for read-only commands, blocking reason behavior, capture stdout/stderr
  * without secrets.
@@ -20,10 +20,13 @@ export const EXIT_CODES = {
 };
 
 // Local state machine from spec lines 144-167
+// Resume is legal ONLY from WAITING_COHUB (recoverable Cohub wait state).
+// PAUSED_USER/BLOCKED/DONE/INTEGRITY_FAILURE require launcher-controlled new /goal.
+// RUNNING_CLAUDE must never resume via CLI.
 const LEGAL_TRANSITIONS = {
   init: new Set(['NEW']),
   start: new Set(['NEW', 'READY']),
-  resume: new Set(['WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'RUNNING_CLAUDE']),
+  resume: new Set(['WAITING_COHUB']),
   doctor: new Set(['NEW', 'READY', 'RUNNING_CLAUDE', 'WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'DONE', 'INTEGRITY_FAILURE']),
   'dry-run': new Set(['NEW', 'READY', 'RUNNING_CLAUDE', 'WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'DONE']),
   status: new Set(['NEW', 'READY', 'RUNNING_CLAUDE', 'WAITING_COHUB', 'PAUSED_USER', 'BLOCKED', 'DONE', 'INTEGRITY_FAILURE']),
@@ -274,25 +277,7 @@ async function resumeCommand(options, deps) {
   const currentState = await deps.getLocalState(options.goalPath);
   checkStateTransition('resume', currentState);
 
-  // Check if blocking reason still exists
-  if (currentState === 'BLOCKED' && deps?.checkBlockingReason) {
-    const blockCheck = await deps.checkBlockingReason(options.goalPath);
-    if (blockCheck.stillBlocked) {
-      return {
-        exitCode: EXIT_CODES.BLOCKED,
-        stdout: '',
-        stderr: `Still blocked: ${blockCheck.reason}\n`,
-        mutatedRemote: false
-      };
-    }
-  }
-
-  // Reconcile user input if paused
-  if (currentState === 'PAUSED_USER' && deps?.reconcileUserInput) {
-    await deps.reconcileUserInput(options.goalPath);
-  }
-
-  // Resume Claude
+  // Resume Claude from WAITING_COHUB state
   if (deps?.resumeClaude) {
     const result = await deps.resumeClaude(options.goalPath);
     return {
