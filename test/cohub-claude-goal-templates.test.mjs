@@ -131,53 +131,157 @@ describe('renderContinuationPrompt - toJSON/valueOf attacks', () => {
 });
 
 describe('renderContinuationPrompt - Proxy attacks', () => {
-  it('handles Proxy wrapping actionSlot without invoking traps', () => {
+  it('rejects Proxy with get trap (proves trap never invoked)', () => {
     const input = validInput();
-    let getTrapCalled = false;
-    let ownKeysTrapCalled = false;
+    let getTrapCounter = 0;
+    let setTrapCounter = 0;
+    let hasTrapCounter = 0;
+    let ownKeysTrapCounter = 0;
+    let getOwnPropertyDescriptorCounter = 0;
+    let getPrototypeOfCounter = 0;
 
     const proxy = new Proxy({ id: 'a1', type: 'verify' }, {
       get(target, prop) {
-        getTrapCalled = true;
+        getTrapCounter++;
+        return target[prop];
+      },
+      set(target, prop, value) {
+        setTrapCounter++;
+        return Reflect.set(target, prop, value);
+      },
+      has(target, prop) {
+        hasTrapCounter++;
+        return Reflect.has(target, prop);
+      },
+      ownKeys(target) {
+        ownKeysTrapCounter++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        getOwnPropertyDescriptorCounter++;
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      getPrototypeOf(target) {
+        getPrototypeOfCounter++;
+        return Reflect.getPrototypeOf(target);
+      }
+    });
+    input.actionSlot = proxy;
+
+    // Proxy objects are now detected and rejected before any trap can run
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /PROXY_REJECTED|INVALID_ACTION_SLOT/
+    );
+
+    // Verify NO traps were invoked
+    assert.strictEqual(getTrapCounter, 0, 'get trap must not be invoked');
+    assert.strictEqual(setTrapCounter, 0, 'set trap must not be invoked');
+    assert.strictEqual(hasTrapCounter, 0, 'has trap must not be invoked');
+    assert.strictEqual(ownKeysTrapCounter, 0, 'ownKeys trap must not be invoked');
+    assert.strictEqual(getOwnPropertyDescriptorCounter, 0, 'getOwnPropertyDescriptor trap must not be invoked');
+    assert.strictEqual(getPrototypeOfCounter, 0, 'getPrototypeOf trap must not be invoked');
+  });
+
+  it('rejects revocable Proxy (proves trap never invoked)', () => {
+    const input = validInput();
+    let getTrapCounter = 0;
+    let ownKeysTrapCounter = 0;
+
+    const { proxy, revoke } = Proxy.revocable({ id: 'a1', type: 'verify' }, {
+      get(target, prop) {
+        getTrapCounter++;
         return target[prop];
       },
       ownKeys(target) {
-        ownKeysTrapCalled = true;
+        ownKeysTrapCounter++;
         return Reflect.ownKeys(target);
       }
     });
     input.actionSlot = proxy;
 
-    // Proxies can't be reliably detected in JavaScript, but descriptor-walking
-    // avoids triggering get traps. The important property is we don't read
-    // through property access.
-    const result = renderContinuationPrompt(input);
+    // Proxy rejected before any trap can run
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /PROXY_REJECTED|INVALID_ACTION_SLOT/
+    );
 
-    // Verify the prompt was generated
-    assert.ok(result.includes('COHUB_GOAL_CONTINUATION'));
+    // Verify NO traps were invoked before rejection
+    assert.strictEqual(getTrapCounter, 0, 'get trap must not be invoked');
+    assert.strictEqual(ownKeysTrapCounter, 0, 'ownKeys trap must not be invoked');
 
-    // The critical security property: get trap was NOT called during validation
-    // (ownKeys may be called by Reflect.ownKeys, which is acceptable)
-    assert.strictEqual(getTrapCalled, false, 'get trap should not be called');
+    // Clean up
+    revoke();
   });
 
-  it('rejects deeply nested Proxy', () => {
+  it('rejects nested Proxy in actionSlot.data (proves trap never invoked)', () => {
     const input = validInput();
-    const proxy = new Proxy({ evil: true }, {});
+    let getTrapCounter = 0;
+    let ownKeysTrapCounter = 0;
+
+    const proxy = new Proxy({ evil: true }, {
+      get(target, prop) {
+        getTrapCounter++;
+        return target[prop];
+      },
+      ownKeys(target) {
+        ownKeysTrapCounter++;
+        return Reflect.ownKeys(target);
+      }
+    });
     input.actionSlot.data = { nested: proxy };
 
-    // Nested Proxy caught by validateAndCanonicalizeValue
-    // May be caught as CUSTOM_PROTOTYPE or pass through if transparent
-    // The important thing is we don't invoke the trap
-    const result = () => renderContinuationPrompt(input);
+    // Nested Proxy caught during recursive validation
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /PROXY_REJECTED/
+    );
 
-    // Either rejects with CUSTOM_PROTOTYPE or passes through without invoking trap
-    try {
-      result();
-      // If it passes, that's acceptable - the proxy is transparent
-    } catch (err) {
-      assert.match(err.message, /CUSTOM_PROTOTYPE/);
-    }
+    // Verify NO traps were invoked
+    assert.strictEqual(getTrapCounter, 0, 'get trap must not be invoked');
+    assert.strictEqual(ownKeysTrapCounter, 0, 'ownKeys trap must not be invoked');
+  });
+
+  it('rejects Proxy in array element (proves trap never invoked)', () => {
+    const input = validInput();
+    let getTrapCounter = 0;
+
+    const proxy = new Proxy({ id: 'e1' }, {
+      get(target, prop) {
+        getTrapCounter++;
+        return target[prop];
+      }
+    });
+    input.actionSlot.event = [proxy];
+
+    // Proxy rejected by isPlainObject check
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /PROXY_REJECTED|INVALID_EVENT_ELEMENT/
+    );
+
+    assert.strictEqual(getTrapCounter, 0, 'get trap must not be invoked');
+  });
+
+  it('rejects Proxy in registeredEventRefs array element', () => {
+    const input = validInput();
+    let getTrapCounter = 0;
+
+    const proxy = new Proxy({}, {
+      get(target, prop) {
+        getTrapCounter++;
+        return 'evt-1';
+      }
+    });
+    input.registeredEventRefs = [proxy];
+
+    // Proxy rejected - either as PROXY_REJECTED or type mismatch
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /PROXY_REJECTED|INVALID_REGISTERED_EVENT_REFS/
+    );
+
+    assert.strictEqual(getTrapCounter, 0, 'get trap must not be invoked');
   });
 });
 
@@ -684,6 +788,128 @@ describe('renderContinuationPrompt - existing tests', () => {
   });
 });
 
+describe('renderContinuationPrompt - Unicode format character attacks', () => {
+  it('rejects Unicode RLO (U+202E) in goalInstance', () => {
+    const input = validInput();
+    input.goalInstance = 'goal‮evil';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*Unicode format or direction control/
+    );
+  });
+
+  it('rejects Unicode LRO (U+202D) in actionSlot field', () => {
+    const input = validInput();
+    input.actionSlot.note = 'test‭malicious';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*Unicode format or direction control/
+    );
+  });
+
+  it('rejects zero-width space (U+200B) in runPath', () => {
+    const input = validInput();
+    input.runPath = '/path​/sneaky';
+
+    // runPath goes through hasInvalidControlChars which has a different error message
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_RUN_PATH.*invalid control characters/
+    );
+  });
+
+  it('rejects zero-width joiner (U+200D) in continuationId', () => {
+    const input = validInput();
+    input.continuationId = 'cont‍id';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*Unicode format or direction control/
+    );
+  });
+
+  it('rejects BOM (U+FEFF) in goalInstance', () => {
+    const input = validInput();
+    input.goalInstance = '﻿goal';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*byte order mark/
+    );
+  });
+
+  it('rejects lone high surrogate in actionSlot field', () => {
+    const input = validInput();
+    input.actionSlot.note = 'test\uD800';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*lone.*surrogate/
+    );
+  });
+
+  it('rejects lone low surrogate in goalVersion', () => {
+    const input = validInput();
+    input.goalVersion = 'v1\uDC00';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*lone.*surrogate/
+    );
+  });
+
+  it('rejects high surrogate without low surrogate in expectedNextAction', () => {
+    const input = validInput();
+    input.expectedNextAction = 'verify\uD800X';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*lone.*surrogate/
+    );
+  });
+
+  it('accepts valid surrogate pairs (emoji)', () => {
+    const input = validInput();
+    input.goalInstance = 'test-goal-😀'; // 😀 emoji
+
+    // Should not throw
+    const output = renderContinuationPrompt(input);
+    assert.ok(output.includes('COHUB_GOAL_CONTINUATION'));
+  });
+
+  it('rejects LRM (U+200E) in actionSlot', () => {
+    const input = validInput();
+    input.actionSlot.note = 'test‎malicious';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*Unicode format or direction control/
+    );
+  });
+
+  it('rejects RLM (U+200F) in registeredEventRefs', () => {
+    const input = validInput();
+    input.registeredEventRefs = ['evt‏1'];
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*Unicode format or direction control/
+    );
+  });
+
+  it('rejects word joiner (U+2060) in goalInstance', () => {
+    const input = validInput();
+    input.goalInstance = 'test⁠goal';
+
+    assert.throws(
+      () => renderContinuationPrompt(input),
+      /INVALID_STRING.*Unicode format or direction control/
+    );
+  });
+});
+
 describe('renderNativeGoalCondition', () => {
   it('validates goal instance format', () => {
     assert.throws(
@@ -694,6 +920,34 @@ describe('renderNativeGoalCondition', () => {
     assert.throws(
       () => renderNativeGoalCondition('test\ngoal'),
       /INVALID_GOAL_INSTANCE/
+    );
+  });
+
+  it('rejects Unicode RLO (U+202E) in goalInstance', () => {
+    assert.throws(
+      () => renderNativeGoalCondition('goal‮evil'),
+      /INVALID_GOAL_INSTANCE.*invalid characters/
+    );
+  });
+
+  it('rejects BOM (U+FEFF) in goalInstance', () => {
+    assert.throws(
+      () => renderNativeGoalCondition('﻿goal'),
+      /INVALID_GOAL_INSTANCE.*invalid characters/
+    );
+  });
+
+  it('rejects zero-width space (U+200B) in goalInstance', () => {
+    assert.throws(
+      () => renderNativeGoalCondition('goal​name'),
+      /INVALID_GOAL_INSTANCE.*invalid characters/
+    );
+  });
+
+  it('rejects lone surrogate in goalInstance', () => {
+    assert.throws(
+      () => renderNativeGoalCondition('goal\uD800'),
+      /INVALID_GOAL_INSTANCE.*invalid characters/
     );
   });
 

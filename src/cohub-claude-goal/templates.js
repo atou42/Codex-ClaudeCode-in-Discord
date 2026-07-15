@@ -6,7 +6,10 @@
  *
  * SECURITY: Descriptor-walking validator never reads through property access.
  * No getters, setters, toJSON, Proxy traps, functions, symbols, or custom prototypes invoked.
+ * Proxy objects are rejected before any trap can run.
  */
+
+import { types } from 'node:util';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const MAX_INPUT_BYTES = 50000;
@@ -79,11 +82,43 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
     // Validate string (no reading needed, already a primitive)
     for (let i = 0; i < value.length; i++) {
       const code = value.charCodeAt(i);
+
+      // Reject ASCII control characters except tab/LF/CR
       if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
         throw new Error('INVALID_STRING: contains control characters');
       }
       if (code === 0) {
         throw new Error('INVALID_STRING: contains null byte');
+      }
+
+      // Reject Unicode format and direction control characters (U+200B-U+206F)
+      // Includes: zero-width space, zero-width joiner, LRM, RLM, LRE, RLE, LRO, RLO, etc.
+      if (code >= 0x200B && code <= 0x206F) {
+        throw new Error('INVALID_STRING: contains Unicode format or direction control characters');
+      }
+
+      // Reject BOM (U+FEFF)
+      if (code === 0xFEFF) {
+        throw new Error('INVALID_STRING: contains byte order mark');
+      }
+
+      // Reject lone surrogates (U+D800-U+DFFF)
+      if (code >= 0xD800 && code <= 0xDFFF) {
+        // Check if it's part of a valid surrogate pair
+        if (code >= 0xD800 && code <= 0xDBFF) {
+          // High surrogate - must be followed by low surrogate
+          if (i + 1 >= value.length) {
+            throw new Error('INVALID_STRING: contains lone high surrogate');
+          }
+          const nextCode = value.charCodeAt(i + 1);
+          if (nextCode < 0xDC00 || nextCode > 0xDFFF) {
+            throw new Error('INVALID_STRING: contains lone high surrogate');
+          }
+          i++; // Skip the low surrogate
+        } else {
+          // Low surrogate without preceding high surrogate
+          throw new Error('INVALID_STRING: contains lone low surrogate');
+        }
       }
     }
     return JSON.stringify(value);
@@ -105,6 +140,11 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
     throw new Error(`UNSUPPORTED_VALUE: unexpected type ${type}`);
   }
 
+  // Reject Proxy objects BEFORE any operation
+  if (types.isProxy(value)) {
+    throw new Error('PROXY_REJECTED: Proxy objects not allowed');
+  }
+
   // Cycle detection
   if (seen.has(value)) {
     throw new Error('CIRCULAR_REFERENCE: circular reference detected');
@@ -117,9 +157,6 @@ function validateAndCanonicalizeValue(value, depth = 0, seen = new Map()) {
     if (proto !== Object.prototype && proto !== Array.prototype && proto !== null) {
       throw new Error('CUSTOM_PROTOTYPE: custom prototype not allowed');
     }
-
-    // Reject Proxy objects (best effort - they may pass through)
-    // We can't reliably detect Proxies, but descriptor walking avoids triggering traps
 
     // Arrays
     if (Array.isArray(value)) {
@@ -224,6 +261,11 @@ function isPlainObject(value) {
     return false;
   }
 
+  // Reject Proxy objects before any operation
+  if (types.isProxy(value)) {
+    return false;
+  }
+
   const proto = Object.getPrototypeOf(value);
 
   // Only allow Object.prototype or null prototype (from Object.create(null))
@@ -247,16 +289,47 @@ function hasProtoDescriptor(value) {
 
 /**
  * Validate string contains no control characters except tab/newline/carriage return
+ * Also rejects Unicode format/direction control chars, BOM, and lone surrogates
  */
 function hasInvalidControlChars(str) {
   if (typeof str !== 'string') return false;
 
   for (let i = 0; i < str.length; i++) {
     const code = str.charCodeAt(i);
+
+    // ASCII control characters
     if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
       return true;
     }
     if (code === 0) return true;
+
+    // Unicode format and direction control characters
+    if (code >= 0x200B && code <= 0x206F) {
+      return true;
+    }
+
+    // BOM
+    if (code === 0xFEFF) {
+      return true;
+    }
+
+    // Lone surrogates
+    if (code >= 0xD800 && code <= 0xDFFF) {
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        // High surrogate - must be followed by low surrogate
+        if (i + 1 >= str.length) {
+          return true;
+        }
+        const nextCode = str.charCodeAt(i + 1);
+        if (nextCode < 0xDC00 || nextCode > 0xDFFF) {
+          return true;
+        }
+        i++; // Skip the low surrogate
+      } else {
+        // Low surrogate without preceding high surrogate
+        return true;
+      }
+    }
   }
   return false;
 }
