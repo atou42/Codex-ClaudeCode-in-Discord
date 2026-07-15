@@ -128,8 +128,8 @@ test('verify - output with nested objects cannot be mutated', () => {
 test('verify - PAUSED_USER gate details are immutable', () => {
   const snapshot = {
     snapshotHash: '0607080910111213141516171819202122232425262728293031323334353637',
-    orchestrationState: { status: 'WAITING_USER_INPUT' },
-    userGate: { gate: 'proposal', promptTurnId: 'turn_001', consumed: false }
+    orchestrationState: { status: 'WAITING_USER' },
+    userGate: { gate: 'proposal_approval', promptTurnId: 'turn_001', consumed: false }
   };
 
   const result = verify(MOCK_GOAL, { snapshot });
@@ -209,7 +209,7 @@ test('verify - descriptor attack: no writable descriptors', () => {
   }
 });
 
-test('verify - circular reference in input does not crash', () => {
+test('verify - circular reference in input is rejected', () => {
   const circular = { type: 'WAIT_WORKER' };
   circular.self = circular;
 
@@ -219,13 +219,15 @@ test('verify - circular reference in input does not crash', () => {
     nextAction: circular
   };
 
-  // Should not crash, should handle gracefully
-  const result = verify(MOCK_GOAL, { snapshot });
-  assert.ok(result);
-  assert.strictEqual(result.verdict, 'RUNNING');
+  // Must reject circular references per spec
+  assert.throws(
+    () => verify(MOCK_GOAL, { snapshot }),
+    /circular/i,
+    'Must reject circular references'
+  );
 });
 
-test('verify - symbol keys are not copied to output', () => {
+test('verify - symbol keys are rejected', () => {
   const sym = Symbol('evil');
   const snapshot = {
     snapshotHash: '6667686970717273747576777879808182838485868788899091929394959697',
@@ -235,10 +237,12 @@ test('verify - symbol keys are not copied to output', () => {
 
   snapshot.nextAction[sym] = 'hidden';
 
-  const result = verify(MOCK_GOAL, { snapshot });
-
-  const symbols = Object.getOwnPropertySymbols(result.nextAction);
-  assert.strictEqual(symbols.length, 0, 'No symbol properties should be copied');
+  // Must reject symbol keys per spec
+  assert.throws(
+    () => verify(MOCK_GOAL, { snapshot }),
+    /symbol/i,
+    'Must reject symbol keys'
+  );
 });
 
 test('verify - unknown fields in snapshot are not leaked to output', () => {
@@ -256,13 +260,13 @@ test('verify - unknown fields in snapshot are not leaked to output', () => {
   assert.strictEqual(result.evilPayload, undefined, 'Evil payloads must not leak');
 
   // Only expected fields should exist
-  const allowedKeys = ['verdict', 'snapshotHash', 'nextAction', 'reason', 'evidenceRefs', 'missingEvidence', 'gate', 'promptTurnId'];
+  const allowedKeys = ['verdict', 'snapshotHash', 'nextAction', 'watchSet', 'reason', 'evidenceRefs', 'missingEvidence', 'gate', 'promptTurnId'];
   for (const key of Object.keys(result)) {
     assert.ok(allowedKeys.includes(key), `Unexpected key: ${key}`);
   }
 });
 
-test('verify - getters in input are not invoked during deep clone', () => {
+test('verify - getters in input are rejected', () => {
   let getterCalled = false;
 
   const snapshot = {
@@ -274,13 +278,12 @@ test('verify - getters in input are not invoked during deep clone', () => {
     }
   };
 
-  const result = verify(MOCK_GOAL, { snapshot });
-
-  // The getter will be called during normal property access, that's expected
-  // But the output should not have a getter
-  const desc = Object.getOwnPropertyDescriptor(result, 'nextAction');
-  assert.strictEqual(desc.get, undefined, 'Output must not have getter');
-  assert.strictEqual(desc.set, undefined, 'Output must not have setter');
+  // Must reject accessor properties per spec
+  assert.throws(
+    () => verify(MOCK_GOAL, { snapshot }),
+    /accessor/i,
+    'Must reject accessor properties'
+  );
 });
 
 test('verify - Object.preventExtensions on output', () => {

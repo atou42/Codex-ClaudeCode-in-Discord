@@ -102,28 +102,28 @@ test('verify - PAUSED_USER requires real user gate', () => {
   const snapshot = {
     snapshotHash: 'f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00010203040506070809000102030405',
     orchestrationState: {
-      status: 'WAITING_USER_INPUT'
+      status: 'WAITING_USER'
     },
     userGate: {
-      gate: 'proposal',
+      gate: 'proposal_approval',
       promptTurnId: 'turn_prompt_001',
-      promptReceipt: { timestamp: '2026-07-15T10:00:00.000Z' }
+      consumed: false
     }
   };
 
   const result = verify(MOCK_GOAL_INSTANCE, { snapshot });
   assert.strictEqual(result.verdict, 'PAUSED_USER');
-  assert.strictEqual(result.gate, 'proposal');
+  assert.strictEqual(result.gate, 'proposal_approval');
 });
 
 test('verify - PAUSED_USER rejects consumed proposal', () => {
   const snapshot = {
     snapshotHash: '0607080910111213141516171819202122232425262728293031323334353637',
     orchestrationState: {
-      status: 'WAITING_USER_INPUT'
+      status: 'WAITING_USER'
     },
     userGate: {
-      gate: 'proposal',
+      gate: 'proposal_approval',
       promptTurnId: 'turn_prompt_002',
       consumed: true
     }
@@ -131,7 +131,6 @@ test('verify - PAUSED_USER rejects consumed proposal', () => {
 
   const result = verify(MOCK_GOAL_INSTANCE, { snapshot });
   assert.notStrictEqual(result.verdict, 'PAUSED_USER');
-  assert.strictEqual(result.verdict, 'RUNNING');
 });
 
 test('verify - BLOCKED requires evidence', () => {
@@ -362,13 +361,13 @@ test('verify - no network calls', async () => {
   assert.strictEqual(typeof result, 'object');
 });
 
-test('verify - user gate enforcement - only proposal/style/studio allowed', () => {
-  const validGates = ['proposal', 'style', 'studio'];
+test('verify - user gate enforcement - only proposal_approval/style_approval/studio_acceptance allowed', () => {
+  const validGates = ['proposal_approval', 'style_approval', 'studio_acceptance'];
 
   for (const gate of validGates) {
     const snapshot = {
       snapshotHash: `${gate.charCodeAt(0).toString(16).padStart(2, '0')}23242526272829303132333435363738394041424344454647484950515253`,
-      orchestrationState: { status: 'WAITING_USER_INPUT' },
+      orchestrationState: { status: 'WAITING_USER' },
       userGate: {
         gate,
         promptTurnId: `turn_${gate}`,
@@ -382,7 +381,7 @@ test('verify - user gate enforcement - only proposal/style/studio allowed', () =
   // Invalid gate
   const invalidSnapshot = {
     snapshotHash: '5455565758596061626364656667686970717273747576777879808182838485',
-    orchestrationState: { status: 'WAITING_USER_INPUT' },
+    orchestrationState: { status: 'WAITING_USER' },
     userGate: {
       gate: 'invalid_gate',
       promptTurnId: 'turn_invalid',

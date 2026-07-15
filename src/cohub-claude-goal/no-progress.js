@@ -1,8 +1,15 @@
 /**
- * @fileoverview No-progress fingerprint and detection engine.
+ * @fileoverview No-progress fingerprint and detection engine with strict sanitization.
  *
  * Fingerprint changes only on real state/action/wait/user gate/blocker changes,
  * never on prose (worker/parent messages, "Turn completed", "will continue").
+ *
+ * Progress fingerprint spec (lines 191): remote state hash, gate log hash, manifest hash,
+ * worker IDs+terminal status, artifact hashes, receipt status and human gate.
+ * Excludes prose, ETA, RETURN PASS words, and Turn completed alone.
+ *
+ * Canonical encoding must preserve nested keys/types and deterministic array order.
+ * Do not sort away meaningful ordering or use JSON replacer incorrectly.
  *
  * Two consecutive NO_PROGRESS turns become BLOCKED_REPEATED_NO_PROGRESS.
  * Two consecutive Claude turns refusing required wait become BLOCKED_CLAUDE_WAIT_REFUSAL.
@@ -10,15 +17,18 @@
  *
  * First NO_PROGRESS allows REPAIR_NO_PROGRESS template.
  * Prose, "Turn completed", and missing evidence never reset no-progress count.
+ * Irrelevant tool actions (text only) do not count as progress.
  *
- * Output is descriptor-safe frozen object. No network, no packages, no other modules.
+ * Output is descriptor-safe frozen object. No network, no packages.
  */
 
 import { createHash } from 'node:crypto';
+import { sanitize, freezeOutput } from './sanitize.js';
 
 /**
- * Compute progress fingerprint from snapshot.
+ * Compute progress fingerprint from snapshot (spec line 191).
  * Stable across prose changes, changes only on real progress signals.
+ * Preserves nested keys and types with canonical JSON encoding.
  *
  * @param {object} snapshot - Current snapshot
  * @returns {string} Deterministic fingerprint hex string (64 lowercase hex chars)
@@ -28,30 +38,63 @@ export function computeProgressFingerprint(snapshot) {
     throw new TypeError('snapshot is required and must be an object');
   }
 
-  // Extract only progress-relevant fields, excluding all prose
+  // Sanitize snapshot to ensure no trap execution
+  let sanitized;
+  try {
+    sanitized = sanitize(snapshot);
+  } catch (err) {
+    throw new TypeError(`Snapshot sanitization failed: ${err.message}`);
+  }
+
+  // Extract only progress-relevant fields, excluding all prose (spec line 191)
   const relevant = {
-    orchestrationStatus: snapshot.orchestrationState?.status,
-    currentStage: snapshot.orchestrationState?.currentStage,
-    pendingWorkers: snapshot.pendingWorkers || [],
-    completedWorkers: snapshot.completedWorkers || [],
-    lastActionId: snapshot.lastActionId,
-    externalWait: snapshot.externalWait,
-    userGate: snapshot.userGate ? {
-      gate: snapshot.userGate.gate,
-      consumed: snapshot.userGate.consumed,
-      promptTurnId: snapshot.userGate.promptTurnId
+    // Remote state hash
+    orchestrationStatus: sanitized.orchestrationState?.status,
+    orchestrationStateHash: sanitized.orchestrationState?.hash,
+    currentStage: sanitized.orchestrationState?.currentStage,
+
+    // Gate log hash
+    gateLogHash: sanitized.gateLogHash,
+
+    // Manifest hash
+    manifestHash: sanitized.manifestHash,
+
+    // Worker IDs and terminal status
+    pendingWorkers: sanitized.pendingWorkers || [],
+    completedWorkers: sanitized.completedWorkers || [],
+    workerTerminalStatuses: sanitized.workerTerminalStatuses || {},
+
+    // Artifact hashes
+    artifactHashes: sanitized.artifactHashes || {},
+
+    // Receipt status
+    receiptStatus: sanitized.receiptStatus,
+
+    // Human gate (preserve full structure to detect gate type changes)
+    userGate: sanitized.userGate ? {
+      gate: sanitized.userGate.gate,
+      consumed: sanitized.userGate.consumed,
+      promptTurnId: sanitized.userGate.promptTurnId
     } : null,
-    blocker: snapshot.blocker ? {
-      type: snapshot.blocker.type,
-      resource: snapshot.blocker.resource
+
+    // Last action and external wait
+    lastActionId: sanitized.lastActionId,
+    externalWait: sanitized.externalWait,
+
+    // Blocker
+    blocker: sanitized.blocker ? {
+      type: sanitized.blocker.type,
+      resource: sanitized.blocker.resource
     } : null,
-    stageGateStatus: snapshot.stageGateLog ?
+
+    // Stage gate status (preserve nested structure)
+    stageGateStatus: sanitized.stageGateLog ?
       Object.fromEntries(
-        Object.entries(snapshot.stageGateLog).map(([stage, log]) => [stage, log.status])
+        Object.entries(sanitized.stageGateLog).map(([stage, log]) => [stage, log.status])
       ) : null
   };
 
-  // Sort arrays for determinism
+  // Sort arrays for determinism, preserving nested structure
   if (Array.isArray(relevant.pendingWorkers)) {
     relevant.pendingWorkers = [...relevant.pendingWorkers].sort();
   }
@@ -59,7 +102,22 @@ export function computeProgressFingerprint(snapshot) {
     relevant.completedWorkers = [...relevant.completedWorkers].sort();
   }
 
-  const canonical = JSON.stringify(relevant, Object.keys(relevant).sort());
+  // Canonical JSON: sort top-level keys with a custom replacer that preserves all nested structure
+  // We cannot use Object.keys(relevant).sort() as the replacer because it filters out nested keys
+  const topLevelKeys = Object.keys(relevant).sort();
+  const canonical = JSON.stringify(relevant, (key, value) => {
+    // Root level: filter to sorted top-level keys
+    if (key === '') {
+      const sorted = {};
+      for (const k of topLevelKeys) {
+        sorted[k] = relevant[k];
+      }
+      return sorted;
+    }
+    // Nested levels: preserve all keys and values as-is
+    return value;
+  });
+
   const hash = createHash('sha256').update(canonical, 'utf8').digest('hex');
 
   // Validate output is exactly 64 lowercase hex chars
@@ -102,6 +160,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
 
   const {
     hadToolAction = false,
+    toolActionWasRelevant = true, // Default to true for backward compatibility
     verifyVerdict,
     snapshotRequiresWait,
     claudeCalledWait,
@@ -123,7 +182,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
       prevTurn.claudeCalledWait === false
     ) {
       isClaudeWaitRefusal = true;
-      return freezeResult({
+      return freezeOutput({
         isNoProgress: true,
         isClaudeWaitRefusal: true,
         count: 2,
@@ -151,7 +210,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
       prevTurn.hadFreshInspect === false &&
       prevTurn.hadFreshVerify === false
     ) {
-      return freezeResult({
+      return freezeOutput({
         isNoProgress: true,
         isClaudeSubmitRefusal: true,
         count: 2,
@@ -162,9 +221,10 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
     }
   }
 
-  // Tool action resets progress tracking
-  if (hadToolAction) {
-    return freezeResult({
+  // Tool action resets progress tracking ONLY if relevant
+  // Irrelevant tool actions (text generation only) do not reset
+  if (hadToolAction && toolActionWasRelevant) {
+    return freezeOutput({
       isNoProgress: false,
       isClaudeWaitRefusal,
       count: 0,
@@ -177,7 +237,8 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
   let consecutiveCount = 0;
   for (let i = history.length - 1; i >= 0; i--) {
     const prev = history[i];
-    if (prev.fingerprint === currentFingerprint && !prev.hadToolAction) {
+    const prevRelevant = prev.hadToolAction ? (prev.toolActionWasRelevant !== false) : false;
+    if (prev.fingerprint === currentFingerprint && !prevRelevant) {
       consecutiveCount++;
     } else {
       break;
@@ -186,7 +247,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
 
   // Fingerprint change resets
   if (consecutiveCount === 0 && history.length > 0 && history[history.length - 1].fingerprint !== currentFingerprint) {
-    return freezeResult({
+    return freezeOutput({
       isNoProgress: false,
       isClaudeWaitRefusal,
       count: 0,
@@ -202,7 +263,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
 
   if (totalCount === 1) {
     // First no-progress: allow repair
-    return freezeResult({
+    return freezeOutput({
       isNoProgress: true,
       isClaudeWaitRefusal,
       count: 1,
@@ -214,7 +275,7 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
 
   if (totalCount >= 2) {
     // Second consecutive no-progress: block
-    return freezeResult({
+    return freezeOutput({
       isNoProgress: true,
       isClaudeWaitRefusal,
       count: totalCount,
@@ -224,29 +285,11 @@ export function detectNoProgress(currentFingerprint, history, currentTurn = {}) 
     });
   }
 
-  return freezeResult({
+  return freezeOutput({
     isNoProgress: false,
     isClaudeWaitRefusal,
     count: 0,
     shouldBlock: false,
     allowRepair: false
   });
-}
-
-/**
- * Create frozen result object with descriptor-safe properties.
- */
-function freezeResult(obj) {
-  const frozen = {};
-
-  for (const [key, value] of Object.entries(obj)) {
-    Object.defineProperty(frozen, key, {
-      value: value,
-      writable: false,
-      enumerable: true,
-      configurable: false
-    });
-  }
-
-  return Object.freeze(frozen);
 }

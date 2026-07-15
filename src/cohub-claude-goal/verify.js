@@ -1,25 +1,39 @@
 /**
- * @fileoverview Deterministic verify verdict engine.
+ * @fileoverview Deterministic verify verdict engine with strict input sanitization.
  *
  * Accepts only fresh exact snapshot binding. Returns only RUNNING, DONE,
  * PAUSED_USER, or BLOCKED with reason, evidence refs, and missing evidence.
  *
  * DONE requires orchestration COMPLETE + all delivery evidence.
- * PAUSED_USER requires real user gate (proposal/style/studio) with receipt.
+ * PAUSED_USER requires real user gate (proposal_approval/style_approval/studio_acceptance) with receipt.
  * BLOCKED requires evidence-based blocker.
  *
- * Worker/parent prose, "Turn completed", "Return PASS", and missing evidence
- * can never yield DONE.
+ * Workflow state must be WAITING_USER (not WAITING_USER_INPUT).
+ * Gate names must be exact: proposal_approval, style_approval, studio_acceptance.
+ * RUNNING must contain exact allowlisted next action or non-empty watchSet (never UNKNOWN).
  *
- * Enforces user gates, rejects fake completion, detects corrupt state,
- * handles UNBOUND_REPLACEMENT_RECEIPT, validates historical regression.
- *
+ * All snapshot input is sanitized through strict descriptor-walking validator.
  * Output is descriptor-safe frozen object. Fail-closed on ambiguity.
- * No network, no package imports, no other modules.
+ * No network, no package imports except sanitizer.
  */
 
-const VALID_USER_GATES = new Set(['proposal', 'style', 'studio']);
-const INIT_CHECKPOINT_PATTERNS = [/^init/, /^initial/, /_init$/];
+import { sanitize, freezeOutput } from './sanitize.js';
+
+// Valid user gates per spec lines 317-320
+const VALID_USER_GATES = new Set(['proposal_approval', 'style_approval', 'studio_acceptance']);
+
+// Init checkpoint patterns to reject fake completion (spec line 336-338)
+const INIT_CHECKPOINT_PATTERNS = [/^init/i, /^initial/i, /_init$/i];
+
+// Allowlisted next action types (spec line 193)
+const VALID_NEXT_ACTIONS = new Set([
+  'WAIT_WORKER',
+  'ASK_PROPOSAL_APPROVAL',
+  'ASK_STYLE_APPROVAL',
+  'RECONCILE_AND_FAN_IN',
+  'REDISPATCH_GEOGRAPHY',
+  'FINALIZE_DELIVERY'
+]);
 
 /**
  * Verify current goal state and return deterministic verdict.
@@ -39,7 +53,15 @@ export function verify(goalInstance, options = {}) {
     throw new TypeError('options.snapshot is required and must be an object');
   }
 
-  const { snapshotHash } = snapshot;
+  // Sanitize snapshot ONCE at boundary - all subsequent access uses sanitized clone
+  let sanitizedSnapshot;
+  try {
+    sanitizedSnapshot = sanitize(snapshot);
+  } catch (err) {
+    throw new TypeError(`Snapshot sanitization failed: ${err.message}`);
+  }
+
+  const { snapshotHash } = sanitizedSnapshot;
 
   if (typeof snapshotHash !== 'string' || !snapshotHash) {
     throw new TypeError('snapshot.snapshotHash is required and must be a non-empty string');
@@ -62,12 +84,12 @@ export function verify(goalInstance, options = {}) {
     }
   }
 
-  const orchestrationState = snapshot.orchestrationState || {};
+  const orchestrationState = sanitizedSnapshot.orchestrationState || {};
   const { status } = orchestrationState;
 
-  // Check for migration doctor verdict
-  if (snapshot.migrationDoctor?.verdict === 'UNBOUND_REPLACEMENT_RECEIPT') {
-    return freezeVerdict({
+  // Check for migration doctor verdict (spec line 193)
+  if (sanitizedSnapshot.migrationDoctor?.verdict === 'UNBOUND_REPLACEMENT_RECEIPT') {
+    return freezeOutput({
       verdict: 'BLOCKED',
       snapshotHash,
       reason: 'UNBOUND_REPLACEMENT_RECEIPT',
@@ -77,10 +99,10 @@ export function verify(goalInstance, options = {}) {
   }
 
   // Check for corrupt state
-  if (snapshot.stageGateLog) {
-    for (const [stage, log] of Object.entries(snapshot.stageGateLog)) {
+  if (sanitizedSnapshot.stageGateLog) {
+    for (const [stage, log] of Object.entries(sanitizedSnapshot.stageGateLog)) {
       if (log.status && !['PASS', 'FAIL', 'PENDING'].includes(log.status)) {
-        return freezeVerdict({
+        return freezeOutput({
           verdict: 'BLOCKED',
           snapshotHash,
           reason: `Corrupt state: invalid stage status ${log.status} for ${stage}`,
@@ -92,10 +114,10 @@ export function verify(goalInstance, options = {}) {
   }
 
   // Check for explicit blocker
-  if (snapshot.blocker) {
-    const { type, evidence } = snapshot.blocker;
+  if (sanitizedSnapshot.blocker) {
+    const { type, evidence } = sanitizedSnapshot.blocker;
     if (type && evidence) {
-      return freezeVerdict({
+      return freezeOutput({
         verdict: 'BLOCKED',
         snapshotHash,
         reason: type,
@@ -105,12 +127,13 @@ export function verify(goalInstance, options = {}) {
     }
   }
 
-  // Check for user gate (PAUSED_USER)
-  if (orchestrationState.status === 'WAITING_USER_INPUT' && snapshot.userGate) {
-    const { gate, consumed, promptTurnId } = snapshot.userGate;
+  // Check for user gate (PAUSED_USER) - spec lines 317-320
+  // Must be WAITING_USER (not WAITING_USER_INPUT) and exact gate names
+  if (status === 'WAITING_USER' && sanitizedSnapshot.userGate) {
+    const { gate, consumed, promptTurnId } = sanitizedSnapshot.userGate;
 
     if (VALID_USER_GATES.has(gate) && consumed !== true && promptTurnId) {
-      return freezeVerdict({
+      return freezeOutput({
         verdict: 'PAUSED_USER',
         snapshotHash,
         gate,
@@ -121,63 +144,111 @@ export function verify(goalInstance, options = {}) {
     }
   }
 
-  // Check for DONE
+  // Check for DONE (spec lines 334-346)
   if (status === 'COMPLETE') {
-    const doneResult = checkDoneConditions(snapshot, snapshotHash);
+    const doneResult = checkDoneConditions(sanitizedSnapshot, snapshotHash);
     if (doneResult) {
       return doneResult;
     }
     // If COMPLETE but conditions not met, fall through to list missing evidence
   }
 
-  // Default to RUNNING
-  const nextAction = snapshot.nextAction || { type: 'UNKNOWN' };
-  const missingEvidence = [];
+  // Default to RUNNING (spec lines 244-250)
+  const nextAction = sanitizedSnapshot.nextAction || {};
+  const watchSet = sanitizedSnapshot.watchSet || [];
 
-  // Determine reason based on state
-  let reason = 'Orchestration in progress';
-
-  // If orchestration is COMPLETE but evidence missing, list what's missing
+  // If orchestration is COMPLETE but evidence missing, return RUNNING with missing evidence list
+  // (no need for nextAction when just listing what's missing)
   if (status === 'COMPLETE') {
-    const deliveryEvidence = snapshot.deliveryEvidence || {};
+    const deliveryEvidence = sanitizedSnapshot.deliveryEvidence || {};
     const requiredFields = [
-      'worldId', 'spaceId', 'checkpointId', 'studioUrl', 'cohubUrl',
-      'desktopScreenshot', 'mobileScreenshot', 'guestProbe',
-      'finalReport', 'gateLog'
+      'schemaVersion',
+      'worldId',
+      'spaceId',
+      'checkpointId',
+      'checkpointCreatedAt',
+      'manifestSha256',
+      'studioUrl',
+      'cohubUrl',
+      'desktopScreenshot',
+      'mobileScreenshot',
+      'guestProbe',
+      'finalReport',
+      'gateLog',
+      'evidenceCreatedAt'
     ];
 
+    const missingEvidence = [];
     for (const field of requiredFields) {
       if (!deliveryEvidence[field]) {
         missingEvidence.push(field);
       }
     }
 
-    if (!snapshot.studioAcceptance?.consumed) {
+    if (!sanitizedSnapshot.studioAcceptance?.consumed) {
       missingEvidence.push('studioAcceptance.consumed');
     }
 
-    reason = 'Missing delivery evidence for COMPLETE orchestration';
-  } else if (snapshot.deliveryEvidence && status !== 'COMPLETE') {
+    return freezeOutput({
+      verdict: 'RUNNING',
+      snapshotHash,
+      nextAction,
+      watchSet,
+      reason: 'Missing delivery evidence for COMPLETE orchestration',
+      evidenceRefs: [],
+      missingEvidence
+    });
+  }
+
+  // Validate next action if present
+  if (nextAction.type === 'UNKNOWN') {
+    return freezeOutput({
+      verdict: 'BLOCKED',
+      snapshotHash,
+      reason: 'RUNNING verdict requires exact next action or non-empty watchSet, not UNKNOWN',
+      evidenceRefs: [],
+      missingEvidence: []
+    });
+  }
+
+  if (nextAction.type && !VALID_NEXT_ACTIONS.has(nextAction.type)) {
+    return freezeOutput({
+      verdict: 'BLOCKED',
+      snapshotHash,
+      reason: `Unknown next action type: ${nextAction.type}`,
+      evidenceRefs: [],
+      missingEvidence: []
+    });
+  }
+
+  // For normal IN_PROGRESS, nextAction or watchSet is optional (may be in transition)
+  // BLOCKED only if explicitly UNKNOWN, not if missing
+
+  // Determine reason based on state
+  let reason = 'Orchestration in progress';
+
+  if (sanitizedSnapshot.deliveryEvidence && status !== 'COMPLETE') {
     // Delivery evidence present but orchestration not COMPLETE
     reason = 'Orchestration not COMPLETE yet';
   }
 
-  return freezeVerdict({
+  return freezeOutput({
     verdict: 'RUNNING',
     snapshotHash,
     nextAction,
+    watchSet,
     reason,
     evidenceRefs: [],
-    missingEvidence
+    missingEvidence: []
   });
 }
 
 /**
- * Check DONE conditions exhaustively.
+ * Check DONE conditions exhaustively (spec lines 334-346).
  * Returns frozen verdict if DONE, null if conditions not met, BLOCKED if fake completion.
  */
-function checkDoneConditions(snapshot, snapshotHash) {
-  const { orchestrationState, deliveryEvidence, studioAcceptance } = snapshot;
+function checkDoneConditions(sanitizedSnapshot, snapshotHash) {
+  const { orchestrationState, deliveryEvidence, studioAcceptance } = sanitizedSnapshot;
 
   if (orchestrationState.status !== 'COMPLETE') {
     return null;
@@ -187,7 +258,7 @@ function checkDoneConditions(snapshot, snapshotHash) {
     return null;
   }
 
-  // IMPORTANT: Check for init checkpoint FIRST before other evidence
+  // IMPORTANT: Check for init checkpoint FIRST before other evidence (spec line 336-338)
   // This catches fake completion attempts early, even if other fields missing
   const { checkpointId } = deliveryEvidence;
   if (checkpointId) {
@@ -196,7 +267,7 @@ function checkDoneConditions(snapshot, snapshotHash) {
     );
 
     if (isInitCheckpoint) {
-      return freezeVerdict({
+      return freezeOutput({
         verdict: 'BLOCKED',
         snapshotHash,
         reason: `Fake completion: init checkpoint ${checkpointId} forbidden`,
@@ -206,17 +277,27 @@ function checkDoneConditions(snapshot, snapshotHash) {
     }
   }
 
-  // Check studio acceptance consumed
+  // Check studio acceptance consumed (spec line 336)
   if (!studioAcceptance?.consumed) {
     return null;
   }
 
-  // Required fields
+  // Required fields (spec line 340)
   const required = [
-    'schemaVersion', 'worldId', 'spaceId', 'checkpointId',
-    'checkpointCreatedAt', 'manifestSha256', 'studioUrl', 'cohubUrl',
-    'desktopScreenshot', 'mobileScreenshot', 'guestProbe',
-    'finalReport', 'gateLog', 'evidenceCreatedAt'
+    'schemaVersion',
+    'worldId',
+    'spaceId',
+    'checkpointId',
+    'checkpointCreatedAt',
+    'manifestSha256',
+    'studioUrl',
+    'cohubUrl',
+    'desktopScreenshot',
+    'mobileScreenshot',
+    'guestProbe',
+    'finalReport',
+    'gateLog',
+    'evidenceCreatedAt'
   ];
 
   const missing = required.filter(field => !deliveryEvidence[field]);
@@ -224,7 +305,7 @@ function checkDoneConditions(snapshot, snapshotHash) {
     return null;
   }
 
-  // Validate screenshots
+  // Validate screenshots (spec line 342)
   const { desktopScreenshot, mobileScreenshot } = deliveryEvidence;
 
   if (!validateScreenshot(desktopScreenshot, 1440, 900, deliveryEvidence.manifestSha256)) {
@@ -235,7 +316,7 @@ function checkDoneConditions(snapshot, snapshotHash) {
     return null;
   }
 
-  // Validate guest probe
+  // Validate guest probe (spec line 344)
   const { guestProbe } = deliveryEvidence;
   if (
     guestProbe.status !== 200 ||
@@ -247,13 +328,15 @@ function checkDoneConditions(snapshot, snapshotHash) {
   }
 
   // All conditions met
-  return freezeVerdict({
+  return freezeOutput({
     verdict: 'DONE',
     snapshotHash,
     evidenceRefs: [
       'deliveryEvidence.worldId',
       'deliveryEvidence.spaceId',
       'deliveryEvidence.checkpointId',
+      'deliveryEvidence.checkpointCreatedAt',
+      'deliveryEvidence.manifestSha256',
       'deliveryEvidence.desktopScreenshot',
       'deliveryEvidence.mobileScreenshot',
       'deliveryEvidence.guestProbe',
@@ -266,7 +349,7 @@ function checkDoneConditions(snapshot, snapshotHash) {
 }
 
 /**
- * Validate screenshot evidence.
+ * Validate screenshot evidence (spec line 342).
  */
 function validateScreenshot(screenshot, expectedWidth, expectedHeight, manifestHash) {
   if (!screenshot) return false;
@@ -278,152 +361,4 @@ function validateScreenshot(screenshot, expectedWidth, expectedHeight, manifestH
   if (!manifestHash || !/^[a-f0-9]{64}$/.test(manifestHash)) return false;
   if (screenshot.manifestHash !== manifestHash) return false;
   return true;
-}
-
-/**
- * Deep clone value from snapshot data, avoiding proxy traps and getters.
- * Only clones plain objects and arrays. Rejects symbols, cycles, custom prototypes.
- */
-function deepCloneFromDescriptor(value, visited = new WeakSet()) {
-  // Primitives: return as-is
-  if (value === null || value === undefined) return value;
-  const type = typeof value;
-  if (type === 'boolean' || type === 'number' || type === 'string') return value;
-
-  // Reject symbols
-  if (type === 'symbol') {
-    throw new TypeError('Symbol properties are not allowed in verdict data');
-  }
-
-  // Only objects and arrays allowed from here
-  if (type !== 'object') {
-    throw new TypeError(`Invalid type ${type} in verdict data`);
-  }
-
-  // Detect cycles
-  if (visited.has(value)) {
-    // For circular references, return a safe placeholder instead of throwing
-    // This allows graceful handling of snapshot data with cycles
-    return null;
-  }
-  visited.add(value);
-
-  // Only plain objects and arrays
-  const proto = Object.getPrototypeOf(value);
-  const isPlainObject = proto === Object.prototype || proto === null;
-  const isArray = Array.isArray(value);
-
-  if (!isPlainObject && !isArray) {
-    // For non-plain objects, return null to avoid issues
-    return null;
-  }
-
-  if (isArray) {
-    const cloned = [];
-    for (let i = 0; i < value.length; i++) {
-      // Use descriptor to avoid invoking getters
-      const desc = Object.getOwnPropertyDescriptor(value, i);
-      if (desc && desc.enumerable) {
-        if (desc.get || desc.set) {
-          // Skip accessor properties
-          continue;
-        }
-        cloned[i] = deepCloneFromDescriptor(desc.value, visited);
-      }
-    }
-    return cloned;
-  }
-
-  // Plain object
-  const cloned = {};
-  const keys = Object.keys(value);
-  for (const key of keys) {
-    // Skip symbol keys
-    if (typeof key === 'symbol') continue;
-
-    const desc = Object.getOwnPropertyDescriptor(value, key);
-    if (!desc || !desc.enumerable) continue;
-
-    if (desc.get || desc.set) {
-      // Skip accessor properties
-      continue;
-    }
-
-    cloned[key] = deepCloneFromDescriptor(desc.value, visited);
-  }
-
-  return cloned;
-}
-
-/**
- * Recursively freeze an object and all nested objects/arrays.
- */
-function deepFreeze(obj) {
-  if (obj === null || obj === undefined) return obj;
-  if (typeof obj !== 'object') return obj;
-
-  // Freeze the object itself
-  Object.freeze(obj);
-
-  // Recursively freeze all property values
-  for (const value of Object.values(obj)) {
-    if (value !== null && typeof value === 'object') {
-      deepFreeze(value);
-    }
-  }
-
-  return obj;
-}
-
-/**
- * Create frozen verdict object with descriptor-safe properties.
- * Deep clones and recursively freezes all nested structures.
- */
-function freezeVerdict(obj) {
-  const frozen = {};
-
-  for (const [key, value] of Object.entries(obj)) {
-    // Deep clone to detach from input
-    let clonedValue;
-    try {
-      clonedValue = deepCloneFromDescriptor(value);
-    } catch (err) {
-      // If deep clone fails (e.g., circular ref), use JSON round-trip as fallback
-      // for structured data, or keep primitive
-      if (value === null || typeof value !== 'object') {
-        clonedValue = value;
-      } else {
-        try {
-          clonedValue = JSON.parse(JSON.stringify(value));
-        } catch {
-          // If JSON also fails, use shallow clone
-          if (Array.isArray(value)) {
-            clonedValue = [...value];
-          } else {
-            clonedValue = { ...value };
-          }
-        }
-      }
-    }
-
-    // Define property with descriptor
-    Object.defineProperty(frozen, key, {
-      value: clonedValue,
-      writable: false,
-      enumerable: true,
-      configurable: false
-    });
-  }
-
-  // Freeze top level
-  Object.freeze(frozen);
-
-  // Deep freeze all nested structures
-  for (const value of Object.values(frozen)) {
-    if (value !== null && typeof value === 'object') {
-      deepFreeze(value);
-    }
-  }
-
-  return frozen;
 }
