@@ -48,88 +48,260 @@ function isPositiveSafeInteger(value) {
 }
 
 /**
- * Parse JSON with duplicate key detection.
+ * Parse JSON with duplicate key detection at every nesting level.
  * Standard JSON.parse silently accepts the last value for duplicate keys,
- * which could mask tampering. This parser rejects duplicates.
+ * which could mask tampering. This parser rejects duplicates in any object.
  */
 function parseJSONStrictly(text) {
-  const keys = new Set();
-  let insideString = false;
-  let escapeNext = false;
-  let currentKey = null;
-  let depth = 0;
   let pos = 0;
-  let expectingKey = false; // Track whether next string is a key or value
+  const len = text.length;
 
-  // Simple state machine to track keys at depth 1 (top-level object keys)
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-
-    if (escapeNext) {
-      escapeNext = false;
-      continue;
-    }
-
-    if (char === '\\') {
-      escapeNext = true;
-      continue;
-    }
-
-    if (char === '"') {
-      if (insideString) {
-        insideString = false;
-        if (depth === 1 && expectingKey && currentKey === null) {
-          const rawKey = text.slice(pos, i);
-          // Parse the key string to normalize escapes (e.g., e -> e)
-          try {
-            const normalizedKey = JSON.parse('"' + rawKey + '"');
-            if (keys.has(normalizedKey)) {
-              throw new Error(`Duplicate key detected in JSON: ${normalizedKey}`);
-            }
-            currentKey = normalizedKey;
-          } catch (e) {
-            if (e.message && e.message.includes('Duplicate key')) {
-              throw e;
-            }
-            // If key parsing fails, just use raw key
-            currentKey = rawKey;
-            if (keys.has(currentKey)) {
-              throw new Error(`Duplicate key detected in JSON: ${currentKey}`);
-            }
-          }
-          expectingKey = false;
-        }
-      } else {
-        insideString = true;
-        if (depth === 1 && expectingKey) {
-          pos = i + 1;
-        }
-      }
-      continue;
-    }
-
-    if (insideString) continue;
-
-    if (char === ':' && depth === 1 && currentKey !== null) {
-      keys.add(currentKey);
-      currentKey = null;
-    } else if (char === '{') {
-      depth++;
-      if (depth === 1) {
-        expectingKey = true;
-      }
-    } else if (char === '}') {
-      depth--;
-    } else if (char === '[') {
-      depth++;
-    } else if (char === ']') {
-      depth--;
-    } else if (char === ',' && depth === 1) {
-      expectingKey = true;
+  function skipWhitespace() {
+    while (pos < len && ' \t\n\r'.includes(text[pos])) {
+      pos++;
     }
   }
 
-  return JSON.parse(text);
+  function parseValue() {
+    skipWhitespace();
+    if (pos >= len) {
+      throw new Error('Unexpected end of JSON input');
+    }
+
+    const char = text[pos];
+
+    if (char === '"') {
+      return parseString();
+    } else if (char === '{') {
+      return parseObject();
+    } else if (char === '[') {
+      return parseArray();
+    } else if (char === 't') {
+      if (text.substr(pos, 4) === 'true') {
+        pos += 4;
+        return true;
+      }
+      throw new Error('Invalid JSON token at position ' + pos);
+    } else if (char === 'f') {
+      if (text.substr(pos, 5) === 'false') {
+        pos += 5;
+        return false;
+      }
+      throw new Error('Invalid JSON token at position ' + pos);
+    } else if (char === 'n') {
+      if (text.substr(pos, 4) === 'null') {
+        pos += 4;
+        return null;
+      }
+      throw new Error('Invalid JSON token at position ' + pos);
+    } else if (char === '-' || (char >= '0' && char <= '9')) {
+      return parseNumber();
+    } else {
+      throw new Error('Unexpected character at position ' + pos);
+    }
+  }
+
+  function parseString() {
+    if (text[pos] !== '"') {
+      throw new Error('Expected string at position ' + pos);
+    }
+    pos++; // skip opening quote
+
+    let result = '';
+    let escapeNext = false;
+
+    while (pos < len) {
+      const char = text[pos];
+
+      if (escapeNext) {
+        if (char === '"' || char === '\\' || char === '/' || char === 'b' || char === 'f' || char === 'n' || char === 'r' || char === 't') {
+          const escapeMap = { '"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t' };
+          result += escapeMap[char] || char;
+          escapeNext = false;
+          pos++;
+        } else if (char === 'u') {
+          // Unicode escape \uXXXX
+          if (pos + 4 >= len) {
+            throw new Error('Incomplete unicode escape at position ' + pos);
+          }
+          const hex = text.substr(pos + 1, 4);
+          const codePoint = parseInt(hex, 16);
+          if (isNaN(codePoint)) {
+            throw new Error('Invalid unicode escape at position ' + pos);
+          }
+          result += String.fromCharCode(codePoint);
+          pos += 5;
+          escapeNext = false;
+        } else {
+          throw new Error('Invalid escape sequence at position ' + pos);
+        }
+      } else if (char === '\\') {
+        escapeNext = true;
+        pos++;
+      } else if (char === '"') {
+        pos++; // skip closing quote
+        return result;
+      } else if (char < ' ') {
+        throw new Error('Unescaped control character at position ' + pos);
+      } else {
+        result += char;
+        pos++;
+      }
+    }
+
+    throw new Error('Unterminated string at position ' + pos);
+  }
+
+  function parseNumber() {
+    const start = pos;
+
+    if (text[pos] === '-') {
+      pos++;
+    }
+
+    if (pos >= len || text[pos] < '0' || text[pos] > '9') {
+      throw new Error('Invalid number at position ' + start);
+    }
+
+    if (text[pos] === '0') {
+      pos++;
+    } else {
+      while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
+        pos++;
+      }
+    }
+
+    if (pos < len && text[pos] === '.') {
+      pos++;
+      if (pos >= len || text[pos] < '0' || text[pos] > '9') {
+        throw new Error('Invalid number at position ' + start);
+      }
+      while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
+        pos++;
+      }
+    }
+
+    if (pos < len && (text[pos] === 'e' || text[pos] === 'E')) {
+      pos++;
+      if (pos < len && (text[pos] === '+' || text[pos] === '-')) {
+        pos++;
+      }
+      if (pos >= len || text[pos] < '0' || text[pos] > '9') {
+        throw new Error('Invalid number at position ' + start);
+      }
+      while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
+        pos++;
+      }
+    }
+
+    const numStr = text.slice(start, pos);
+    return parseFloat(numStr);
+  }
+
+  function parseObject() {
+    if (text[pos] !== '{') {
+      throw new Error('Expected object at position ' + pos);
+    }
+    pos++; // skip opening brace
+
+    const obj = {};
+    const keys = new Set();
+    let first = true;
+
+    skipWhitespace();
+
+    while (pos < len && text[pos] !== '}') {
+      if (!first) {
+        skipWhitespace();
+        if (text[pos] !== ',') {
+          throw new Error('Expected comma at position ' + pos);
+        }
+        pos++;
+        skipWhitespace();
+      }
+      first = false;
+
+      if (text[pos] === '}') {
+        break; // trailing comma
+      }
+
+      // Parse key
+      if (text[pos] !== '"') {
+        throw new Error('Expected string key at position ' + pos);
+      }
+      const key = parseString();
+
+      if (keys.has(key)) {
+        throw new Error('Duplicate key detected in JSON: ' + key);
+      }
+      keys.add(key);
+
+      skipWhitespace();
+      if (text[pos] !== ':') {
+        throw new Error('Expected colon at position ' + pos);
+      }
+      pos++;
+
+      // Parse value
+      obj[key] = parseValue();
+
+      skipWhitespace();
+    }
+
+    if (pos >= len || text[pos] !== '}') {
+      throw new Error('Expected closing brace at position ' + pos);
+    }
+    pos++; // skip closing brace
+
+    return obj;
+  }
+
+  function parseArray() {
+    if (text[pos] !== '[') {
+      throw new Error('Expected array at position ' + pos);
+    }
+    pos++; // skip opening bracket
+
+    const arr = [];
+    let first = true;
+
+    skipWhitespace();
+
+    while (pos < len && text[pos] !== ']') {
+      if (!first) {
+        skipWhitespace();
+        if (text[pos] !== ',') {
+          throw new Error('Expected comma at position ' + pos);
+        }
+        pos++;
+        skipWhitespace();
+      }
+      first = false;
+
+      if (text[pos] === ']') {
+        break; // trailing comma
+      }
+
+      arr.push(parseValue());
+
+      skipWhitespace();
+    }
+
+    if (pos >= len || text[pos] !== ']') {
+      throw new Error('Expected closing bracket at position ' + pos);
+    }
+    pos++; // skip closing bracket
+
+    return arr;
+  }
+
+  const result = parseValue();
+  skipWhitespace();
+  if (pos < len) {
+    throw new Error('Unexpected content after JSON at position ' + pos);
+  }
+
+  return result;
 }
 
 /**
