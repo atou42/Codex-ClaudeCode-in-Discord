@@ -5,6 +5,8 @@
  * redacted responses, typed errors. Tool handlers call only injected functions.
  */
 
+import { types } from 'node:util';
+
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const REDACTED_FIELDS = new Set([
   'accessToken', 'refreshToken', 'token', 'secret', 'password',
@@ -13,6 +15,9 @@ const REDACTED_FIELDS = new Set([
 
 const MAX_RESPONSE_SIZE = 512 * 1024; // 512KB
 const MAX_ARRAY_LENGTH = 1000;
+const MAX_STRING_LENGTH = 10000;
+const MAX_DEPTH = 20;
+const MAX_TOTAL_BYTES = 100 * 1024; // 100KB input limit
 
 /**
  * Custom error with typed code
@@ -26,120 +31,205 @@ class MCPValidationError extends Error {
 }
 
 /**
- * Check if value is a plain object (not array, null, or class instance)
+ * Recursively validate and clone an object graph, checking descriptors at every level.
+ * Only allows exact plain objects (Object.prototype only), dense ordinary arrays,
+ * strings, numbers (finite only), booleans, null.
+ * Rejects: proxies, getters/setters, symbols, cycles, sparse arrays, extra array props,
+ * dangerous keys, null/custom prototypes, functions, BigInt, undefined, NaN/Infinity.
  */
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
+function validateAndClone(value, depth = 0, seen = new WeakSet(), path = 'root') {
+  // Depth check
+  if (depth > MAX_DEPTH) {
+    throw new MCPValidationError('MAX_DEPTH', `nesting depth exceeded at ${path}`);
   }
+
+  // Primitives (allow only safe types)
+  if (value === null) {
+    return null;
+  }
+
+  const type = typeof value;
+
+  if (type === 'boolean') {
+    return value;
+  }
+
+  if (type === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new MCPValidationError('NONFINITE_NUMBER', `NaN or Infinity not allowed at ${path}`);
+    }
+    return value;
+  }
+
+  if (type === 'string') {
+    if (value.length > MAX_STRING_LENGTH) {
+      throw new MCPValidationError('STRING_TOO_LONG', `string exceeds ${MAX_STRING_LENGTH} chars at ${path}`);
+    }
+    return value;
+  }
+
+  if (type === 'undefined') {
+    throw new MCPValidationError('UNDEFINED_VALUE', `undefined not allowed at ${path}`);
+  }
+
+  if (type === 'bigint') {
+    throw new MCPValidationError('BIGINT_VALUE', `BigInt not allowed at ${path}`);
+  }
+
+  if (type === 'function') {
+    throw new MCPValidationError('FUNCTION_VALUE', `function not allowed at ${path}`);
+  }
+
+  if (type === 'symbol') {
+    throw new MCPValidationError('SYMBOL_VALUE', `symbol not allowed at ${path}`);
+  }
+
+  if (type !== 'object') {
+    throw new MCPValidationError('UNKNOWN_TYPE', `unknown type ${type} at ${path}`);
+  }
+
+  // Check for proxy BEFORE any property access
+  if (types.isProxy(value)) {
+    throw new MCPValidationError('PROXY_NOT_ALLOWED', `proxy not allowed at ${path}`);
+  }
+
+  // Cycle detection
+  if (seen.has(value)) {
+    throw new MCPValidationError('CYCLIC_REFERENCE', `cycle detected at ${path}`);
+  }
+  seen.add(value);
+
+  // Arrays
+  if (Array.isArray(value)) {
+    // Check for sparse arrays (holes)
+    for (let i = 0; i < value.length; i++) {
+      if (!(i in value)) {
+        throw new MCPValidationError('SPARSE_ARRAY', `sparse array not allowed at ${path}`);
+      }
+    }
+
+    // Check for extra properties on array
+    const ownKeys = Object.getOwnPropertyNames(value);
+    for (const key of ownKeys) {
+      if (key !== 'length' && !/^\d+$/.test(key)) {
+        throw new MCPValidationError('ARRAY_EXTRA_PROPERTIES', `array with extra properties not allowed at ${path}`);
+      }
+    }
+
+    // Check for symbol keys on array
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new MCPValidationError('SYMBOL_KEYS', `symbol keys not allowed at ${path}`);
+    }
+
+    // Length check
+    if (value.length > MAX_ARRAY_LENGTH) {
+      throw new MCPValidationError('ARRAY_TOO_LONG', `array exceeds ${MAX_ARRAY_LENGTH} items at ${path}`);
+    }
+
+    // Recursively validate items
+    const cloned = [];
+    for (let i = 0; i < value.length; i++) {
+      cloned[i] = validateAndClone(value[i], depth + 1, seen, `${path}[${i}]`);
+    }
+
+    seen.delete(value);
+    return cloned;
+  }
+
+  // Objects - must have exactly Object.prototype
   const proto = Object.getPrototypeOf(value);
-  // Accept both Object.prototype and null (from Object.create(null))
-  // But also check if __proto__ was polluted with custom properties
-  if (proto !== Object.prototype && proto !== null) {
-    // If prototype has been set to something else, check if it's been polluted
-    const protoKeys = Object.keys(proto);
-    if (protoKeys.length > 0) {
-      // This is suspicious - likely __proto__ pollution attempt
-      throw new Error('dangerous __proto__ pollution detected');
-    }
+  if (proto !== Object.prototype) {
+    throw new MCPValidationError('INVALID_PROTOTYPE', `only plain objects allowed (Object.prototype) at ${path}`);
   }
-  return true;
-}
 
-/**
- * Check for dangerous prototype pollution keys
- */
-function hasDangerousKeys(obj) {
-  // Check own property names
-  const keys = Object.keys(obj);
-  for (const key of keys) {
+  // Check for symbol keys
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new MCPValidationError('SYMBOL_KEYS', `symbol keys not allowed at ${path}`);
+  }
+
+  // Get all own property names and check descriptors
+  const ownKeys = Object.getOwnPropertyNames(value);
+  const cloned = {};
+
+  for (const key of ownKeys) {
+    const keyPath = `${path}.${key}`;
+
+    // Check for dangerous keys
     if (DANGEROUS_KEYS.has(key)) {
-      return true;
+      throw new MCPValidationError('DANGEROUS_KEYS', `dangerous key "${key}" not allowed at ${keyPath}`);
     }
+
+    // Check descriptor - must be plain data property
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) {
+      throw new MCPValidationError('MISSING_DESCRIPTOR', `missing descriptor at ${keyPath}`);
+    }
+
+    if (descriptor.get || descriptor.set) {
+      throw new MCPValidationError('ACCESSOR_PROPERTIES', `accessor properties not allowed at ${keyPath}`);
+    }
+
+    // Clone the value recursively
+    cloned[key] = validateAndClone(descriptor.value, depth + 1, seen, keyPath);
   }
 
-  // Check if __proto__ was attempted (pollutes prototype chain)
-  const ownPropertyNames = Object.getOwnPropertyNames(obj);
-  for (const key of ownPropertyNames) {
-    if (DANGEROUS_KEYS.has(key)) {
-      return true;
-    }
-  }
-
-  // Also check if prototype was actually polluted
-  if (obj.__proto__ !== Object.prototype && obj.__proto__ !== null) {
-    const protoKeys = Object.keys(obj.__proto__);
-    if (protoKeys.length > 0 && protoKeys.some(k => !Object.prototype.hasOwnProperty(k))) {
-      return true;
-    }
-  }
-
-  return false;
+  seen.delete(value);
+  return cloned;
 }
 
 /**
- * Check for accessor properties (getters/setters)
+ * Check total serialized byte size
  */
-function hasAccessors(obj) {
-  const keys = Object.keys(obj);
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(obj, key);
-    if (descriptor && (descriptor.get || descriptor.set)) {
-      return true;
-    }
+function checkTotalSize(obj, maxBytes) {
+  const json = JSON.stringify(obj);
+  if (json.length > maxBytes) {
+    throw new MCPValidationError('INPUT_TOO_LARGE', `input exceeds ${maxBytes} bytes`);
   }
-  return false;
 }
 
 /**
- * Check for symbol keys
- */
-function hasSymbolKeys(obj) {
-  return Object.getOwnPropertySymbols(obj).length > 0;
-}
-
-/**
- * Validate and sanitize tool arguments
+ * Validate and sanitize tool arguments using recursive descriptor validation
  */
 function validateArguments(toolName, args, schema) {
-  if (!isPlainObject(args)) {
+  // First validate it's a plain object at top level
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     throw new MCPValidationError('INVALID_ARGUMENTS', 'arguments must be a plain object');
   }
 
-  if (hasDangerousKeys(args)) {
-    throw new MCPValidationError('DANGEROUS_KEYS', 'dangerous keys (__proto__, constructor, prototype) not allowed');
+  // Check for proxy before any access
+  if (types.isProxy(args)) {
+    throw new MCPValidationError('PROXY_NOT_ALLOWED', 'proxy not allowed in arguments');
   }
 
-  if (hasAccessors(args)) {
-    throw new MCPValidationError('ACCESSOR_PROPERTIES', 'accessor properties not allowed');
-  }
+  // Clone and validate the entire graph recursively
+  const validated = validateAndClone(args, 0, new WeakSet(), 'arguments');
 
-  if (hasSymbolKeys(args)) {
-    throw new MCPValidationError('SYMBOL_KEYS', 'symbol keys not allowed');
-  }
+  // Check total size
+  checkTotalSize(validated, MAX_TOTAL_BYTES);
 
   // Check required fields
   for (const field of schema.required) {
-    if (!(field in args)) {
+    if (!(field in validated)) {
       throw new MCPValidationError('MISSING_FIELD', `${field} is required`);
     }
   }
 
   // Check for unknown fields
   const allowedFields = new Set([...schema.required, ...schema.optional]);
-  for (const field of Object.keys(args)) {
+  for (const field of Object.keys(validated)) {
     if (!allowedFields.has(field)) {
       throw new MCPValidationError('UNKNOWN_FIELD', `unknown field: ${field}`);
     }
   }
 
-  return args;
+  return validated;
 }
 
 /**
- * Redact sensitive fields from response
+ * Sanitize dependency output by walking descriptors without executing getters/toJSON/valueOf.
+ * Creates a detached safe graph by reading descriptors only, never invoking traps.
  */
-function redactResponse(obj, depth = 0) {
+function sanitizeDependencyOutput(obj, depth = 0, seen = new WeakSet(), path = 'response') {
   if (depth > 10) {
     return '[MAX_DEPTH]';
   }
@@ -148,28 +238,101 @@ function redactResponse(obj, depth = 0) {
     return obj;
   }
 
-  if (typeof obj !== 'object') {
+  const type = typeof obj;
+
+  // Primitives pass through
+  if (type === 'boolean' || type === 'number' || type === 'string') {
     return obj;
   }
 
+  // Reject unsafe types
+  if (type === 'function' || type === 'bigint' || type === 'symbol') {
+    return '[REDACTED:UNSAFE_TYPE]';
+  }
+
+  if (type !== 'object') {
+    return '[UNKNOWN_TYPE]';
+  }
+
+  // Check for proxy - this check itself may trigger traps on hostile proxies,
+  // but we catch that below. For most proxies, types.isProxy() is safe.
+  try {
+    if (types.isProxy(obj)) {
+      return '[REDACTED:PROXY]';
+    }
+  } catch {
+    // If checking isProxy itself throws, it's hostile
+    return '[REDACTED:PROXY]';
+  }
+
+  // Cycle detection
+  if (seen.has(obj)) {
+    return '[CIRCULAR]';
+  }
+  seen.add(obj);
+
+  // Arrays
   if (Array.isArray(obj)) {
     if (obj.length > MAX_ARRAY_LENGTH) {
-      return obj.slice(0, MAX_ARRAY_LENGTH).map(item => redactResponse(item, depth + 1))
-        .concat([`[${obj.length - MAX_ARRAY_LENGTH} more items truncated]`]);
+      const truncated = [];
+      for (let i = 0; i < MAX_ARRAY_LENGTH; i++) {
+        truncated.push(sanitizeDependencyOutput(obj[i], depth + 1, seen, `${path}[${i}]`));
+      }
+      truncated.push(`[${obj.length - MAX_ARRAY_LENGTH} more items truncated]`);
+      seen.delete(obj);
+      return truncated;
     }
-    return obj.map(item => redactResponse(item, depth + 1));
+
+    const result = [];
+    for (let i = 0; i < obj.length; i++) {
+      result.push(sanitizeDependencyOutput(obj[i], depth + 1, seen, `${path}[${i}]`));
+    }
+    seen.delete(obj);
+    return result;
+  }
+
+  // Objects - walk descriptors only, never access properties directly
+  // Use try-catch in case getOwnPropertyNames itself triggers hostile behavior
+  let ownKeys;
+  try {
+    ownKeys = Object.getOwnPropertyNames(obj);
+  } catch {
+    seen.delete(obj);
+    return '[REDACTED:HOSTILE_OBJECT]';
   }
 
   const result = {};
-  for (const [key, value] of Object.entries(obj)) {
+
+  for (const key of ownKeys) {
     // Skip redacted fields
     if (REDACTED_FIELDS.has(key) || key.startsWith('_')) {
       continue;
     }
 
-    result[key] = redactResponse(value, depth + 1);
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(obj, key);
+    } catch {
+      // If getting descriptor throws, skip this property
+      continue;
+    }
+
+    if (!descriptor) {
+      continue;
+    }
+
+    // If it's an accessor, skip it (never execute getters)
+    if (descriptor.get || descriptor.set) {
+      continue;
+    }
+
+    // Only process data properties
+    if ('value' in descriptor) {
+      result[key] = sanitizeDependencyOutput(descriptor.value, depth + 1, seen, `${path}.${key}`);
+    }
   }
 
+  seen.delete(obj);
   return result;
 }
 
@@ -218,11 +381,11 @@ function createError(code, message) {
 }
 
 /**
- * Create success response
+ * Create success response with sanitized dependency output
  */
 function createSuccess(data) {
-  const redacted = redactResponse(data);
-  const bounded = boundResponse(redacted);
+  const sanitized = sanitizeDependencyOutput(data);
+  const bounded = boundResponse(sanitized);
 
   return deepFreeze({
     content: [{
@@ -311,7 +474,7 @@ export function createServer(deps, options = {}) {
   async function handleToolCall(name, args) {
     const schema = TOOL_SCHEMAS[name];
     if (!schema) {
-      throw new Error(`unknown tool: ${name}`);
+      throw new MCPValidationError('UNKNOWN_TOOL', `unknown tool: ${name}`);
     }
 
     const validatedArgs = validateArguments(name, args, schema);
@@ -343,7 +506,7 @@ export function createServer(deps, options = {}) {
       }
 
       default:
-        throw new Error(`unknown tool: ${name}`);
+        throw new MCPValidationError('UNKNOWN_TOOL', `unknown tool: ${name}`);
     }
   }
 
@@ -448,12 +611,12 @@ export function createServer(deps, options = {}) {
 
       return createError('UNKNOWN_METHOD', `unknown method: ${method}`);
     } catch (error) {
-      // Return validation errors with their specific codes
+      // Return validation errors with their specific codes (allowlisted templates)
       if (error instanceof MCPValidationError) {
         return createError(error.code, error.message);
       }
-      // All other errors become INTERNAL_ERROR
-      return createError('INTERNAL_ERROR', error.message);
+      // Unknown dependency exceptions: generic closed error, never leak raw message/stack
+      return createError('INTERNAL_ERROR', 'internal error');
     }
   }
 
