@@ -81,11 +81,17 @@ test('assertCohubPort throws listing only the methods that are actually missing'
 
 test('assertCohubPort accepts a fully valid implementation and exposes exactly the contract surface', () => {
   const { impl } = fullValidImpl();
-  impl.somePrivateHelper = () => 'leaked';
   const port = assertCohubPort(impl);
 
   assert.deepEqual([...Object.keys(port)].sort(), [...COHUB_PORT_METHODS].sort());
   assert.equal(port.somePrivateHelper, undefined);
+});
+
+test('assertCohubPort rejects implementations with extra properties beyond the contract', () => {
+  const { impl } = fullValidImpl();
+  impl.somePrivateHelper = () => 'leaked';
+
+  assert.throws(() => assertCohubPort(impl), /unexpected properties/i);
 });
 
 test('assertCohubPort wrapped port forwards arguments and return values to the underlying implementation', () => {
