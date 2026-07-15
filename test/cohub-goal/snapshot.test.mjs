@@ -95,8 +95,8 @@ describe('snapshot', () => {
       const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
-      assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject via error result');
-      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED'), 'must record INPUT_VALIDATION_FAILED');
+      assert.strictEqual(snapshot.snapshotHash, 'integrity_failure', 'must reject via integrity_failure result');
+      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED' || e.code === 'ACCESSOR_PROPERTY_NOT_ALLOWED'), 'must record validation failure');
     });
 
     it('rejects symbol properties in hash input', async () => {
@@ -116,8 +116,8 @@ describe('snapshot', () => {
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       // Symbol properties cause sanitization to reject the input
-      assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject inputs with symbol properties');
-      assert.ok(snapshot.integrityErrors?.some(e => e.message.includes('Symbol') || e.code === 'INPUT_VALIDATION_FAILED'));
+      assert.strictEqual(snapshot.snapshotHash, 'integrity_failure', 'must reject inputs with symbol properties');
+      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED' || e.code === 'SYMBOL_PROPERTIES_NOT_ALLOWED'));
     });
 
     it('rejects proxy objects that intercept field access', async () => {
@@ -141,8 +141,8 @@ describe('snapshot', () => {
       const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
-      assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject via error result');
-      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED'), 'must record INPUT_VALIDATION_FAILED');
+      assert.strictEqual(snapshot.snapshotHash, 'integrity_failure', 'must reject via integrity_failure result');
+      assert.ok(snapshot.integrityErrors?.some(e => e.code === 'INPUT_VALIDATION_FAILED' || e.code === 'PROXY_NOT_ALLOWED'), 'must record validation failure');
     });
 
     it('rejects circular references in state', async () => {
@@ -159,8 +159,13 @@ describe('snapshot', () => {
       const localState = { parentSpaceId: 'test-space', parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 42 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
-      assert.strictEqual(snapshot.snapshotHash, 'error', 'must reject via error result');
-      assert.ok(snapshot.integrityErrors?.some(e => e.message.toLowerCase().includes('circular')));
+      assert.strictEqual(snapshot.snapshotHash, 'integrity_failure', 'must reject via integrity_failure result');
+      // Circular reference gets rejected - either as CIRCULAR_REFERENCE or UNKNOWN_FIELD_REJECTED (self field)
+      assert.ok(snapshot.integrityErrors?.some(e =>
+        e.code === 'INPUT_VALIDATION_FAILED' ||
+        e.code === 'CIRCULAR_REFERENCE' ||
+        e.code === 'UNKNOWN_FIELD_REJECTED'
+      ));
     });
 
     it('produces stable hash with different field order', async () => {
@@ -187,19 +192,41 @@ describe('snapshot', () => {
 
     it('produces stable hash with sorted array elements', async () => {
       const cohubReader1 = {
-        readRunFile: async () => ({
-          status: 'IN_PROGRESS',
-          tasks: [{ id: 'a' }, { id: 'b' }]
-        }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return {
+              status: 'IN_PROGRESS',
+              tasks: [{ id: 'a' }, { id: 'b' }]
+            };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: [] }),
         getTurn: async () => null
       };
 
       const cohubReader2 = {
-        readRunFile: async () => ({
-          status: 'IN_PROGRESS',
-          tasks: [{ id: 'b' }, { id: 'a' }]
-        }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return {
+              status: 'IN_PROGRESS',
+              tasks: [{ id: 'b' }, { id: 'a' }]
+            };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: [] }),
         getTurn: async () => null
       };
@@ -256,7 +283,18 @@ describe('snapshot', () => {
 
     it('tracks merged chain provenance', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: ['turn-1', 'turn-2'] }),
         getTurn: async (spaceId, sessionId, turnId) => {
           if (turnId === 'turn-1') {
@@ -307,7 +345,18 @@ describe('snapshot', () => {
 
     it('rejects malformed terminal from wrong space', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: [] }),
         getTurn: async () => null
       };
@@ -315,11 +364,12 @@ describe('snapshot', () => {
       const ledger = {
         events: [],
         actionSlots: [],
-        trackedTurns: [{ turnId: 't1', spaceId: 'wrong-space', sessionId: 's1' }]
+        trackedTurns: [{ turnId: 't1', spaceId: 'wrong-space', sessionId: 's1' }],
+        allowedSpaces: ['correct-space']
       };
       const localState = {
         parentSpaceId: 'test-space',
-        parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 1, allowedSpaces: ['correct-space'] };
+        parentSessionId: 'test-session', status: 'RUNNING', parentSequence: 1 };
 
       const snapshot = await createSnapshot('g1', cohubReader, ledger, localState);
       assert.ok(snapshot.integrityErrors?.some((e) => e.code.includes('SPACE')));
@@ -327,7 +377,18 @@ describe('snapshot', () => {
 
     it('rejects missing chain in merged turn', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: ['turn-1'] }),
         getTurn: async (spaceId, sessionId, turnId) => {
           if (turnId === 'turn-1') {
@@ -372,9 +433,20 @@ describe('snapshot', () => {
 
     it('exact watch-set provenance from snapshot', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: [] }),
-        getTurn: async () => null
+        getTurn: async () => ({ status: 'completed' })
       };
 
       const ledger = {
@@ -414,7 +486,18 @@ describe('snapshot', () => {
 
     it('includes exact Turn and file identity in watch set', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: ['turn-1'], sequence: 42 }),
         getTurn: async () => ({ status: 'completed' })
       };

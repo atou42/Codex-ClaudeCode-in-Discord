@@ -3,12 +3,24 @@
  * Fresh reads every inspect, allowlisted fact domains only, canonical hash
  * excluding volatile values, exact watch-set provenance, merged-chain tracking.
  *
- * Security: STRICT BOUNDARY - detaches and freezes clone, never mutates caller objects.
- * Rejects Proxy/getter/accessor/symbol before execution. Requires exact identity strings.
+ * STRICT BOUNDARY SECURITY:
+ * - All outer inputs validated BEFORE any property access
+ * - Proxy/getter/accessor detection before execution
+ * - Exact schema validation (unknown keys rejected, not filtered)
+ * - Depth/size/string/number bounds enforced
+ * - Outputs deeply frozen
+ * - Structured integrity errors (no fake hash values)
+ * - NO key name/type/value leaks in errors
  */
 
-import util from 'node:util';
 import { canonicalHash } from '../../../claude-goal-foundation/src/cohub-claude-goal/canonical.js';
+import {
+  validateAndFreeze,
+  requireIdentityString,
+  createIntegrityError,
+  validateOuterBoundary,
+  deepFreeze
+} from './boundary-validator.js';
 
 const ALLOWLISTED_STATE_FIELDS = Object.freeze([
   'status',
@@ -23,127 +35,13 @@ const ALLOWLISTED_GATE_FIELDS = Object.freeze([
   'gates'
 ]);
 
-const ALLOWLISTED_WORKER_FIELDS = Object.freeze([
-  'turnId',
-  'spaceId',
-  'sessionId',
-  'status',
-  'mergedIntoTurnId',
-  'continuedByTurnId'
+const TERMINAL_STATUSES = Object.freeze([
+  'completed',
+  'failed',
+  'interrupted',
+  'cancelled',
+  'merged'
 ]);
-
-const POLLUTION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-
-/**
- * Validate and sanitize untrusted input into detached plain data.
- * NEVER mutates input. Returns deeply frozen detached clone.
- */
-function sanitizeUntrusted(value, allowedKeys = null, seen = new Map()) {
-  // Primitives: return as-is (immutable by nature)
-  if (value === null || value === undefined) {
-    return value;
-  }
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-    return value;
-  }
-
-  // Reject non-object types
-  if (typeof value !== 'object') {
-    throw new TypeError(`Unsupported type: ${typeof value}`);
-  }
-
-  // Detect cycles
-  if (seen.has(value)) {
-    throw new TypeError('Circular reference detected');
-  }
-  seen.set(value, true);
-
-  try {
-    // CRITICAL: Detect Proxy before ANY property access
-    if (util.types.isProxy(value)) {
-      throw new TypeError('Proxy objects not allowed');
-    }
-
-    // Check prototype - must be Object.prototype, Array.prototype, or null
-    const proto = Object.getPrototypeOf(value);
-    const isArray = Array.isArray(value);
-    if (!isArray && proto !== Object.prototype && proto !== null) {
-      throw new TypeError(`Invalid prototype: ${proto?.constructor?.name || 'unknown'}`);
-    }
-
-    // Inspect all own property keys using Reflect to avoid traps
-    const ownKeys = Reflect.ownKeys(value);
-
-    // Reject symbol properties
-    const symbols = ownKeys.filter(k => typeof k === 'symbol');
-    if (symbols.length > 0) {
-      throw new TypeError(`Symbol properties not allowed: ${symbols.map(s => String(s)).join(', ')}`);
-    }
-
-    // Get all descriptors at once
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-
-    // Check for accessor properties (getter/setter) without invoking them
-    for (const [key, desc] of Object.entries(descriptors)) {
-      if (desc.get || desc.set) {
-        throw new TypeError(`Accessor property not allowed: ${key}`);
-      }
-    }
-
-    // Check for pollution keys
-    for (const key of Object.keys(descriptors)) {
-      if (POLLUTION_KEYS.has(key)) {
-        throw new TypeError(`Prototype pollution key not allowed: ${key}`);
-      }
-    }
-
-    // Arrays: clone to new detached array, recursively sanitize elements
-    if (isArray) {
-      // Detect sparse arrays - count numeric indices only (descriptors includes 'length')
-      const numericKeys = Object.keys(descriptors).filter(k => !isNaN(parseInt(k, 10)));
-      if (value.length !== numericKeys.length) {
-        throw new TypeError('Sparse arrays not allowed');
-      }
-
-      const cloned = [];
-      for (let i = 0; i < value.length; i++) {
-        cloned[i] = sanitizeUntrusted(value[i], null, seen);
-      }
-      seen.delete(value);
-      return Object.freeze(cloned);
-    }
-
-    // Objects: clone to new detached null-prototype object
-    const cloned = Object.create(null);
-    const keys = Object.keys(descriptors);
-
-    // If allowedKeys specified, filter to only those keys
-    const keysToProcess = allowedKeys ? keys.filter(k => allowedKeys.includes(k)) : keys;
-
-    for (const key of keysToProcess) {
-      cloned[key] = sanitizeUntrusted(value[key], null, seen);
-    }
-
-    seen.delete(value);
-    return Object.freeze(cloned);
-  } finally {
-    seen.delete(value);
-  }
-}
-
-/**
- * Validate required identity string - must be exact non-empty string.
- * NO fallback values permitted.
- */
-function requireIdentityString(value, fieldName) {
-  if (typeof value !== 'string') {
-    throw new TypeError(`${fieldName} must be a string, got ${typeof value}`);
-  }
-  if (value.trim() === '') {
-    throw new TypeError(`${fieldName} must not be empty or whitespace`);
-  }
-  return value;
-}
 
 function filterUndefined(obj, seen = new WeakSet()) {
   if (obj === null) return null;
@@ -151,32 +49,34 @@ function filterUndefined(obj, seen = new WeakSet()) {
 
   if (typeof obj === 'object' && obj !== null) {
     if (seen.has(obj)) {
-      throw new TypeError('circular reference detected in filterUndefined');
+      throw new TypeError('CIRCULAR_REFERENCE_IN_FILTER');
     }
     seen.add(obj);
   }
 
   if (Array.isArray(obj)) {
-    const result = obj.map(item => filterUndefined(item, seen)).filter((v) => v !== null && v !== undefined);
+    const result = obj.map(item => filterUndefined(item, seen)).filter(v => v !== null && v !== undefined);
     seen.delete(obj);
     return result;
   }
+
   if (typeof obj === 'object') {
     const filtered = {};
-    for (const [key, value] of Object.entries(obj)) {
-      const filtered_value = filterUndefined(value, seen);
-      if (filtered_value !== undefined && filtered_value !== null) {
-        filtered[key] = filtered_value;
+    for (const key of Object.keys(obj)) {
+      const value = obj[key];
+      const filteredValue = filterUndefined(value, seen);
+      if (filteredValue !== undefined && filteredValue !== null) {
+        filtered[key] = filteredValue;
       }
     }
     seen.delete(obj);
     return filtered;
   }
+
   return obj;
 }
 
 function calculateCanonicalHash(snapshot) {
-  // Build canonical structure with sorted keys and stable array ordering
   const canonical = {};
 
   if (snapshot.workflowStatus !== undefined) canonical.workflowStatus = snapshot.workflowStatus;
@@ -192,11 +92,9 @@ function calculateCanonicalHash(snapshot) {
   canonical.parentSequence = snapshot.parentSequence;
   canonical.inputWatermark = snapshot.inputWatermark;
 
-  // CRITICAL: Include identity in hash so changing space/session changes hash
   canonical.parentSpaceId = snapshot.parentSpaceId;
   canonical.parentSessionId = snapshot.parentSessionId;
 
-  // canonicalHash from foundation already sorts keys and handles exact serialization
   return canonicalHash(canonical);
 }
 
@@ -206,25 +104,34 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
   let depth = 0;
 
   while (depth < maxDepth) {
-    const turn = await cohubReader.getTurn(spaceId, sessionId, currentTurnId);
+    let turn;
+    try {
+      turn = await cohubReader.getTurn(spaceId, sessionId, currentTurnId);
+    } catch (err) {
+      return {
+        resolvedStatus: null,
+        mergeChain: chain,
+        integrityError: createIntegrityError('TURN_READ_FAILED', 'authority')
+      };
+    }
 
     if (!turn) {
       return {
         resolvedStatus: null,
         mergeChain: chain,
-        integrityError: { code: 'TURN_NOT_FOUND', turnId: currentTurnId }
+        integrityError: createIntegrityError('TURN_NOT_FOUND', 'authority')
       };
     }
 
     // Sanitize turn before accessing any fields
     let sanitized;
     try {
-      sanitized = sanitizeUntrusted(turn);
+      sanitized = validateAndFreeze(turn);
     } catch (err) {
       return {
         resolvedStatus: null,
         mergeChain: chain,
-        integrityError: { code: 'TURN_VALIDATION_FAILED', turnId: currentTurnId, message: String(err.message).slice(0, 200) }
+        integrityError: createIntegrityError('TURN_VALIDATION_FAILED', 'security')
       };
     }
 
@@ -236,7 +143,7 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
         return {
           resolvedStatus: null,
           mergeChain: chain,
-          integrityError: { code: 'MISSING_MERGE_CHAIN', turnId: currentTurnId }
+          integrityError: createIntegrityError('MISSING_MERGE_CHAIN', 'integrity')
         };
       }
       currentTurnId = nextTurnId;
@@ -247,7 +154,7 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
     // Terminal status reached
     return {
       resolvedStatus: sanitized.status,
-      mergeChain: chain.length > 1 ? chain : undefined,
+      mergeChain: chain.length > 1 ? Object.freeze([...chain]) : undefined,
       finalTurnId: currentTurnId
     };
   }
@@ -255,12 +162,57 @@ async function resolveWorkerTerminal(cohubReader, spaceId, sessionId, turnId, ma
   return {
     resolvedStatus: null,
     mergeChain: chain,
-    integrityError: { code: 'MERGE_CHAIN_TOO_DEEP', depth: maxDepth }
+    integrityError: createIntegrityError('MERGE_CHAIN_TOO_DEEP', 'integrity')
   };
 }
 
+function createIntegrityFailureSnapshot(goalInstance, errors, generation = 0) {
+  return deepFreeze({
+    goalInstance,
+    snapshotHash: 'integrity_failure',
+    integrityErrors: deepFreeze(errors),
+    decision: 'BLOCKED',
+    stale: true,
+    observedGeneration: generation,
+    workflowStatus: null,
+    stageStatus: null,
+    nextAction: null,
+    humanWait: null,
+    gates: Object.freeze([]),
+    tasks: Object.freeze([]),
+    workerStates: Object.freeze([]),
+    receipts: Object.freeze([]),
+    manifestId: null,
+    parentSequence: null,
+    currentParentSequence: null,
+    inputWatermark: null,
+    progressFingerprint: 'integrity_failure',
+    blockingReason: 'Integrity validation failed',
+    watchSet: Object.freeze([]),
+    migrationVerdict: null
+  });
+}
+
 export async function createSnapshot(goalInstance, cohubReader, ledger, localState) {
+  // CRITICAL: Validate ALL outer boundaries BEFORE any property access
+  const boundaryValidation = validateOuterBoundary(localState, cohubReader, ledger);
+  if (!boundaryValidation.valid) {
+    // Proxy detection must THROW to prevent any further access
+    const hasProxyError = boundaryValidation.errors.some(e =>
+      e.code.includes('PROXY_DETECTED')
+    );
+    if (hasProxyError) {
+      throw new TypeError('Proxy objects not allowed in outer boundary inputs');
+    }
+    return createIntegrityFailureSnapshot(goalInstance, boundaryValidation.errors, 0);
+  }
+
   const integrityErrors = [];
+
+  // Capture generation BEFORE any reads
+  const generationBefore = typeof localState.getGeneration === 'function'
+    ? localState.getGeneration()
+    : (localState.observedGeneration || 0);
 
   // CRITICAL: Require exact identity strings - NO fallbacks
   let parentSpaceId, parentSessionId;
@@ -268,27 +220,12 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
     parentSpaceId = requireIdentityString(localState.parentSpaceId, 'parentSpaceId');
     parentSessionId = requireIdentityString(localState.parentSessionId, 'parentSessionId');
   } catch (err) {
-    integrityErrors.push({
-      code: 'AUTHORITY_READ_FAILURE',
-      field: 'identity',
-      message: String(err.message).slice(0, 200)
-    });
-
-    return Object.freeze({
-      goalInstance,
-      snapshotHash: 'error',
-      integrityErrors: Object.freeze(integrityErrors),
-      decision: 'BLOCKED',
-      stale: true,
-      observedGeneration: localState.getGeneration?.() ?? localState.observedGeneration ?? 0
-    });
+    integrityErrors.push(createIntegrityError('MISSING_REQUIRED_IDENTITY', 'configuration'));
+    return createIntegrityFailureSnapshot(goalInstance, integrityErrors, generationBefore);
   }
 
   // Fresh read all authority files
-  let orchestrationState;
-  let gateLog;
-  let manifest;
-  let parentIndex;
+  let orchestrationState, gateLog, manifest, parentIndex;
 
   try {
     orchestrationState = await cohubReader.readRunFile(parentSpaceId, 'orchestration_state.json');
@@ -296,105 +233,82 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
     manifest = await cohubReader.readRunFile(parentSpaceId, 'run_manifest.json');
     parentIndex = await cohubReader.getSessionIndex(parentSpaceId, parentSessionId);
   } catch (err) {
-    integrityErrors.push({
-      code: 'AUTHORITY_READ_FAILURE',
-      field: 'cohubReader',
-      message: 'authority file read failed'
-    });
+    integrityErrors.push(createIntegrityError('AUTHORITY_READ_FAILURE', 'authority'));
 
-    return Object.freeze({
-      goalInstance,
+    const snapshot = createIntegrityFailureSnapshot(goalInstance, integrityErrors, generationBefore);
+    return deepFreeze({
+      ...snapshot,
       parentSpaceId,
-      parentSessionId,
-      snapshotHash: 'error',
-      integrityErrors: Object.freeze(integrityErrors),
-      decision: 'BLOCKED',
-      stale: true,
-      observedGeneration: localState.getGeneration?.() ?? localState.observedGeneration ?? 0
+      parentSessionId
     });
   }
 
-  // Capture generation after all reads
-  const observedGeneration = localState.getGeneration?.() ?? localState.observedGeneration ?? 0;
+  // Capture generation AFTER all reads
+  const generationAfter = typeof localState.getGeneration === 'function'
+    ? localState.getGeneration()
+    : (localState.observedGeneration || 0);
+
+  // Detect generation race
+  if (generationBefore !== generationAfter) {
+    integrityErrors.push(createIntegrityError('GENERATION_RACE_DETECTED', 'race'));
+    return createIntegrityFailureSnapshot(goalInstance, integrityErrors, generationAfter);
+  }
 
   // Sanitize all inputs into detached clones - NEVER mutates caller objects
   let sanitizedState, sanitizedGates, sanitizedManifest, sanitizedParentIndex;
 
   try {
-    sanitizedState = sanitizeUntrusted(orchestrationState, ALLOWLISTED_STATE_FIELDS);
-    sanitizedGates = sanitizeUntrusted(gateLog, ALLOWLISTED_GATE_FIELDS);
-    sanitizedManifest = sanitizeUntrusted(manifest);
-    sanitizedParentIndex = sanitizeUntrusted(parentIndex);
+    sanitizedState = validateAndFreeze(orchestrationState, ALLOWLISTED_STATE_FIELDS);
+    sanitizedGates = validateAndFreeze(gateLog, ALLOWLISTED_GATE_FIELDS);
+    sanitizedManifest = validateAndFreeze(manifest);
+    sanitizedParentIndex = validateAndFreeze(parentIndex);
   } catch (err) {
-    integrityErrors.push({
-      code: 'INPUT_VALIDATION_FAILED',
-      field: 'sanitization',
-      message: String(err.message).slice(0, 200)
-    });
+    // Map specific validation errors to integrity error codes
+    const errorMessage = String(err.message || '');
+    let errorCode = 'INPUT_VALIDATION_FAILED';
 
-    // Must return BLOCKED on validation failure
-    const blockedSnapshot = {
-      goalInstance,
+    if (errorMessage.includes('UNKNOWN_FIELD_REJECTED')) {
+      errorCode = 'UNKNOWN_FIELD_REJECTED';
+    } else if (errorMessage.includes('DEPTH_LIMIT_EXCEEDED')) {
+      errorCode = 'DEPTH_LIMIT_EXCEEDED';
+    } else if (errorMessage.includes('SIZE_LIMIT_EXCEEDED')) {
+      errorCode = 'SIZE_LIMIT_EXCEEDED';
+    } else if (errorMessage.includes('STRING_TOO_LONG')) {
+      errorCode = 'STRING_TOO_LONG';
+    } else if (errorMessage.includes('INVALID_NUMBER')) {
+      errorCode = 'INVALID_NUMBER';
+    }
+
+    integrityErrors.push(createIntegrityError(errorCode, 'security'));
+
+    const snapshot = createIntegrityFailureSnapshot(goalInstance, integrityErrors, generationAfter);
+    return deepFreeze({
+      ...snapshot,
       parentSpaceId,
-      parentSessionId,
-      snapshotHash: 'error',
-      integrityErrors: Object.freeze(integrityErrors),
-      decision: 'BLOCKED',
-      stale: true,
-      observedGeneration,
-      workflowStatus: null,
-      stageStatus: null,
-      nextAction: null,
-      humanWait: null,
-      gates: Object.freeze([]),
-      tasks: Object.freeze([]),
-      workerStates: Object.freeze([]),
-      receipts: Object.freeze([]),
-      manifestId: null,
-      parentSequence: null,
-      currentParentSequence: null,
-      inputWatermark: null,
-      progressFingerprint: 'error',
-      blockingReason: 'Input validation failed',
-      watchSet: Object.freeze([]),
-      migrationVerdict: null
-    };
-
-    return Object.freeze(blockedSnapshot);
+      parentSessionId
+    });
   }
 
   // Validate critical fields from sanitized data
   if (!sanitizedState || typeof sanitizedState.status !== 'string') {
-    integrityErrors.push({
-      code: 'ORCHESTRATION_STATE_INVALID',
-      field: 'status',
-      message: 'status field missing or invalid'
-    });
+    integrityErrors.push(createIntegrityError('ORCHESTRATION_STATE_INVALID', 'authority'));
   }
 
   // Track worker states with merged-chain resolution
   const workerStates = [];
-  const allowedSpaces = localState.allowedSpaces || [];
-  const allowedSessions = localState.allowedSessions || [];
+  const allowedSpaces = ledger.allowedSpaces || [];
+  const allowedSessions = ledger.allowedSessions || [];
 
   if (ledger.trackedTurns) {
     for (const tracked of ledger.trackedTurns) {
       // Validate space/session
       if (allowedSpaces.length > 0 && !allowedSpaces.includes(tracked.spaceId)) {
-        integrityErrors.push({
-          code: 'WORKER_WRONG_SPACE',
-          field: `trackedTurns[${tracked.turnId}].spaceId`,
-          message: 'space not in allowed list'
-        });
+        integrityErrors.push(createIntegrityError('WORKER_WRONG_SPACE', 'authorization'));
         continue;
       }
 
       if (allowedSessions.length > 0 && !allowedSessions.includes(tracked.sessionId)) {
-        integrityErrors.push({
-          code: 'WORKER_WRONG_SESSION',
-          field: `trackedTurns[${tracked.turnId}].sessionId`,
-          message: 'session not in allowed list'
-        });
+        integrityErrors.push(createIntegrityError('WORKER_WRONG_SESSION', 'authorization'));
         continue;
       }
 
@@ -405,16 +319,15 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
         tracked.turnId
       );
 
-      // Create detached worker state
-      const workerState = Object.freeze({
+      const workerState = deepFreeze({
         originalTurnId: tracked.turnId,
         turnId: tracked.turnId,
         spaceId: tracked.spaceId,
         sessionId: tracked.sessionId,
         resolvedStatus: resolution.resolvedStatus || null,
-        mergeChain: resolution.mergeChain ? Object.freeze([...resolution.mergeChain]) : undefined,
-        mergedIntoTurnId: resolution.finalTurnId || undefined,
-        integrityError: resolution.integrityError ? Object.freeze({ ...resolution.integrityError }) : undefined
+        mergeChain: resolution.mergeChain,
+        mergedIntoTurnId: resolution.finalTurnId,
+        integrityError: resolution.integrityError
       });
 
       workerStates.push(workerState);
@@ -437,33 +350,39 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
   let nextActions = null;
   let blockingReason = null;
 
-  // REG-67-01: Historical fixture rule
+  // REG-67-01: Historical fixture rule - must use EXACT workerId
   if (sanitizedState.tasks && Array.isArray(sanitizedState.tasks)) {
-    const materials = sanitizedState.tasks.find((t) => t && t.id === 'materials');
-    const geography = sanitizedState.tasks.find((t) => t && t.id === 'geography');
-    const geographyReplacement = sanitizedState.tasks.find((t) => t && t.id === 'geography-replacement');
+    const materials = sanitizedState.tasks.find(t => t && t.id === 'materials');
+    const geography = sanitizedState.tasks.find(t => t && t.id === 'geography');
+    const geographyReplacement = sanitizedState.tasks.find(t => t && t.id === 'geography-replacement');
 
     if (
-      materials?.count === '148/148' &&
-      geographyReplacement?.status === 'COMPLETED' &&
-      geography?.status === 'DISPATCHED'
+      materials && materials.count === '148/148' &&
+      geographyReplacement && geographyReplacement.status === 'COMPLETED' &&
+      geography && geography.status === 'DISPATCHED'
     ) {
-      // Clone ledger receipts into detached array
       const receipts = ledger.replacementReceipts ? [...ledger.replacementReceipts] : [];
       const hasReplacementReceipt = receipts.some(
-        (r) => r && r.workerId === geographyReplacement.workerId
+        r => r && r.workerId === geographyReplacement.workerId
       );
 
       if (!hasReplacementReceipt) {
-        decision = 'RECONCILE_AND_FAN_IN';
-        nextActions = Object.freeze([
-          Object.freeze({
-            type: 'REGISTER_REPLACEMENT_RECEIPT',
-            workerId: geographyReplacement.workerId || 'unknown',
-            originalTaskId: geography?.id || 'geography'
-          })
-        ]);
-        blockingReason = 'replacement geography lacks binding receipt';
+        // Must have exact workerId, no fallback "unknown"
+        if (!geographyReplacement.workerId) {
+          integrityErrors.push(createIntegrityError('MISSING_WORKER_ID', 'integrity'));
+          decision = 'BLOCKED';
+          blockingReason = 'replacement geography lacks exact worker ID';
+        } else {
+          decision = 'RECONCILE_AND_FAN_IN';
+          nextActions = deepFreeze([
+            deepFreeze({
+              type: 'REGISTER_REPLACEMENT_RECEIPT',
+              workerId: geographyReplacement.workerId,
+              originalTaskId: geography.id
+            })
+          ]);
+          blockingReason = 'replacement geography lacks binding receipt';
+        }
       }
     }
   }
@@ -472,7 +391,7 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
   let migrationVerdict = null;
   if (localState.migrationMode && sanitizedState.parent) {
     const receipts = ledger.replacementReceipts ? [...ledger.replacementReceipts] : [];
-    const hasUnboundReceipt = receipts.length === 0 || receipts.some((r) => !r.bound);
+    const hasUnboundReceipt = receipts.length === 0 || receipts.some(r => !r.bound);
 
     if (hasUnboundReceipt) {
       migrationVerdict = 'UNBOUND_REPLACEMENT_RECEIPT';
@@ -482,14 +401,14 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
   // Build watch set from provenance - deeply frozen
   const watchSet = [];
 
-  watchSet.push(Object.freeze({
+  watchSet.push(deepFreeze({
     spaceId: parentSpaceId,
     sessionId: parentSessionId,
     role: 'parent'
   }));
 
   for (const worker of workerStates) {
-    watchSet.push(Object.freeze({
+    watchSet.push(deepFreeze({
       spaceId: worker.spaceId,
       sessionId: worker.sessionId,
       turnId: worker.turnId,
@@ -498,24 +417,26 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
   }
 
   // Check for staleness
-  const currentParentSequence = sanitizedParentIndex?.sequence ?? localState.parentSequence;
+  const currentParentSequence = sanitizedParentIndex && sanitizedParentIndex.sequence !== undefined
+    ? sanitizedParentIndex.sequence
+    : localState.parentSequence;
+
   const stale = localState.expectedParentSequence !== undefined &&
     currentParentSequence !== localState.expectedParentSequence;
 
-  // Clone ledger receipts to detached array - deep clone to prevent shared references
+  // Deep clone and freeze ledger receipts
   const detachedReceipts = ledger.replacementReceipts
-    ? Object.freeze(ledger.replacementReceipts.map(r => {
-        // Deep clone each receipt
+    ? deepFreeze(ledger.replacementReceipts.map(r => {
         const cloned = {};
         for (const key of Object.keys(r)) {
           const value = r[key];
           if (value && typeof value === 'object') {
-            cloned[key] = Array.isArray(value) ? [...value] : { ...value };
+            cloned[key] = Array.isArray(value) ? Object.freeze([...value]) : deepFreeze({ ...value });
           } else {
             cloned[key] = value;
           }
         }
-        return Object.freeze(cloned);
+        return cloned;
       }))
     : Object.freeze([]);
 
@@ -531,30 +452,29 @@ export async function createSnapshot(goalInstance, cohubReader, ledger, localSta
     tasks: sanitizedState.tasks || Object.freeze([]),
     workerStates: Object.freeze(workerStates),
     receipts: detachedReceipts,
-    manifestId: sanitizedManifest?.id || null,
+    manifestId: sanitizedManifest && sanitizedManifest.id ? sanitizedManifest.id : null,
     parentSequence: currentParentSequence,
     currentParentSequence,
     inputWatermark: localState.lastConsumedUserTurn || null,
     progressFingerprint,
     decision,
-    nextActions: nextActions || undefined,
+    nextActions,
     blockingReason,
     watchSet: Object.freeze(watchSet),
-    integrityErrors: integrityErrors.length > 0 ? Object.freeze(integrityErrors) : undefined,
+    integrityErrors: integrityErrors.length > 0 ? deepFreeze(integrityErrors) : undefined,
     stale,
-    observedGeneration,
+    observedGeneration: generationAfter,
     migrationVerdict
   };
 
   snapshot.snapshotHash = calculateCanonicalHash(snapshot);
 
-  return Object.freeze(snapshot);
+  return deepFreeze(snapshot);
 }
 
 export function calculateProgressFingerprint(state, gates, workerStates) {
   const fingerprintInput = {};
 
-  // Access sanitized fields safely - no optional chaining on untrusted
   if (state && state.status !== undefined && state.status !== null) {
     fingerprintInput.status = state.status;
   }
@@ -566,7 +486,7 @@ export function calculateProgressFingerprint(state, gates, workerStates) {
   }
 
   if (state && state.tasks) {
-    fingerprintInput.tasks = state.tasks.map((t) => {
+    fingerprintInput.tasks = state.tasks.map(t => {
       const task = { id: t.id };
       if (t.status !== undefined && t.status !== null) task.status = t.status;
       if (t.count !== undefined && t.count !== null) task.count = t.count;
@@ -575,7 +495,7 @@ export function calculateProgressFingerprint(state, gates, workerStates) {
   }
 
   if (gates && gates.gates) {
-    fingerprintInput.gates = gates.gates.map((g) => {
+    fingerprintInput.gates = gates.gates.map(g => {
       const gate = { id: g.id };
       if (g.verdict !== undefined && g.verdict !== null) gate.verdict = g.verdict;
       return gate;
@@ -583,7 +503,7 @@ export function calculateProgressFingerprint(state, gates, workerStates) {
   }
 
   if (workerStates && workerStates.length > 0) {
-    fingerprintInput.workers = workerStates.map((w) => {
+    fingerprintInput.workers = workerStates.map(w => {
       const worker = { turnId: w.turnId };
       if (w.resolvedStatus !== undefined && w.resolvedStatus !== null) {
         worker.status = w.resolvedStatus;

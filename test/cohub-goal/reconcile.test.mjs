@@ -116,7 +116,18 @@ describe('reconcile', () => {
   describe('reconnect reconciliation', () => {
     it('EVT-03: performs full reconciliation after reconnect', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: ['turn-1'] }),
         getTurn: async (spaceId, sessionId, turnId) => {
           if (turnId === 'turn-1') {
@@ -225,7 +236,18 @@ describe('reconcile', () => {
   describe('merged-chain tracking', () => {
     it('EVT-06: follows merged turn to real terminal', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: ['turn-1', 'turn-2', 'turn-3'] }),
         getTurn: async (spaceId, sessionId, turnId) => {
           if (turnId === 'turn-1') {
@@ -257,7 +279,18 @@ describe('reconcile', () => {
 
     it('EVT-06: rejects treating merged as permanent wait', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: ['turn-1'] }),
         getTurn: async (spaceId, sessionId, turnId) => {
           if (turnId === 'turn-1') {
@@ -284,7 +317,18 @@ describe('reconcile', () => {
   describe('wrong space/session/path validation', () => {
     it('rejects turn from wrong space', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: [] }),
         getTurn: async () => null
       };
@@ -292,23 +336,34 @@ describe('reconcile', () => {
       const ledger = {
         events: [],
         actionSlots: [],
-        trackedTurns: [{ turnId: 't1', spaceId: 'wrong-space', sessionId: 's1' }]
+        trackedTurns: [{ turnId: 't1', spaceId: 'wrong-space', sessionId: 's1' }],
+        allowedSpaces: ['correct-space']
       };
       const localState = {
         parentSpaceId: 'test-space',
         parentSessionId: 'test-session',
         status: 'RUNNING',
-        parentSequence: 1,
-        allowedSpaces: ['correct-space']
+        parentSequence: 1
       };
 
       const result = await reconcile('g1', cohubReader, ledger, localState);
-      assert.ok(result.snapshot.integrityErrors?.some((e) => e.field.includes('space')));
+      assert.ok(result.snapshot.integrityErrors?.some((e) => e.code.includes('SPACE')));
     });
 
     it('rejects turn from wrong session pattern', async () => {
       const cohubReader = {
-        readRunFile: async () => ({ status: 'IN_PROGRESS' }),
+        readRunFile: async (spaceId, path) => {
+          if (path === 'orchestration_state.json') {
+            return { status: 'IN_PROGRESS' };
+          }
+          if (path === 'stage_gate_log.json') {
+            return { gates: [] };
+          }
+          if (path === 'run_manifest.json') {
+            return { id: 'manifest-v1' };
+          }
+          return {};
+        },
         getSessionIndex: async () => ({ turns: [] }),
         getTurn: async () => null
       };
@@ -316,18 +371,18 @@ describe('reconcile', () => {
       const ledger = {
         events: [],
         actionSlots: [],
-        trackedTurns: [{ turnId: 't1', spaceId: 's1', sessionId: 'unregistered-session' }]
+        trackedTurns: [{ turnId: 't1', spaceId: 's1', sessionId: 'unregistered-session' }],
+        allowedSessions: ['parent-session', 'worker-session-1']
       };
       const localState = {
         parentSpaceId: 'test-space',
         parentSessionId: 'test-session',
         status: 'RUNNING',
-        parentSequence: 1,
-        allowedSessions: ['parent-session', 'worker-session-1']
+        parentSequence: 1
       };
 
       const result = await reconcile('g1', cohubReader, ledger, localState);
-      assert.ok(result.snapshot.integrityErrors?.some((e) => e.field.includes('session')));
+      assert.ok(result.snapshot.integrityErrors?.some((e) => e.code.includes('SESSION')));
     });
   });
 
