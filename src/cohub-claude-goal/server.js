@@ -15,6 +15,17 @@ const MAX_RESPONSE_SIZE = 512 * 1024; // 512KB
 const MAX_ARRAY_LENGTH = 1000;
 
 /**
+ * Custom error with typed code
+ */
+class MCPValidationError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = 'MCPValidationError';
+  }
+}
+
+/**
  * Check if value is a plain object (not array, null, or class instance)
  */
 function isPlainObject(value) {
@@ -92,25 +103,25 @@ function hasSymbolKeys(obj) {
  */
 function validateArguments(toolName, args, schema) {
   if (!isPlainObject(args)) {
-    throw new Error('arguments must be a plain object');
+    throw new MCPValidationError('INVALID_ARGUMENTS', 'arguments must be a plain object');
   }
 
   if (hasDangerousKeys(args)) {
-    throw new Error('dangerous keys (__proto__, constructor, prototype) not allowed');
+    throw new MCPValidationError('DANGEROUS_KEYS', 'dangerous keys (__proto__, constructor, prototype) not allowed');
   }
 
   if (hasAccessors(args)) {
-    throw new Error('accessor properties not allowed');
+    throw new MCPValidationError('ACCESSOR_PROPERTIES', 'accessor properties not allowed');
   }
 
   if (hasSymbolKeys(args)) {
-    throw new Error('symbol keys not allowed');
+    throw new MCPValidationError('SYMBOL_KEYS', 'symbol keys not allowed');
   }
 
   // Check required fields
   for (const field of schema.required) {
     if (!(field in args)) {
-      throw new Error(`${field} is required`);
+      throw new MCPValidationError('MISSING_FIELD', `${field} is required`);
     }
   }
 
@@ -118,7 +129,7 @@ function validateArguments(toolName, args, schema) {
   const allowedFields = new Set([...schema.required, ...schema.optional]);
   for (const field of Object.keys(args)) {
     if (!allowedFields.has(field)) {
-      throw new Error(`unknown field: ${field}`);
+      throw new MCPValidationError('UNKNOWN_FIELD', `unknown field: ${field}`);
     }
   }
 
@@ -168,16 +179,33 @@ function redactResponse(obj, depth = 0) {
 function boundResponse(obj) {
   const json = JSON.stringify(obj);
   if (json.length > MAX_RESPONSE_SIZE) {
-    throw new Error(`response exceeds ${MAX_RESPONSE_SIZE} byte limit`);
+    throw new MCPValidationError('RESPONSE_TOO_LARGE', `response exceeds ${MAX_RESPONSE_SIZE} byte limit`);
   }
   return obj;
+}
+
+/**
+ * Deep freeze an object and all nested objects/arrays.
+ * Guarantees returned objects cannot be mutated and nested
+ * descriptors are plain data (no getters/setters survive JSON round-trip).
+ */
+function deepFreeze(obj) {
+  if (obj === null || typeof obj !== 'object') {
+    return obj;
+  }
+  for (const value of Object.values(obj)) {
+    if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+      deepFreeze(value);
+    }
+  }
+  return Object.freeze(obj);
 }
 
 /**
  * Create typed error response
  */
 function createError(code, message) {
-  return {
+  return deepFreeze({
     isError: true,
     content: [{
       type: 'text',
@@ -186,7 +214,7 @@ function createError(code, message) {
         message: String(message).replace(/\n/g, ' ')
       })
     }]
-  };
+  });
 }
 
 /**
@@ -196,12 +224,12 @@ function createSuccess(data) {
   const redacted = redactResponse(data);
   const bounded = boundResponse(redacted);
 
-  return {
+  return deepFreeze({
     content: [{
       type: 'text',
       text: JSON.stringify(bounded)
     }]
-  };
+  });
 }
 
 /**
@@ -258,7 +286,7 @@ export function createServer(deps, options = {}) {
    */
   function checkGoalAllowed(goalInstance) {
     if (allowedGoals && !allowedGoals.includes(goalInstance)) {
-      throw new Error(`goal ${goalInstance} not allowed`);
+      throw new MCPValidationError('GOAL_NOT_ALLOWED', `goal ${goalInstance} not allowed`);
     }
   }
 
@@ -272,7 +300,7 @@ export function createServer(deps, options = {}) {
 
     for (const item of watchSet) {
       if (item.spaceId && !allowedSpaces.includes(item.spaceId)) {
-        throw new Error(`space ${item.spaceId} not allowed`);
+        throw new MCPValidationError('SPACE_NOT_ALLOWED', `space ${item.spaceId} not allowed`);
       }
     }
   }
@@ -420,6 +448,11 @@ export function createServer(deps, options = {}) {
 
       return createError('UNKNOWN_METHOD', `unknown method: ${method}`);
     } catch (error) {
+      // Return validation errors with their specific codes
+      if (error instanceof MCPValidationError) {
+        return createError(error.code, error.message);
+      }
+      // All other errors become INTERNAL_ERROR
       return createError('INTERNAL_ERROR', error.message);
     }
   }
