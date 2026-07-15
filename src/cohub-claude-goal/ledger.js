@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { canonicalHash } from './canonical.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { IntegrityError } from './errors.js';
 
 export const GENESIS_PREVIOUS_ENTRY_HASH = '0'.repeat(64);
+const APPEND_LOCK_SUFFIX = '.append-lock';
 
 const REQUIRED_INPUT_FIELDS = [
   'goalInstance',
@@ -239,60 +241,133 @@ export async function appendLedgerEntry(dir, fields, options = {}) {
     }
   }
 
-  const replay = await replayLedger(dir);
-
-  const statePath = path.join(dir, 'state.json');
-  if (fs.existsSync(statePath)) {
-    await reconcileMaterializedState(dir, replay);
+  // DEFECT-2: Validate goalInstance is a non-empty string
+  if (typeof fields.goalInstance !== 'string' || fields.goalInstance.length === 0) {
+    throw new Error('ledger append: goalInstance must be a non-empty string');
   }
 
-  if (replay.records.length > 0) {
-    const head = replay.records[replay.records.length - 1];
-    if (head.goalInstance !== fields.goalInstance) {
+  // DEFECT-1: Acquire exclusive append lock to serialize concurrent appends.
+  // The lock lives in the goal dir (not ledger/) so replayLedger's strict
+  // directory scan never sees it.
+  const ledgerDir = path.join(dir, 'ledger');
+  const appendLockPath = path.join(dir, `ledger${APPEND_LOCK_SUFFIX}`);
+
+  let appendLockFd;
+  try {
+    appendLockFd = await fsPromises.open(
+      appendLockPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+      0o600
+    );
+  } catch (err) {
+    if (err.code === 'EEXIST') {
+      // Check if lock is stale (older than 30 seconds)
+      let lockStat;
+      try {
+        lockStat = await fsPromises.stat(appendLockPath);
+        const lockAge = Date.now() - lockStat.mtimeMs;
+        if (lockAge > 30000) {
+          // Try to read lock contents for forensics
+          let lockContent = null;
+          try {
+            lockContent = await fsPromises.readFile(appendLockPath, 'utf8');
+          } catch (readErr) {
+            // Ignore read errors
+          }
+          throw new IntegrityError(
+            `ledger append: stale append lock detected (age: ${Math.round(lockAge / 1000)}s, content: ${lockContent || 'unreadable'}); manual intervention required`
+          );
+        }
+      } catch (statErr) {
+        if (statErr.code !== 'ENOENT') {
+          throw statErr;
+        }
+        // Lock disappeared between open attempt and stat; retry would be safe but we'll fail for clarity
+      }
       throw new IntegrityError(
-        `ledger append: goalInstance mismatch: ledger head is "${head.goalInstance}", got "${fields.goalInstance}"`,
+        `ledger append: another process is currently appending to the ledger; retry`
       );
     }
-    if (head.goalVersion !== fields.goalVersion) {
-      throw new IntegrityError(
-        `ledger append: goalVersion mismatch: ledger head is ${head.goalVersion}, got ${fields.goalVersion}`,
-      );
+    throw err;
+  }
+
+  try {
+    // Write lock metadata with descriptor validation
+    const lockData = JSON.stringify({
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+      nonce: crypto.randomBytes(16).toString('hex'),
+    });
+    await appendLockFd.write(lockData, 0, 'utf8');
+    await appendLockFd.sync();
+
+    // Re-read ledger under lock to detect concurrent changes
+    const replay = await replayLedger(dir);
+
+    const statePath = path.join(dir, 'state.json');
+    if (fs.existsSync(statePath)) {
+      await reconcileMaterializedState(dir, replay);
+    }
+
+    if (replay.records.length > 0) {
+      const head = replay.records[replay.records.length - 1];
+      if (head.goalInstance !== fields.goalInstance) {
+        throw new IntegrityError(
+          `ledger append: goalInstance mismatch: ledger head is "${head.goalInstance}", got "${fields.goalInstance}"`,
+        );
+      }
+      if (head.goalVersion !== fields.goalVersion) {
+        throw new IntegrityError(
+          `ledger append: goalVersion mismatch: ledger head is ${head.goalVersion}, got ${fields.goalVersion}`,
+        );
+      }
+    }
+
+    const seq = replay.headSeq + 1;
+    const entryWithoutHash = {
+      schemaVersion: 1,
+      seq,
+      timestamp: new Date().toISOString(),
+      goalInstance: fields.goalInstance,
+      goalVersion: fields.goalVersion,
+      claudeSessionId: fields.claudeSessionId,
+      type: fields.type,
+      eventId: fields.eventId,
+      actionId: fields.actionId,
+      beforeSnapshotHash: fields.beforeSnapshotHash,
+      afterSnapshotHash: fields.afterSnapshotHash,
+      decision: fields.decision,
+      evidenceRefs: fields.evidenceRefs,
+      previousEntryHash: replay.headHash,
+    };
+    const entryHash = computeEntryHash(entryWithoutHash);
+    const entry = { ...entryWithoutHash, entryHash };
+
+    const fileName = `${String(seq).padStart(8, '0')}-${entryHash}.json`;
+    const recordPath = path.join(ledgerDir, fileName);
+
+    await writeFileAtomic(recordPath, JSON.stringify(entry, null, 2), {
+      mode: 0o600,
+      crashHook: options.recordCrashHook,
+    });
+
+    if (!options.skipStateWrite) {
+      await persistState(dir, entry, options.stateCrashHook);
+    }
+
+    return { entry };
+  } finally {
+    // Always close and remove lock, even on error
+    if (appendLockFd) {
+      await appendLockFd.close();
+      try {
+        await fsPromises.unlink(appendLockPath);
+      } catch (unlinkErr) {
+        // If unlink fails, preserve forensic evidence but continue
+        // The stale lock detection will catch it on next append
+      }
     }
   }
-
-  const seq = replay.headSeq + 1;
-  const entryWithoutHash = {
-    schemaVersion: 1,
-    seq,
-    timestamp: new Date().toISOString(),
-    goalInstance: fields.goalInstance,
-    goalVersion: fields.goalVersion,
-    claudeSessionId: fields.claudeSessionId,
-    type: fields.type,
-    eventId: fields.eventId,
-    actionId: fields.actionId,
-    beforeSnapshotHash: fields.beforeSnapshotHash,
-    afterSnapshotHash: fields.afterSnapshotHash,
-    decision: fields.decision,
-    evidenceRefs: fields.evidenceRefs,
-    previousEntryHash: replay.headHash,
-  };
-  const entryHash = computeEntryHash(entryWithoutHash);
-  const entry = { ...entryWithoutHash, entryHash };
-
-  const fileName = `${String(seq).padStart(8, '0')}-${entryHash}.json`;
-  const recordPath = path.join(dir, 'ledger', fileName);
-
-  await writeFileAtomic(recordPath, JSON.stringify(entry, null, 2), {
-    mode: 0o600,
-    crashHook: options.recordCrashHook,
-  });
-
-  if (!options.skipStateWrite) {
-    await persistState(dir, entry, options.stateCrashHook);
-  }
-
-  return { entry };
 }
 
 export async function reconcileMaterializedState(dir, replay) {
