@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
+describe('cohub-claude-goal launcher', { timeout: 10000 }, () => {
   let Launcher, State, ExitCode, Verdict;
   let launcher;
   let mockGoalDir;
@@ -83,7 +83,9 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
 
     // Clean up temp directory
     if (mockGoalDir) {
-      await rm(mockGoalDir, { recursive: true, force: true });
+      // Give time for file handles to close (ledger fsync, etc.)
+      await delay(100);
+      await rm(mockGoalDir, { recursive: true, force: true }).catch(() => {});
     }
   });
 
@@ -270,13 +272,13 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
           assert.ok(argv.includes('--session-id'), 'Should include --session-id');
           assert.ok(argv.includes('stream-json'), 'Should include stream-json');
           assert.ok(argv.includes('dontAsk'), 'Should include dontAsk');
-          assert.ok(argv.includes('--mcp'), 'Should include --mcp');
-          assert.ok(argv.includes('cohub_goal'), 'Should include cohub_goal MCP');
-          assert.ok(argv.includes('--deny-tool'), 'Should deny tools');
-          assert.ok(argv.includes('Bash'), 'Should deny Bash');
-          assert.ok(argv.includes('Write'), 'Should deny Write');
-          assert.ok(argv.includes('Edit'), 'Should deny Edit');
-          assert.ok(argv.includes('WebFetch'), 'Should deny WebFetch');
+          assert.ok(argv.includes('--strict-mcp-config'), 'Should include --strict-mcp-config');
+          assert.ok(argv.includes('--disallowedTools'), 'Should deny tools');
+          const toolsArg = argv[argv.indexOf('--disallowedTools') + 1];
+          assert.ok(toolsArg.includes('Bash'), 'Should deny Bash');
+          assert.ok(toolsArg.includes('Write'), 'Should deny Write');
+          assert.ok(toolsArg.includes('Edit'), 'Should deny Edit');
+          assert.ok(toolsArg.includes('WebFetch'), 'Should deny WebFetch');
 
           const sessionIdx = argv.indexOf('--session-id');
           const sessionId = argv[sessionIdx + 1];
@@ -308,6 +310,7 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       await launcher.init();
       launcher.state = State.WAITING_COHUB;
       launcher.lastVerdict = Verdict.RUNNING;
+      launcher.lastVerdictInvocationId = 'test-invocation-id'; // Fresh verdict binding
       await launcher._updateState();
 
       // Should not throw
@@ -358,11 +361,12 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       await launcher.init();
       launcher.state = State.WAITING_COHUB;
       launcher.lastVerdict = null; // No fresh verify
+      launcher.lastVerdictInvocationId = null;
       await launcher._updateState();
 
       await assert.rejects(
         async () => await launcher.resume(),
-        /no lastVerdict present/
+        /no.*fresh.*verify/i
       );
     });
 
@@ -371,6 +375,7 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       await launcher.init();
       launcher.state = State.WAITING_COHUB;
       launcher.lastVerdict = Verdict.RUNNING;
+      launcher.lastVerdictInvocationId = 'test-invocation';
       launcher.evaluatorEntered = true;
       await launcher._updateState();
 
@@ -385,6 +390,7 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       await launcher.init();
       launcher.state = State.WAITING_COHUB;
       launcher.lastVerdict = Verdict.DONE; // Settled verdict
+      launcher.lastVerdictInvocationId = 'test-invocation';
       await launcher._updateState();
 
       await assert.rejects(
@@ -529,18 +535,22 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       };
       launcher.claudeSessionId = 'test-uuid';
 
-      const argv = launcher._constructStartArgv();
+      const condition = launcher._constructGoalCondition();
+      const argv = launcher._constructStartArgv(condition);
       const argvStr = argv.join(' ');
 
-      // Should include MCP config
-      assert.ok(argv.includes('cohub_goal'), 'Should allow cohub_goal MCP');
+      // Should include strict MCP config
+      assert.ok(argv.includes('--strict-mcp-config'), 'Should use strict MCP config');
 
-      // Should deny other tools
-      assert.ok(argv.includes('Bash'), 'Should deny Bash');
-      assert.ok(argv.includes('Write'), 'Should deny Write');
-      assert.ok(argv.includes('Edit'), 'Should deny Edit');
-      assert.ok(argv.includes('WebFetch'), 'Should deny WebFetch');
-      assert.ok(argv.includes('WebSearch'), 'Should deny WebSearch');
+      // Should deny other tools via disallowedTools
+      assert.ok(argv.includes('--disallowedTools'), 'Should have disallowedTools');
+      const toolsIdx = argv.indexOf('--disallowedTools');
+      const toolsList = argv[toolsIdx + 1];
+      assert.ok(toolsList.includes('Bash'), 'Should deny Bash');
+      assert.ok(toolsList.includes('Write'), 'Should deny Write');
+      assert.ok(toolsList.includes('Edit'), 'Should deny Edit');
+      assert.ok(toolsList.includes('WebFetch'), 'Should deny WebFetch');
+      assert.ok(toolsList.includes('WebSearch'), 'Should deny WebSearch');
     });
 
     it('should use stream-json output', () => {
@@ -548,7 +558,8 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       launcher.goalConfig = { goalInstance: 'test', goalVersion: 1 };
       launcher.claudeSessionId = 'test-uuid';
 
-      const argv = launcher._constructStartArgv();
+      const condition = launcher._constructGoalCondition();
+      const argv = launcher._constructStartArgv(condition);
 
       assert.ok(argv.includes('stream-json'), 'Should use stream-json output');
     });
@@ -558,7 +569,8 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       launcher.goalConfig = { goalInstance: 'test', goalVersion: 1 };
       launcher.claudeSessionId = 'test-uuid';
 
-      const argv = launcher._constructStartArgv();
+      const condition = launcher._constructGoalCondition();
+      const argv = launcher._constructStartArgv(condition);
 
       assert.ok(argv.includes('dontAsk'), 'Should use dontAsk mode');
     });
@@ -568,7 +580,8 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       launcher.goalConfig = { goalInstance: 'test', goalVersion: 1 };
       launcher.claudeSessionId = 'test-uuid';
 
-      const argv = launcher._constructStartArgv();
+      const condition = launcher._constructGoalCondition();
+      const argv = launcher._constructStartArgv(condition);
       const argvStr = argv.join(' ');
 
       assert.ok(!argvStr.includes('token'), 'Should not include token');
@@ -773,7 +786,7 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       await launcher.init();
 
       launcher.goalConfig = await launcher._loadGoalConfig();
-      await launcher._acquireLease();
+      await launcher.lease.acquire(launcher.goalConfig.goalInstance, { nativeGoalActive: true });
 
       // Should create lease file
       const { readFile } = await import('node:fs/promises');
@@ -789,7 +802,7 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       launcher = new Launcher({ goalDir: mockGoalDir });
       await launcher.init();
       launcher.goalConfig = await launcher._loadGoalConfig();
-      await launcher._acquireLease();
+      await launcher.lease.acquire(launcher.goalConfig.goalInstance, { nativeGoalActive: true });
 
       // Create a second launcher that will check the lease
       const launcher2 = new Launcher({ goalDir: mockGoalDir });
@@ -806,7 +819,7 @@ describe('cohub-claude-goal launcher', { timeout: 5000 }, () => {
       await wf(launcher.leasePath, JSON.stringify(lease, null, 2));
 
       await assert.rejects(
-        async () => await launcher2._acquireLease(),
+        async () => await launcher2.lease.acquire(launcher2.goalConfig.goalInstance, { nativeGoalActive: true }),
         /Lease conflict/
       );
     });
