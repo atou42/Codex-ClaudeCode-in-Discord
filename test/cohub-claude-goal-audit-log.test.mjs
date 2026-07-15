@@ -886,3 +886,192 @@ test('REGRESSION-11: stale lock files must not block forever', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('REGRESSION-12: Proxy objects must be rejected at all levels', async () => {
+  const dir = makeTempDir();
+  await mkdir(dir, { recursive: true });
+
+  try {
+    // Test 1: Proxy at top level
+    const record = makeRecord({ eventId: 'proxy-top' });
+    const getTrapCount1 = { count: 0 };
+    const handler1 = {
+      get(target, prop) {
+        getTrapCount1.count++;
+        if (prop === 'goalInstance') return 'EVIL_INJECTED';
+        return target[prop];
+      },
+      has(target, prop) {
+        getTrapCount1.count++;
+        return Reflect.has(target, prop);
+      },
+      ownKeys(target) {
+        getTrapCount1.count++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        getTrapCount1.count++;
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      getPrototypeOf(target) {
+        getTrapCount1.count++;
+        return Reflect.getPrototypeOf(target);
+      }
+    };
+    const proxied1 = new Proxy(record, handler1);
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, proxied1),
+      /proxy/i,
+      'must reject Proxy at top level'
+    );
+    assert.strictEqual(getTrapCount1.count, 0, 'Proxy handler must not be invoked');
+
+    // Test 2: Proxy in metadata
+    const record2 = makeRecord({ eventId: 'proxy-meta' });
+    const getTrapCount2 = { count: 0 };
+    const metaObj = { key: 'value' };
+    const handler2 = {
+      get(target, prop) {
+        getTrapCount2.count++;
+        return target[prop];
+      },
+      set(target, prop, value) {
+        getTrapCount2.count++;
+        return Reflect.set(target, prop, value);
+      },
+      has(target, prop) {
+        getTrapCount2.count++;
+        return Reflect.has(target, prop);
+      },
+      ownKeys(target) {
+        getTrapCount2.count++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        getTrapCount2.count++;
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      getPrototypeOf(target) {
+        getTrapCount2.count++;
+        return Reflect.getPrototypeOf(target);
+      }
+    };
+    record2.metadata = new Proxy(metaObj, handler2);
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record2),
+      /proxy/i,
+      'must reject Proxy in metadata'
+    );
+    assert.strictEqual(getTrapCount2.count, 0, 'Proxy handler in metadata must not be invoked');
+
+    // Test 3: Proxy in nested metadata
+    const record3 = makeRecord({ eventId: 'proxy-nested' });
+    const getTrapCount3 = { count: 0 };
+    const nested = { deep: 'value' };
+    const handler3 = {
+      get(target, prop) {
+        getTrapCount3.count++;
+        return target[prop];
+      },
+      has(target, prop) {
+        getTrapCount3.count++;
+        return Reflect.has(target, prop);
+      },
+      ownKeys(target) {
+        getTrapCount3.count++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        getTrapCount3.count++;
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      getPrototypeOf(target) {
+        getTrapCount3.count++;
+        return Reflect.getPrototypeOf(target);
+      }
+    };
+    record3.metadata = { level1: { level2: new Proxy(nested, handler3) } };
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record3),
+      /proxy/i,
+      'must reject Proxy in nested metadata'
+    );
+    assert.strictEqual(getTrapCount3.count, 0, 'Proxy handler in nested metadata must not be invoked');
+
+    // Test 4: Proxy in evidenceRefs array
+    const record4 = makeRecord({ eventId: 'proxy-evidence' });
+    const getTrapCount4 = { count: 0 };
+    const refObj = { ref: 'evidence.json', hash: sha256('data') };
+    const handler4 = {
+      get(target, prop) {
+        getTrapCount4.count++;
+        if (prop === 'ref') return 'EVIL_REF';
+        return target[prop];
+      },
+      has(target, prop) {
+        getTrapCount4.count++;
+        return Reflect.has(target, prop);
+      },
+      ownKeys(target) {
+        getTrapCount4.count++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        getTrapCount4.count++;
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      getPrototypeOf(target) {
+        getTrapCount4.count++;
+        return Reflect.getPrototypeOf(target);
+      }
+    };
+    record4.evidenceRefs = [new Proxy(refObj, handler4)];
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record4),
+      /proxy/i,
+      'must reject Proxy in evidenceRefs'
+    );
+    assert.strictEqual(getTrapCount4.count, 0, 'Proxy handler in evidenceRefs must not be invoked');
+
+    // Test 5: Proxy in metadata array item
+    const record5 = makeRecord({ eventId: 'proxy-meta-array' });
+    const getTrapCount5 = { count: 0 };
+    const itemObj = { item: 'value' };
+    const handler5 = {
+      get(target, prop) {
+        getTrapCount5.count++;
+        return target[prop];
+      },
+      has(target, prop) {
+        getTrapCount5.count++;
+        return Reflect.has(target, prop);
+      },
+      ownKeys(target) {
+        getTrapCount5.count++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        getTrapCount5.count++;
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+      getPrototypeOf(target) {
+        getTrapCount5.count++;
+        return Reflect.getPrototypeOf(target);
+      }
+    };
+    record5.metadata = { items: [new Proxy(itemObj, handler5)] };
+
+    await assert.rejects(
+      async () => appendAuditRecord(dir, record5),
+      /proxy/i,
+      'must reject Proxy in metadata array item'
+    );
+    assert.strictEqual(getTrapCount5.count, 0, 'Proxy handler in metadata array must not be invoked');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

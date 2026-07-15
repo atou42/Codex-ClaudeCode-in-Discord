@@ -19,6 +19,7 @@
 import { readdir, readFile, writeFile, rename, stat, lstat, open, unlink } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 
 const SCHEMA_VERSION = 1;
 
@@ -72,6 +73,11 @@ function sanitizeError(error, recordSnapshot) {
     return message;
   }
 
+  // SECURITY: Reject Proxy before any operations
+  if (recordSnapshot && typeof recordSnapshot === 'object' && types.isProxy(recordSnapshot)) {
+    return 'Validation error on untrusted object';
+  }
+
   // Work with frozen snapshot to avoid getter triggers
   const sensitiveFields = ['eventId', 'actionId', 'turnId', 'claudeSessionId'];
 
@@ -95,11 +101,22 @@ function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
+
+  // SECURITY: Reject Proxy before getPrototypeOf
+  if (types.isProxy(value)) {
+    return false;
+  }
+
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
 }
 
 function hasDangerousKeys(obj) {
+  // SECURITY: Reject Proxy before any key enumeration
+  if (types.isProxy(obj)) {
+    throw new TypeError('Proxy objects are not allowed');
+  }
+
   // Check both enumerable keys (Object.keys) and all own properties
   const allKeys = new Set([
     ...Object.keys(obj),
@@ -115,6 +132,11 @@ function hasDangerousKeys(obj) {
 }
 
 function hasAccessorProperties(obj) {
+  // SECURITY: Reject Proxy before getOwnPropertyDescriptors
+  if (types.isProxy(obj)) {
+    throw new TypeError('Proxy objects are not allowed');
+  }
+
   const descriptors = Object.getOwnPropertyDescriptors(obj);
   for (const desc of Object.values(descriptors)) {
     if (desc.get || desc.set) {
@@ -125,12 +147,22 @@ function hasAccessorProperties(obj) {
 }
 
 function hasSymbolKeys(obj) {
+  // SECURITY: Reject Proxy before getOwnPropertySymbols
+  if (types.isProxy(obj)) {
+    throw new TypeError('Proxy objects are not allowed');
+  }
+
   return Object.getOwnPropertySymbols(obj).length > 0;
 }
 
 function detectCircular(obj, seen = new WeakSet()) {
   if (obj === null || typeof obj !== 'object') {
     return false;
+  }
+
+  // SECURITY: Reject Proxy before any operations
+  if (types.isProxy(obj)) {
+    throw new TypeError('Proxy objects are not allowed');
   }
 
   if (seen.has(obj)) {
@@ -161,6 +193,11 @@ function detectCircular(obj, seen = new WeakSet()) {
  * Checks all nested objects, not just top level.
  */
 function validateObjectDeep(obj, path = 'record') {
+  // SECURITY: Reject Proxy before any Reflect/Object operations
+  if (obj !== null && typeof obj === 'object' && types.isProxy(obj)) {
+    throw new TypeError(`${path} must not be a Proxy object`);
+  }
+
   if (!isPlainObject(obj)) {
     throw new TypeError(`${path} must be a plain object`);
   }
@@ -184,12 +221,24 @@ function validateObjectDeep(obj, path = 'record') {
       throw new TypeError(`${path} contains dangerous key: ${key}`);
     }
 
+    // SECURITY: Reject Proxy at any depth
+    if (value !== null && typeof value === 'object' && types.isProxy(value)) {
+      throw new TypeError(`${path}.${key} must not be a Proxy object`);
+    }
+
     if (isPlainObject(value)) {
       validateObjectDeep(value, `${path}.${key}`);
     } else if (Array.isArray(value)) {
       for (let i = 0; i < value.length; i++) {
-        if (isPlainObject(value[i])) {
-          validateObjectDeep(value[i], `${path}.${key}[${i}]`);
+        const item = value[i];
+
+        // SECURITY: Reject Proxy in arrays
+        if (item !== null && typeof item === 'object' && types.isProxy(item)) {
+          throw new TypeError(`${path}.${key}[${i}] must not be a Proxy object`);
+        }
+
+        if (isPlainObject(item)) {
+          validateObjectDeep(item, `${path}.${key}[${i}]`);
         }
       }
     }
@@ -201,6 +250,11 @@ function validateObjectDeep(obj, path = 'record') {
  * Throw on any violation - never silently accept bad data.
  */
 function validateRecordStructure(record) {
+  // SECURITY: Reject Proxy before any operations
+  if (record !== null && typeof record === 'object' && types.isProxy(record)) {
+    throw new TypeError('Record must not be a Proxy object');
+  }
+
   if (!isPlainObject(record)) {
     throw new TypeError('Record must be a plain object');
   }
@@ -279,7 +333,14 @@ function validateRecordStructure(record) {
   }
 
   if (Array.isArray(record.evidenceRefs)) {
-    for (const ref of record.evidenceRefs) {
+    for (let i = 0; i < record.evidenceRefs.length; i++) {
+      const ref = record.evidenceRefs[i];
+
+      // SECURITY: Reject Proxy in evidenceRefs
+      if (ref !== null && typeof ref === 'object' && types.isProxy(ref)) {
+        throw new TypeError(`evidenceRefs[${i}] must not be a Proxy object`);
+      }
+
       if (!isPlainObject(ref)) {
         throw new TypeError('evidenceRefs items must be plain objects');
       }
@@ -291,6 +352,11 @@ function validateRecordStructure(record) {
 
   // Recursively validate metadata if present
   if (record.metadata !== undefined) {
+    // SECURITY: Reject Proxy in metadata
+    if (record.metadata !== null && typeof record.metadata === 'object' && types.isProxy(record.metadata)) {
+      throw new TypeError('metadata must not be a Proxy object');
+    }
+
     validateObjectDeep(record.metadata, 'metadata');
   }
 }
@@ -504,6 +570,11 @@ async function cleanStaleLocks(dir, timeoutMs = 30000) {
  */
 export async function appendAuditRecord(dir, record, maxRetries = 5) {
   let lastError;
+
+  // SECURITY: Reject Proxy immediately before any operations
+  if (record !== null && typeof record === 'object' && types.isProxy(record)) {
+    throw new TypeError('Record must not be a Proxy object');
+  }
 
   // Create snapshot for error sanitization (frozen to prevent getter triggers)
   const recordSnapshot = Object.freeze({
