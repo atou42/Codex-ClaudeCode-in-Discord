@@ -10,18 +10,22 @@
 // backfill, or the hard timeout.
 //
 // The generation counter is what prevents the park race: it increments
-// synchronously on every accepted watched event, every subscribe.ok, and
-// every disconnect/reconnect. A reconcile that started before some change
-// compares generationBefore/generationAfter and, on mismatch, reconciles
-// again rather than trusting a result that is already stale. When about to
-// park, the code registers a waiter and re-checks generation in the same
-// synchronous critical section (nothing else runs in between on the
-// single-threaded event loop), so an event landing in that exact window
-// cancels the park instead of being missed until some future wakeup.
+// synchronously on every observed event (including malformed/unwatched),
+// every subscribe.ok, and every disconnect/reconnect. A reconcile that started
+// before some change compares generationBefore/generationAfter and, on
+// mismatch, reconciles again rather than trusting a result that is already
+// stale. When about to park, the code registers a waiter and re-checks
+// generation in the same synchronous critical section (nothing else runs in
+// between on the single-threaded event loop), so an event landing in that
+// exact window cancels the park instead of being missed until some future
+// wakeup.
 //
 // A timeout is returned as an explicit { status: 'timeout' } outcome for the
 // caller to map to EVENT_WAIT_TIMEOUT / BLOCKED. It is never treated as a
 // signal to continue or retried internally.
+
+import { types } from 'node:util';
+import { sanitizeInput, deepFreeze, InputSanitizerError } from './input-sanitizer.js';
 
 export function createDedupeStore() {
   const eventIds = new Set();
@@ -106,38 +110,92 @@ export function createSubscriptionSession({
   hooks = {},
   hardTimeoutMs = 40 * 60 * 1000,
 }) {
-  if (!Array.isArray(spaceIds) || spaceIds.length === 0) {
-    throw new Error('createSubscriptionSession requires a non-empty spaceIds array');
-  }
-  if (!Array.isArray(watchSet)) {
-    throw new Error('createSubscriptionSession requires a watchSet array');
-  }
-  if (typeof hardTimeoutMs !== 'number' || hardTimeoutMs <= 0) {
-    throw new Error('hardTimeoutMs must be positive');
+  // Proxy-first sanitization: reject Proxy, accessor, symbol, custom prototype,
+  // sparse array, cycle, excessive size. Returns detached deep-frozen copies.
+  let immutableSpaceIds;
+  let immutableWatchSet;
+
+  try {
+    if (types.isProxy(spaceIds)) {
+      throw new InputSanitizerError('spaceIds must not be a Proxy');
+    }
+    if (!Array.isArray(spaceIds) || spaceIds.length === 0) {
+      throw new Error('createSubscriptionSession requires a non-empty spaceIds array');
+    }
+
+    if (types.isProxy(watchSet)) {
+      throw new InputSanitizerError('watchSet must not be a Proxy');
+    }
+    if (!Array.isArray(watchSet)) {
+      throw new Error('createSubscriptionSession requires a watchSet array');
+    }
+
+    if (types.isProxy(dedupeStore)) {
+      throw new InputSanitizerError('dedupeStore must not be a Proxy');
+    }
+
+    if (hooks !== undefined) {
+      if (types.isProxy(hooks)) {
+        throw new InputSanitizerError('hooks must not be a Proxy');
+      }
+      if (typeof hooks !== 'object' || hooks === null) {
+        throw new Error('hooks must be an object or undefined');
+      }
+    }
+
+    if (typeof hardTimeoutMs !== 'number' || hardTimeoutMs <= 0) {
+      throw new Error('hardTimeoutMs must be positive');
+    }
+
+    // Sanitize spaceIds: detached immutable copy
+    immutableSpaceIds = sanitizeInput(spaceIds, {
+      allowedTypes: new Set(['string']),
+      maxArrayLength: 10000,
+      maxStringLength: 10000,
+    });
+
+    // Sanitize watchSet: detached immutable copy
+    immutableWatchSet = sanitizeInput(watchSet, {
+      allowedTypes: new Set(['string', 'object']),
+      maxArrayLength: 10000,
+      maxObjectKeys: 10,
+      maxStringLength: 10000,
+    });
+
+    // Validate watch entries: exact own-property plain objects with exactly spaceId+sessionId
+    const watchedSpaceIdsCheck = new Set(immutableSpaceIds);
+    const watchKeysCheck = new Set();
+    for (const w of immutableWatchSet) {
+      if (!w || typeof w !== 'object') {
+        throw new Error('invalid watch entry: must be an object');
+      }
+      if (!hasOwnDataProperty(w, 'spaceId') || !hasOwnDataProperty(w, 'sessionId')) {
+        throw new Error('invalid watch entry: must have own spaceId and sessionId properties');
+      }
+      if (!isNonEmptyString(w.spaceId) || !isNonEmptyString(w.sessionId)) {
+        throw new Error('invalid watch entry: spaceId and sessionId must be non-empty strings');
+      }
+      if (!watchedSpaceIdsCheck.has(w.spaceId)) {
+        throw new Error('watch entry references space not in spaceIds');
+      }
+      const key = `${w.spaceId}::${w.sessionId}`;
+      if (watchKeysCheck.has(key)) {
+        throw new Error('duplicate watch entry');
+      }
+      watchKeysCheck.add(key);
+    }
+  } catch (err) {
+    // Propagate InputSanitizerError with original message for test visibility,
+    // but ensure attacker input values are never included
+    if (err instanceof InputSanitizerError) {
+      throw err;
+    }
+    throw err;
   }
 
-  // Validate watch entries: exact own-property plain objects with exactly spaceId+sessionId
-  const watchedSpaceIds = new Set(spaceIds);
-  const watchKeys = new Set();
-  for (const w of watchSet) {
-    if (!w || typeof w !== 'object') {
-      throw new Error('invalid watch entry: must be an object');
-    }
-    if (!hasOwnDataProperty(w, 'spaceId') || !hasOwnDataProperty(w, 'sessionId')) {
-      throw new Error('invalid watch entry: must have own spaceId and sessionId properties');
-    }
-    if (!isNonEmptyString(w.spaceId) || !isNonEmptyString(w.sessionId)) {
-      throw new Error('invalid watch entry: spaceId and sessionId must be non-empty strings');
-    }
-    if (!watchedSpaceIds.has(w.spaceId)) {
-      throw new Error(`watch entry references space ${w.spaceId} not in spaceIds`);
-    }
-    const key = `${w.spaceId}::${w.sessionId}`;
-    if (watchKeys.has(key)) {
-      throw new Error(`duplicate watch entry for ${w.spaceId}::${w.sessionId}`);
-    }
-    watchKeys.add(key);
-  }
+  // Use sanitized immutable copies from here on
+  const watchedSpaceIds = new Set(immutableSpaceIds);
+  const watchKeys = new Set(immutableWatchSet.map(w => `${w.spaceId}::${w.sessionId}`));
 
   let observedGeneration = 0;
   let queue = [];
@@ -179,6 +237,16 @@ export function createSubscriptionSession({
 
   function handleIncomingEvent(event) {
     if (closed) return;
+
+    // Every observed socket event synchronously increments generation BEFORE
+    // validation/queue decisions, including malformed/unwatched/subscribe
+    // ack/disconnect/reconnect. This ensures the generation protocol exactly
+    // closes HTTP and park windows per spec.
+    const shouldBumpGeneration = event?.kind === 'disconnected'
+      || event?.kind === 'reconnected'
+      || event?.kind === 'turn'
+      || (event && typeof event === 'object');
+
     if (event?.kind === 'disconnected') {
       subscribedAndAcked = false;
       disconnectedSinceLastAck = true;
@@ -189,16 +257,30 @@ export function createSubscriptionSession({
       bumpGeneration();
       return;
     }
-    if (event?.kind !== 'turn') return;
+
+    // Malformed/unwatched events still bump generation but never apply
+    if (event?.kind !== 'turn') {
+      if (shouldBumpGeneration) {
+        metrics.rejectedMalformedEventCount += 1;
+        bumpGeneration();
+      }
+      return;
+    }
 
     if (!validateTurnEvent(event)) {
       metrics.rejectedMalformedEventCount += 1;
+      bumpGeneration();
       return;
     }
-    if (!isWatched(event)) return;
+
+    if (!isWatched(event)) {
+      bumpGeneration();
+      return;
+    }
 
     if (dedupeStore.hasEvent(event.id)) {
       metrics.duplicateObservationCount += 1;
+      bumpGeneration();
       return;
     }
     dedupeStore.recordEvent(event.id);
@@ -206,6 +288,7 @@ export function createSubscriptionSession({
     const logicalKey = logicalKeyFor(event);
     if (dedupeStore.hasLogical(logicalKey)) {
       metrics.duplicateObservationCount += 1;
+      bumpGeneration();
       return;
     }
 
@@ -224,9 +307,9 @@ export function createSubscriptionSession({
     disconnectedSinceLastAck = false;
     await port.connect();
     if (closed) throw new Error('subscription session is closed');
-    await port.subscribe(spaceIds);
+    await port.subscribe(immutableSpaceIds);
     if (closed) throw new Error('subscription session is closed');
-    for (const spaceId of spaceIds) {
+    for (const spaceId of immutableSpaceIds) {
       await port.waitForSubscribeAck(spaceId);
       if (closed) throw new Error('subscription session is closed');
       metrics.subscribeAckCount += 1;
@@ -258,7 +341,10 @@ export function createSubscriptionSession({
     const snapshot = await reconcile(port);
     if (closed) throw new Error('subscription session is closed');
 
-    // Validate reconcile return value
+    // Validate reconcile return value with Proxy-first check
+    if (types.isProxy(snapshot)) {
+      throw new Error('reconcile must not return a Proxy');
+    }
     if (!snapshot || typeof snapshot !== 'object') {
       throw new Error('reconcile must return an object (invalid snapshot)');
     }
@@ -269,10 +355,17 @@ export function createSubscriptionSession({
       throw new Error('reconcile snapshot.snapshotHash must be 64 lowercase hex characters');
     }
 
+    // Sanitize and deep freeze the snapshot to prevent mutation
+    const sanitized = sanitizeInput(snapshot, {
+      allowedTypes: new Set(['string', 'number', 'boolean', 'null', 'object']),
+      maxObjectKeys: 100,
+      maxStringLength: 10000,
+    });
+
     hooks.afterReconcileFetch?.();
     const generationAfter = observedGeneration;
     metrics.reconcileCount += 1;
-    return { snapshot, generationBefore, generationAfter };
+    return { snapshot: sanitized, generationBefore, generationAfter };
   }
 
   /**
