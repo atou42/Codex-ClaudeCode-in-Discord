@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { submitAction, recoverSubmit } from '../../src/cohub-claude-goal/submit.js';
 import { PHASES } from '../../src/cohub-claude-goal/action-slot.js';
 
-// Reconciliation input validation: exact own descriptor-safe object, matches array binding consistency, zero/multiple/malformed results.
+// Action reconciliation with exact Turn matches: all five fields required, exactly one match confirms.
 
 function makeCtx() {
   const ctx = {
@@ -35,8 +35,8 @@ const FRESH = async () => ({
   unconsumedEvents: [],
 });
 
-describe('reconciliation input validation', () => {
-  it('RECON-01: reconciliation must return exact own plain object', async () => {
+describe('action reconciliation with exact Turn matches', () => {
+  it('RECON-01: reconciliation must return exact own plain object with matches array', async () => {
     const ctx = makeCtx();
     ctx.ledger = [
       { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
@@ -58,16 +58,29 @@ describe('reconciliation input validation', () => {
     assert.ok(nullResult.reason.includes('invalid'));
     assert.strictEqual(sendCalls, 0);
 
-    // Array result
+    // Array result (instead of object with matches)
+    ctx.ledger = ctx.ledger.filter(e => e.phase !== PHASES.AMBIGUOUS);
     const arrayResult = await recoverSubmit({
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async () => [{ found: true, turnId: 'turn-1' }],
+      reconcileByClientMessageId: async () => [{ turnId: 'turn-1' }],
       cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
     });
     assert.strictEqual(arrayResult.error, 'BLOCKED_AMBIGUOUS_SEND');
     assert.strictEqual(sendCalls, 0);
+
+    // Object without matches array
+    ctx.ledger = ctx.ledger.filter(e => e.phase !== PHASES.AMBIGUOUS);
+    const noMatchesResult = await recoverSubmit({
+      ctx,
+      goalInstance: 'test-goal',
+      freshInspect: FRESH,
+      reconcileByClientMessageId: async () => ({ found: true, turnId: 'turn-1' }),
+      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
+    });
+    assert.strictEqual(noMatchesResult.error, 'BLOCKED_AMBIGUOUS_SEND');
+    assert.ok(noMatchesResult.reason.includes('matches'));
   });
 
   it('RECON-02: reconciliation with accessor properties → BLOCK', async () => {
@@ -79,8 +92,7 @@ describe('reconciliation input validation', () => {
     ];
 
     const objWithGetter = {};
-    Object.defineProperty(objWithGetter, 'found', { get: () => true });
-    Object.defineProperty(objWithGetter, 'turnId', { get: () => 'turn-1' });
+    Object.defineProperty(objWithGetter, 'matches', { get: () => [] });
 
     let sendCalls = 0;
     const result = await recoverSubmit({
@@ -107,8 +119,7 @@ describe('reconciliation input validation', () => {
 
     class ReconcileResult {
       constructor() {
-        this.found = true;
-        this.turnId = 'turn-1';
+        this.matches = [];
       }
     }
 
@@ -125,7 +136,7 @@ describe('reconciliation input validation', () => {
     assert.strictEqual(sendCalls, 0);
   });
 
-  it('RECON-04: zero candidate matches → found=false → BLOCK', async () => {
+  it('RECON-04: zero candidate matches → BLOCK', async () => {
     const ctx = makeCtx();
     ctx.ledger = [
       { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
@@ -138,7 +149,7 @@ describe('reconciliation input validation', () => {
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async () => ({ found: false }),
+      reconcileByClientMessageId: async () => ({ matches: [] }),
       cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
     });
 
@@ -156,32 +167,39 @@ describe('reconciliation input validation', () => {
       { phase: PHASES.REQUEST_STARTED, actionSlotId: 'slot-123', continuationId: 'cont-123' },
     ];
 
-    ctx.parentTurns = [
-      { turnId: 'turn-1', clientMessageId: 'cont-123', parentSessionId: 'sess-A', sequence: 6 },
-      { turnId: 'turn-2', clientMessageId: 'cont-123', parentSessionId: 'sess-A', sequence: 7 },
-    ];
-
     let sendCalls = 0;
     const result = await recoverSubmit({
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async (cid) => {
-        const matches = ctx.parentTurns.filter(t => t.clientMessageId === cid);
-        if (matches.length === 0) return { found: false };
-        if (matches.length > 1) return { found: 'multiple', count: matches.length };
-        return { found: true, turnId: matches[0].turnId };
-      },
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: 'turn-1',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+          {
+            turnId: 'turn-2',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
       cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
     });
 
     assert.strictEqual(result.error, 'BLOCKED_AMBIGUOUS_SEND');
-    assert.ok(result.reason.includes('malformed') || result.reason.includes('found not true'));
+    assert.ok(result.reason.includes('Multiple matches'));
     assert.strictEqual(sendCalls, 0);
     assert.strictEqual(ctx.ledger.filter(e => e.phase === PHASES.AMBIGUOUS).length, 1);
   });
 
-  it('RECON-06: found=true with valid turnId → bind once, zero sends', async () => {
+  it('RECON-06: exactly one valid match → bind once, zero sends', async () => {
     const ctx = makeCtx();
     ctx.ledger = [
       { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
@@ -189,19 +207,22 @@ describe('reconciliation input validation', () => {
       { phase: PHASES.REQUEST_STARTED, actionSlotId: 'slot-123', continuationId: 'cont-123' },
     ];
 
-    ctx.parentTurns = [
-      { turnId: 'turn-existing', clientMessageId: 'cont-123', sequence: 6 },
-    ];
-
     let sendCalls = 0;
     const result = await recoverSubmit({
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async (cid) => {
-        const turn = ctx.parentTurns.find(t => t.clientMessageId === cid);
-        return turn ? { found: true, turnId: turn.turnId } : { found: false };
-      },
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: 'turn-existing',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-parent',
+          },
+        ],
+      }),
       cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
     });
 
@@ -210,6 +231,7 @@ describe('reconciliation input validation', () => {
     assert.strictEqual(result.reconciled, true);
     assert.strictEqual(sendCalls, 0);
     assert.strictEqual(ctx.ledger.at(-1).phase, PHASES.CONFIRMED);
+    assert.strictEqual(ctx.ledger.at(-1).parentSessionId, 'sess-parent');
   });
 
   it('RECON-07: repeated recovery must not duplicate AMBIGUOUS blockers', async () => {
@@ -221,7 +243,7 @@ describe('reconciliation input validation', () => {
     ];
 
     let sendCalls = 0;
-    const reconcile = async () => ({ found: false });
+    const reconcile = async () => ({ matches: [] });
     const send = async () => { sendCalls++; throw new Error('must not send'); };
 
     const result1 = await recoverSubmit({
@@ -250,7 +272,82 @@ describe('reconciliation input validation', () => {
     assert.strictEqual(sendCalls, 0);
   });
 
-  it('RECON-08: unknown reconciliation shape → BLOCK', async () => {
+  it('RECON-08: match missing required field → BLOCK', async () => {
+    const ctx = makeCtx();
+    ctx.ledger = [
+      { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
+      { phase: PHASES.PREPARED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
+      { phase: PHASES.REQUEST_STARTED, actionSlotId: 'slot-123', continuationId: 'cont-123' },
+    ];
+
+    let sendCalls = 0;
+
+    // Missing turnId
+    const noTurnId = await recoverSubmit({
+      ctx,
+      goalInstance: 'test-goal',
+      freshInspect: FRESH,
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
+      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
+    });
+    assert.strictEqual(noTurnId.error, 'BLOCKED_AMBIGUOUS_SEND');
+    assert.ok(noTurnId.reason.includes('turnId'));
+
+    // Empty string field
+    ctx.ledger = ctx.ledger.filter(e => e.phase !== PHASES.AMBIGUOUS);
+    const emptyField = await recoverSubmit({
+      ctx,
+      goalInstance: 'test-goal',
+      freshInspect: FRESH,
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: '',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
+      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
+    });
+    assert.strictEqual(emptyField.error, 'BLOCKED_AMBIGUOUS_SEND');
+
+    // Non-string field
+    ctx.ledger = ctx.ledger.filter(e => e.phase !== PHASES.AMBIGUOUS);
+    const numericField = await recoverSubmit({
+      ctx,
+      goalInstance: 'test-goal',
+      freshInspect: FRESH,
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: 123,
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
+      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
+    });
+    assert.strictEqual(numericField.error, 'BLOCKED_AMBIGUOUS_SEND');
+
+    assert.strictEqual(sendCalls, 0);
+  });
+
+  it('RECON-09: match actionSlotId mismatch → BLOCK', async () => {
     const ctx = makeCtx();
     ctx.ledger = [
       { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
@@ -263,16 +360,26 @@ describe('reconciliation input validation', () => {
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async () => ({ status: 'unknown', data: {} }),
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: 'turn-1',
+            actionSlotId: 'slot-wrong',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
       cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
     });
 
     assert.strictEqual(result.error, 'BLOCKED_AMBIGUOUS_SEND');
-    assert.ok(result.reason.includes('malformed') || result.reason.includes('found not true'));
+    assert.ok(result.reason.includes('actionSlotId'));
     assert.strictEqual(sendCalls, 0);
   });
 
-  it('RECON-09: malformed turnId in found=true result → BLOCK', async () => {
+  it('RECON-10: match continuationId mismatch → BLOCK', async () => {
     const ctx = makeCtx();
     ctx.ledger = [
       { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
@@ -281,28 +388,102 @@ describe('reconciliation input validation', () => {
     ];
 
     let sendCalls = 0;
-
-    // Empty string turnId
-    const emptyResult = await recoverSubmit({
+    const result = await recoverSubmit({
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async () => ({ found: true, turnId: '' }),
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: 'turn-1',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-wrong',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
       cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
     });
-    assert.strictEqual(emptyResult.error, 'BLOCKED_AMBIGUOUS_SEND');
-    assert.ok(emptyResult.reason.includes('turnId'));
 
-    // Numeric turnId
-    const numericResult = await recoverSubmit({
-      ctx,
-      goalInstance: 'test-goal',
-      freshInspect: FRESH,
-      reconcileByClientMessageId: async () => ({ found: true, turnId: 123 }),
-      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
-    });
-    assert.strictEqual(numericResult.error, 'BLOCKED_AMBIGUOUS_SEND');
-
+    assert.strictEqual(result.error, 'BLOCKED_AMBIGUOUS_SEND');
+    assert.ok(result.reason.includes('continuationId'));
     assert.strictEqual(sendCalls, 0);
+  });
+
+  it('RECON-11: match clientMessageId ≠ continuationId → BLOCK', async () => {
+    const ctx = makeCtx();
+    ctx.ledger = [
+      { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
+      { phase: PHASES.PREPARED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
+      { phase: PHASES.REQUEST_STARTED, actionSlotId: 'slot-123', continuationId: 'cont-123' },
+    ];
+
+    let sendCalls = 0;
+    const result = await recoverSubmit({
+      ctx,
+      goalInstance: 'test-goal',
+      freshInspect: FRESH,
+      reconcileByClientMessageId: async () => ({
+        matches: [
+          {
+            turnId: 'turn-1',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-different',
+            parentSessionId: 'sess-A',
+          },
+        ],
+      }),
+      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
+    });
+
+    assert.strictEqual(result.error, 'BLOCKED_AMBIGUOUS_SEND');
+    assert.ok(result.reason.includes('clientMessageId'));
+    assert.strictEqual(sendCalls, 0);
+  });
+
+  it('RECON-12: accessor bypass prevention via copied data', async () => {
+    const ctx = makeCtx();
+    ctx.ledger = [
+      { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
+      { phase: PHASES.PREPARED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
+      { phase: PHASES.REQUEST_STARTED, actionSlotId: 'slot-123', continuationId: 'cont-123' },
+    ];
+
+    let mutationAttempted = false;
+    let sendCalls = 0;
+
+    const result = await recoverSubmit({
+      ctx,
+      goalInstance: 'test-goal',
+      freshInspect: FRESH,
+      reconcileByClientMessageId: async () => {
+        const matches = [
+          {
+            turnId: 'turn-valid',
+            actionSlotId: 'slot-123',
+            continuationId: 'cont-123',
+            clientMessageId: 'cont-123',
+            parentSessionId: 'sess-A',
+          },
+        ];
+        // Attempt to mutate after returning
+        setTimeout(() => {
+          mutationAttempted = true;
+          matches[0].turnId = 'turn-hacked';
+        }, 0);
+        return { matches };
+      },
+      cohubSend: async () => { sendCalls++; throw new Error('must not send'); },
+    });
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.turnId, 'turn-valid');
+    assert.strictEqual(sendCalls, 0);
+
+    // Verify CONFIRMED has the original turnId
+    const confirmed = ctx.ledger.find(e => e.phase === PHASES.CONFIRMED);
+    assert.strictEqual(confirmed.turnId, 'turn-valid');
   });
 });

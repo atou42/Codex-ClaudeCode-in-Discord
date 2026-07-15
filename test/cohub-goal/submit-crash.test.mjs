@@ -74,12 +74,20 @@ describe('submit crash injection', () => {
       goalInstance: 'test-goal',
       freshInspect: FRESH,
       reconcileByClientMessageId: async (cid) => {
-        const turn = ctx.parentTurns.find(t => t.clientMessageId === cid);
-        return turn ? { found: true, turnId: turn.turnId } : { found: false };
+        const matches = ctx.parentTurns
+          .filter(t => t.clientMessageId === cid)
+          .map(t => ({
+            turnId: t.turnId,
+            actionSlotId: 'slot-123',
+            continuationId: cid,
+            clientMessageId: t.clientMessageId,
+            parentSessionId: t.parentSessionId || 'sess-default',
+          }));
+        return { matches };
       },
       cohubSend: async (params) => {
         networkCalls += 1;
-        ctx.parentTurns.push({ turnId: 'turn-1', clientMessageId: params.clientMessageId, sequence: 6 });
+        ctx.parentTurns.push({ turnId: 'turn-1', clientMessageId: params.clientMessageId, parentSessionId: 'sess-default', sequence: 6 });
         return { turnId: 'turn-1', sequence: 6 };
       },
     });
@@ -99,7 +107,7 @@ describe('submit crash injection', () => {
         injectCrash: { at: 'during-send' },
         cohubSend: async (params) => {
           networkCalls += 1;
-          ctx.parentTurns.push({ turnId: 'turn-srv', clientMessageId: params.clientMessageId, sequence: 6 });
+          ctx.parentTurns.push({ turnId: 'turn-srv', clientMessageId: params.clientMessageId, parentSessionId: 'sess-parent', sequence: 6 });
           return { turnId: 'turn-srv', sequence: 6 };
         },
       })),
@@ -114,8 +122,16 @@ describe('submit crash injection', () => {
       goalInstance: 'test-goal',
       freshInspect: FRESH,
       reconcileByClientMessageId: async (cid) => {
-        const turn = ctx.parentTurns.find(t => t.clientMessageId === cid);
-        return turn ? { found: true, turnId: turn.turnId } : { found: false };
+        const matches = ctx.parentTurns
+          .filter(t => t.clientMessageId === cid)
+          .map(t => ({
+            turnId: t.turnId,
+            actionSlotId: 'slot-123',
+            continuationId: cid,
+            clientMessageId: t.clientMessageId,
+            parentSessionId: t.parentSessionId,
+          }));
+        return { matches };
       },
       cohubSend: async () => {
         networkCalls += 1;
@@ -148,7 +164,7 @@ describe('submit crash injection', () => {
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async () => ({ found: false }),
+      reconcileByClientMessageId: async () => ({ matches: [] }),
       cohubSend: async () => {
         throw new Error('must not resend on ambiguity');
       },
@@ -168,7 +184,7 @@ describe('submit crash injection', () => {
         injectCrash: { at: 'after-send' },
         cohubSend: async (params) => {
           networkCalls += 1;
-          ctx.parentTurns.push({ turnId: 'turn-done', clientMessageId: params.clientMessageId, sequence: 6 });
+          ctx.parentTurns.push({ turnId: 'turn-done', clientMessageId: params.clientMessageId, parentSessionId: 'sess-parent', sequence: 6 });
           return { turnId: 'turn-done', sequence: 6 };
         },
       })),
@@ -182,8 +198,16 @@ describe('submit crash injection', () => {
       goalInstance: 'test-goal',
       freshInspect: FRESH,
       reconcileByClientMessageId: async (cid) => {
-        const turn = ctx.parentTurns.find(t => t.clientMessageId === cid);
-        return turn ? { found: true, turnId: turn.turnId } : { found: false };
+        const matches = ctx.parentTurns
+          .filter(t => t.clientMessageId === cid)
+          .map(t => ({
+            turnId: t.turnId,
+            actionSlotId: 'slot-123',
+            continuationId: cid,
+            clientMessageId: t.clientMessageId,
+            parentSessionId: t.parentSessionId,
+          }));
+        return { matches };
       },
       cohubSend: async () => {
         networkCalls += 1;
@@ -214,7 +238,7 @@ describe('submit crash injection', () => {
         inputWatermark: 2,
         unconsumedEvents: [],
       }),
-      reconcileByClientMessageId: async () => ({ found: false }),
+      reconcileByClientMessageId: async () => ({ matches: [] }),
       cohubSend: async () => {
         throw new Error('must not send on stale snapshot');
       },
@@ -237,17 +261,17 @@ describe('submit crash injection', () => {
       ctx,
       goalInstance: 'test-goal',
       freshInspect: FRESH,
-      reconcileByClientMessageId: async () => ({ found: 'maybe' }), // malformed
+      reconcileByClientMessageId: async () => ({ found: 'maybe' }), // malformed - no matches array
       cohubSend: async () => {
         throw new Error('must not send');
       },
     });
 
     assert.strictEqual(result.error, 'BLOCKED_AMBIGUOUS_SEND');
-    assert.ok(result.reason.includes('malformed'));
+    assert.ok(result.reason.includes('matches'));
   });
 
-  it('SEND-06: reconciliation found=true but missing turnId → BLOCK', async () => {
+  it('SEND-06: reconciliation with matches array but missing required field → BLOCK', async () => {
     const ctx = makeCtx();
     ctx.ledger = [
       { phase: PHASES.OBSERVED, actionSlotId: 'slot-123', continuationId: 'cont-123', expectedSnapshotHash: 'a'.repeat(64), expectedParentSequence: 5, expectedInputWatermark: 2 },
@@ -256,10 +280,18 @@ describe('submit crash injection', () => {
     ];
 
     const result = await submitAction(submitParams(ctx, {
-      reconcileByClientMessageId: async () => ({ found: true }), // missing turnId
+      reconcileByClientMessageId: async () => ({
+        matches: [{
+          // missing turnId
+          actionSlotId: 'slot-123',
+          continuationId: 'cont-123',
+          clientMessageId: 'cont-123',
+          parentSessionId: 'sess-A',
+        }],
+      }),
     }));
 
     assert.strictEqual(result.error, 'BLOCKED_AMBIGUOUS_SEND');
-    assert.ok(result.reason.includes('turnId is missing'));
+    assert.ok(result.reason.includes('turnId'));
   });
 });
