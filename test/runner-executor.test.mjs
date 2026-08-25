@@ -529,10 +529,24 @@ test('createRunnerExecutor rejects Pi-family model errors even when the CLI exit
   assert.equal(result.error, 'provider unavailable');
 });
 
-test('createRunnerExecutor rejects incomplete Pi-family output even when the CLI exits zero', async () => {
-  for (const stdout of [
-    'not-json\n',
-    '{"type":"session","id":"pi-session","cwd":"/tmp/workspace"}\n',
+test('createRunnerExecutor rejects incomplete or aborted Pi-family output even when the CLI exits zero', async () => {
+  for (const { stdout, expectedError } of [
+    {
+      stdout: 'not-json\n',
+      expectedError: /Pi JSON stream/,
+    },
+    {
+      stdout: '{"type":"session","id":"pi-session","cwd":"/tmp/workspace"}\n',
+      expectedError: /Pi JSON stream/,
+    },
+    {
+      stdout: [
+        '{"type":"session","id":"pi-aborted","cwd":"/tmp/workspace"}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Partial output must not be delivered."}],"stopReason":"aborted"}}',
+        '',
+      ].join('\n'),
+      expectedError: /Pi-family turn ended with stop reason: aborted/,
+    },
   ]) {
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
@@ -573,7 +587,8 @@ test('createRunnerExecutor rejects incomplete Pi-family output even when the CLI
     });
 
     assert.equal(result.ok, false);
-    assert.match(result.error, /Pi JSON stream/);
+    assert.match(result.error, expectedError);
+    assert.deepEqual(result.finalAnswerMessages, []);
   }
 });
 

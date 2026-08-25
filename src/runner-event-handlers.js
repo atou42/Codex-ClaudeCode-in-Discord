@@ -166,7 +166,10 @@ export function handlePiFamilyRunnerEvent(event, state, ensureSessionBridge = ()
   if (!message || String(message.role || '').trim().toLowerCase() !== 'assistant') return;
   state.meta.piFamilyAssistantEnded = true;
 
-  const stopReason = String(message.stopReason || message.stop_reason || '').trim().toLowerCase();
+  const stopReason = normalizePiFamilyStopReason(message.stopReason || message.stop_reason);
+  state.meta.piFamilyStopReason = stopReason;
+  const continuesWithTools = stopReason === 'tooluse';
+  if (!continuesWithTools) state.meta.piFamilySawTerminalAssistant = true;
   if (stopReason === 'error') {
     const error = String(message.errorMessage || message.error_message || 'Pi-family model request failed').trim();
     state.meta.piFamilyError = error;
@@ -187,8 +190,14 @@ export function handlePiFamilyRunnerEvent(event, state, ensureSessionBridge = ()
   }
   for (const thinking of thinkingParts) appendUniqueText(state.reasonings, thinking);
   const text = textParts.join('\n\n').trim();
-  if (text) appendUniqueText(state.finalAnswerMessages, text);
+  if (text && continuesWithTools) appendUniqueText(state.messages, text);
+  else if (text && stopReason === 'stop') appendUniqueText(state.finalAnswerMessages, text);
+  else if (text) appendUniqueText(state.messages, text);
   if (message.usage && typeof message.usage === 'object') state.usage = message.usage;
+}
+
+function normalizePiFamilyStopReason(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 export function handleZCodeRunnerEvent(event, state) {

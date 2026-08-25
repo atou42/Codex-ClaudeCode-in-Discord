@@ -567,7 +567,13 @@ export function createRunnerExecutor({
           piFamilyProtocolError = String(meta.piFamilyError || '').trim();
           if (!piFamilyProtocolError && (!meta.piFamilySawSession || !threadId)) {
             piFamilyProtocolError = 'invalid Pi JSON stream: missing session header';
-          } else if (!piFamilyProtocolError && (!meta.piFamilyAssistantEnded || finalAnswerMessages.length === 0)) {
+          } else if (!piFamilyProtocolError && !meta.piFamilySawTerminalAssistant) {
+            piFamilyProtocolError = 'invalid Pi JSON stream: missing terminal assistant output';
+          } else if (!piFamilyProtocolError && meta.piFamilyStopReason !== 'stop') {
+            piFamilyProtocolError = meta.piFamilyStopReason
+              ? `Pi-family turn ended with stop reason: ${meta.piFamilyStopReason}`
+              : 'invalid Pi JSON stream: missing terminal stop reason';
+          } else if (!piFamilyProtocolError && finalAnswerMessages.length === 0) {
             piFamilyProtocolError = 'invalid Pi JSON stream: missing final assistant output';
           }
           if (piFamilyProtocolError && !logs.includes(piFamilyProtocolError)) logs.push(piFamilyProtocolError);

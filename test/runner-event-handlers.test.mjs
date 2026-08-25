@@ -115,6 +115,49 @@ test('handlePiFamilyRunnerEvent captures session header, reasoning, final text, 
   assert.deepEqual(state.usage, { input: 12, output: 3, totalTokens: 15 });
 });
 
+test('handlePiFamilyRunnerEvent keeps tool narration out of final answers', () => {
+  const state = {
+    messages: [],
+    finalAnswerMessages: [],
+    reasonings: [],
+    logs: [],
+    usage: null,
+    threadId: null,
+    meta: {},
+  };
+
+  handlePiFamilyRunnerEvent({
+    type: 'message_end',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Source files are ready. Building the renderer.' }],
+      stopReason: 'toolUse',
+    },
+  }, state, () => {});
+  handlePiFamilyRunnerEvent({
+    type: 'message_end',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Cleaning up an obsolete code block.' }],
+      stopReason: 'tool_use',
+    },
+  }, state, () => {});
+  handlePiFamilyRunnerEvent({
+    type: 'message_end',
+    message: {
+      role: 'assistant',
+      content: [],
+      stopReason: 'stop',
+    },
+  }, state, () => {});
+
+  assert.deepEqual(state.messages, [
+    'Source files are ready. Building the renderer.',
+    'Cleaning up an obsolete code block.',
+  ]);
+  assert.deepEqual(state.finalAnswerMessages, []);
+});
+
 test('handleGrokRunnerEvent assembles streaming text and requires the end session', () => {
   const state = {
     messages: [],

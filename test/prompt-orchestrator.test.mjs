@@ -1269,6 +1269,65 @@ test('createPromptOrchestrator.handlePrompt preserves the current session across
   assert.equal(runCount, 2);
 });
 
+test('createPromptOrchestrator.handlePrompt retries an OMP empty-final protocol failure', async () => {
+  let runCount = 0;
+  const harness = createOrchestrator({
+    runTask: async (options) => {
+      runCount += 1;
+      options.onSpawn?.({ pid: 658 });
+      if (runCount === 1) {
+        return {
+          ok: false,
+          cancelled: false,
+          timedOut: false,
+          error: 'invalid Pi JSON stream: missing final assistant output',
+          logs: ['invalid Pi JSON stream: missing final assistant output'],
+          notes: [],
+          reasonings: [],
+          messages: ['Inspecting the workspace.'],
+          finalAnswerMessages: [],
+          threadId: 'omp-session-1',
+          usage: null,
+        };
+      }
+      return {
+        ok: true,
+        cancelled: false,
+        timedOut: false,
+        error: '',
+        logs: [],
+        notes: [],
+        reasonings: [],
+        messages: ['Inspecting the workspace.'],
+        finalAnswerMessages: ['OMP completed the requested work.'],
+        threadId: 'omp-session-1',
+        usage: { input_tokens: 222 },
+      };
+    },
+    resolveTaskRetrySetting: () => ({ maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0, source: 'test' }),
+  });
+  harness.session.provider = 'omp';
+  harness.session.runnerSessionId = 'omp-session-1';
+  harness.session.codexThreadId = 'omp-session-1';
+  const message = {
+    id: 'msg-omp-empty-final-retry',
+    channel: {
+      async sendTyping() {},
+      async send() {},
+    },
+  };
+  const channelState = { queue: [], cancelRequested: false, activeRun: null };
+
+  const outcome = await harness.orchestrator.handlePrompt(message, 'thread-omp', 'continue', channelState);
+
+  assert.deepEqual(outcome, { ok: true, cancelled: false });
+  assert.equal(runCount, 2);
+  assert.equal(harness.session.runnerSessionId, 'omp-session-1');
+  assert.equal(harness.replyLog.length, 1);
+  assert.match(harness.replyLog[0], /OMP completed the requested work\./);
+  assert.doesNotMatch(harness.replyLog[0], /Inspecting the workspace\./);
+});
+
 test('createPromptOrchestrator.handlePrompt does not retry a missing bound Claude session', async () => {
   let runCount = 0;
   const harness = createOrchestrator({
