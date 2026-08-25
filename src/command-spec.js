@@ -390,23 +390,37 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
           .addStringOption(o => o.setName('question').setDescription('start 时要问的问题').setRequired(false));
       },
     },
-    (!lockedProvider || lockedProvider === 'codex') && {
+    (!lockedProvider || ['codex', 'grok', 'zcode', 'omp'].includes(lockedProvider)) && {
       name: 'goal',
-      description: '管理当前 Codex session 的持久目标；active 时会自动续跑',
+      description: lockedProvider === 'codex'
+        ? '管理当前 Codex session 的持久目标；active 时会自动续跑'
+        : '管理当前 session 的原生 goal',
       configure(builder) {
-        return builder
-          .addStringOption(o => o.setName('action').setDescription('goal 操作').setRequired(true)
-            .addChoices(
-              { name: 'status 查当前 goal', value: 'status' },
+        const actionChoices = ['grok', 'zcode', 'omp'].includes(lockedProvider)
+          ? [
               { name: 'set 设置 goal', value: 'set' },
+              { name: 'status 查当前 goal', value: 'status' },
+              { name: 'pause 暂停 goal', value: 'pause' },
+              { name: 'resume 恢复 goal', value: 'resume' },
+              { name: 'clear 清除 goal', value: 'clear' },
+            ]
+          : [
+              { name: 'set 设置 goal', value: 'set' },
+              { name: 'status 查当前 goal', value: 'status' },
               { name: 'pause 标记暂停', value: 'pause' },
               { name: 'resume 标记进行中', value: 'resume' },
               { name: 'done 标记完成', value: 'done' },
               { name: 'clear 清除 goal', value: 'clear' },
               { name: 'budget 设置预算', value: 'budget' },
-            ))
-          .addStringOption(o => o.setName('objective').setDescription('set 时填写目标；带附件请用普通消息 !goal').setRequired(false))
-          .addStringOption(o => o.setName('token_budget').setDescription('token 预算，如 120000；clear 清除预算').setRequired(false));
+            ];
+        let configured = builder
+          .addStringOption(o => o.setName('action').setDescription('goal 操作；留空默认 set').setRequired(false)
+            .addChoices(...actionChoices))
+          .addStringOption(o => o.setName('objective').setDescription('set 时填写目标').setRequired(false));
+        if (!lockedProvider || lockedProvider === 'codex' || lockedProvider === 'grok') {
+          configured = configured.addStringOption(o => o.setName('token_budget').setDescription('token 预算，如 120000；clear 清除预算').setRequired(false));
+        }
+        return configured;
       },
     },
     {

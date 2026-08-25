@@ -117,9 +117,10 @@ test('buildSlashCommands includes workspace commands and aliases', () => {
 
   const goal = commands.find((command) => command.name === 'cx_goal');
   assert.deepEqual(goal.options.map((option) => option.name), ['action', 'objective', 'token_budget']);
+  assert.equal(goal.options[0].required, false);
   assert.deepEqual(goal.options[0].choices.map((choice) => choice.value), [
-    'status',
     'set',
+    'status',
     'pause',
     'resume',
     'done',
@@ -209,4 +210,39 @@ test('buildSlashCommands narrows locked-provider surfaces to native aliases and 
     'enabled',
     'reset',
   ]);
+});
+
+test('buildSlashCommands registers fork for locked Grok', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'grok',
+    botProvider: 'grok',
+  }).map((command) => command.toJSON());
+
+  assert.ok(commands.some((command) => command.name === 'grok_fork'));
+});
+
+test('buildSlashCommands registers native goal actions for locked Grok, ZCode, and OMP', () => {
+  for (const provider of ['grok', 'zcode', 'omp']) {
+    const commands = buildSlashCommands({
+      SlashCommandBuilder: MockSlashCommandBuilder,
+      slashPrefix: provider,
+      botProvider: provider,
+    }).map((command) => command.toJSON());
+    const goal = commands.find((command) => command.name === `${provider}_goal`);
+
+    assert.ok(goal);
+    assert.equal(goal.options[0].required, false);
+    assert.deepEqual(goal.options[0].choices.map((choice) => choice.value), [
+      'set',
+      'status',
+      'pause',
+      'resume',
+      'clear',
+    ]);
+    assert.deepEqual(
+      goal.options.map((option) => option.name),
+      provider === 'grok' ? ['action', 'objective', 'token_budget'] : ['action', 'objective'],
+    );
+  }
 });

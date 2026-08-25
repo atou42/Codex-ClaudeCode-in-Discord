@@ -1214,6 +1214,49 @@ test('createSlashCommandRouter sets a Codex goal from slash objective fields', a
   assert.match(queuedPrompts[0].content, /Continue working toward the active Codex goal/);
 });
 
+test('createSlashCommandRouter defaults goal action to set when only objective is provided', async () => {
+  const goalCalls = [];
+  const state = createRouterState({
+    getSessionId: () => 'thread-1',
+    async setCodexThreadGoal(options) {
+      goalCalls.push(options);
+      return {
+        goal: {
+          threadId: options.threadId,
+          objective: options.objective,
+          status: options.status,
+          tokenBudget: options.tokenBudget,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      };
+    },
+    async enqueuePrompt() {
+      return { ok: true, enqueued: true, queuedAhead: 0 };
+    },
+  });
+
+  const handled = await state.router({
+    interaction: createInteraction('cx_goal', {
+      objective: 'ship Discord goal command',
+    }),
+    commandName: 'goal',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(goalCalls, [{
+    threadId: 'thread-1',
+    objective: 'ship Discord goal command',
+    status: 'active',
+  }]);
+  assert.match(state.replies[0].content, /goal 已设置/);
+});
+
 test('createSlashCommandRouter sets a Codex goal from modal submit', async () => {
   const goalCalls = [];
   const replies = [];
@@ -1342,7 +1385,7 @@ test('createSlashCommandRouter rejects Codex goal without a bound session', asyn
   assert.match(state.replies[0].content, /还没有绑定 Codex session/);
 });
 
-test('createSlashCommandRouter rejects goal for non-codex providers', async () => {
+test('createSlashCommandRouter rejects goal for providers without a headless-safe native command', async () => {
   const state = createRouterState({
     async getCodexThreadGoal() {
       throw new Error('should not call app-server');
@@ -1359,7 +1402,104 @@ test('createSlashCommandRouter rejects goal for non-codex providers', async () =
   });
 
   assert.equal(handled, true);
-  assert.match(state.replies[0].content, /goal 只支持 Codex/);
+  assert.match(state.replies[0].content, /不能从 Discord 安全调用原生 goal/);
+});
+
+test('createSlashCommandRouter defaults Grok goal to native set and queues the exact command', async () => {
+  const queuedPrompts = [];
+  const state = createRouterState({
+    resolveSecurityContext: () => ({ profile: 'team' }),
+    async enqueuePrompt(message, key, content, securityContext) {
+      queuedPrompts.push({ message, key, content, securityContext });
+      return { ok: true, enqueued: true, queuedAhead: 0 };
+    },
+  });
+  state.session.provider = 'grok';
+
+  const handled = await state.router({
+    interaction: createInteraction('cx_goal', {
+      objective: 'ship Discord goal command',
+      token_budget: '90000',
+    }),
+    commandName: 'goal',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(queuedPrompts.length, 1);
+  assert.equal(queuedPrompts[0].key, 'channel-1');
+  assert.equal(queuedPrompts[0].content, '/goal ship Discord goal command --budget 90000');
+  assert.equal(queuedPrompts[0].message.providerControlCommand, true);
+  assert.deepEqual(queuedPrompts[0].securityContext, { profile: 'team' });
+  assert.match(state.replies[0].content, /grok goal set 已开始/);
+});
+
+test('createSlashCommandRouter maps ZCode status to its native empty goal command', async () => {
+  const queuedPrompts = [];
+  const state = createRouterState({
+    async enqueuePrompt(message, key, content) {
+      queuedPrompts.push({ message, key, content });
+      return { ok: true, enqueued: true, queuedAhead: 2 };
+    },
+  });
+  state.session.provider = 'zcode';
+
+  const handled = await state.router({
+    interaction: createInteraction('cx_goal', { action: 'status' }),
+    commandName: 'goal',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(queuedPrompts[0].content, '/goal');
+  assert.match(state.replies[0].content, /前面还有 2 个任务/);
+});
+
+test('createSlashCommandRouter defaults OMP goal to native set in its interactive session', async () => {
+  const queuedPrompts = [];
+  const state = createRouterState({
+    async enqueuePrompt(message, key, content) {
+      queuedPrompts.push({ message, key, content });
+      return { ok: true, enqueued: true, queuedAhead: 0 };
+    },
+  });
+  state.session.provider = 'omp';
+
+  const handled = await state.router({
+    interaction: createInteraction('omp_goal', { objective: 'ship Discord goal command' }),
+    commandName: 'goal',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(queuedPrompts[0].content, '/goal set ship Discord goal command');
+  assert.equal(queuedPrompts[0].message.providerControlCommand, true);
+  assert.match(state.replies[0].content, /omp goal set 已开始/);
+});
+
+test('createSlashCommandRouter reports native goal queue failures explicitly', async () => {
+  const state = createRouterState({
+    async enqueuePrompt() {
+      return { ok: false, enqueued: false, reason: 'queue_full' };
+    },
+  });
+  state.session.provider = 'grok';
+
+  await state.router({
+    interaction: createInteraction('cx_goal', { objective: 'ship it' }),
+    commandName: 'goal',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.match(state.replies[0].content, /queue_full/);
 });
 
 test('createSlashCommandRouter routes abort alias to cancel handler', async () => {

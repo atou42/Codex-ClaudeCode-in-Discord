@@ -25,6 +25,12 @@ import {
   shouldStartCodexGoalContinuation,
 } from './codex-goal-flow.js';
 import {
+  buildProviderGoalCommand,
+  formatProviderGoalQueueResult,
+  parseProviderGoalSlashInput,
+  providerSupportsNativeGoalSlash,
+} from './provider-goal-flow.js';
+import {
   formatProjectUpgradeReport,
   parseProjectUpgradeSlashInput,
 } from './project-upgrade.js';
@@ -51,7 +57,7 @@ function registerSlashHandlers(map, names, handler) {
   }
 }
 
-function createInteractionPromptMessage(interaction) {
+function createInteractionPromptMessage(interaction, { providerControlCommand = false } = {}) {
   return {
     id: interaction.id,
     channel: interaction.channel,
@@ -59,6 +65,7 @@ function createInteractionPromptMessage(interaction) {
     author: interaction.user,
     client: interaction.client || interaction.channel?.client,
     reactions: { cache: new Map() },
+    providerControlCommand,
     react: async () => {},
     reply: async (payload) => {
       if (typeof interaction.channel?.send === 'function') {
@@ -882,7 +889,52 @@ export function createSlashCommandRouter({
   registerSlashHandlers(handlers, ['goal'], async ({ interaction, key, session, respond }) => {
     const language = getSessionLanguage(session);
     const provider = getSessionProvider(session);
-    const rawAction = String(interaction.options.getString('action') || 'status').trim().toLowerCase();
+    const rawAction = String(interaction.options.getString('action') || 'set').trim().toLowerCase();
+    if (providerSupportsNativeGoalSlash(provider)) {
+      try {
+        const action = parseProviderGoalSlashInput({
+          provider,
+          action: rawAction,
+          objective: interaction.options.getString('objective') || '',
+          tokenBudget: interaction.options.getString('token_budget') || '',
+        });
+        if (typeof enqueuePrompt !== 'function') {
+          throw new Error('goal queue is unavailable');
+        }
+        const queued = await enqueuePrompt(
+          createInteractionPromptMessage(interaction, { providerControlCommand: true }),
+          key,
+          buildProviderGoalCommand(action),
+          typeof resolveSecurityContext === 'function'
+            ? resolveSecurityContext(interaction.channel, session)
+            : null,
+        );
+        if (!queued?.enqueued) {
+          throw new Error(queued?.reason || 'goal command was not queued');
+        }
+        await respond({
+          content: formatProviderGoalQueueResult({
+            provider: action.provider,
+            action: action.action,
+            queuedAhead: queued.queuedAhead,
+          }, language),
+          flags: 64,
+        });
+      } catch (err) {
+        await respond({
+          content: `${getProviderDisplayName(provider)} goal 失败：${formatError(err)}`,
+          flags: 64,
+        });
+      }
+      return;
+    }
+    if (provider !== 'codex') {
+      await respond({
+        content: `${getProviderDisplayName(provider)} 当前不能从 Discord 安全调用原生 goal。`,
+        flags: 64,
+      });
+      return;
+    }
     const action = parseCodexGoalSlashInput({
       action: rawAction,
       objective: interaction.options.getString('objective') || '',
