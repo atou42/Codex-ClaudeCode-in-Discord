@@ -739,37 +739,189 @@ function extractObservedModel(event) {
   return '';
 }
 
-function normalizeGrokProgressEvent(event, toolCalls) {
+const GROK_NORMALIZED_PROGRESS_EVENT = '__grokNormalizedProgressEvent';
+
+function normalizeGrokToolArgs(event, tracked = {}) {
+  const rawInput = event?.rawInput && typeof event.rawInput === 'object' && !Array.isArray(event.rawInput)
+    ? event.rawInput
+    : {};
+  const metadataInput = event?._meta?.['x.ai/tool']?.input;
+  const args = {
+    ...(tracked.args && typeof tracked.args === 'object' ? tracked.args : {}),
+    ...(metadataInput && typeof metadataInput === 'object' && !Array.isArray(metadataInput) ? metadataInput : {}),
+    ...rawInput,
+  };
+  const locationPath = Array.isArray(event?.locations)
+    ? String(event.locations.find((location) => String(location?.path || '').trim())?.path || '').trim()
+    : '';
+  const filePath = String(args.path || args.file_path || args.target_file || locationPath || '').trim();
+  if (filePath && !args.path && !args.file_path) args.path = filePath;
+  const title = String(event?.title || '').trim();
+  const genericTitle = String(
+    event?.toolName
+      || event?.tool_name
+      || event?._meta?.['x.ai/tool']?.name
+      || tracked.toolName
+      || '',
+  ).trim();
+  if (!args.description && title && title !== genericTitle && /[`/\\\s]/.test(title)) {
+    args.description = title;
+  }
+  return args;
+}
+
+function normalizeGrokToolName(event, tracked = {}) {
+  return String(
+    event?.toolName
+      || event?.tool_name
+      || event?._meta?.['x.ai/tool']?.name
+      || tracked.toolName
+      || event?.title
+      || 'tool',
+  ).trim() || 'tool';
+}
+
+function hasMeaningfulGrokToolDetails(args) {
+  if (!args || typeof args !== 'object') return false;
+  return [
+    args.description,
+    args.command,
+    args.cmd,
+    args.path,
+    args.file_path,
+    args.target_file,
+    args.query,
+    args.q,
+    args.url,
+    args.pattern,
+  ].some((value) => String(value || '').trim());
+}
+
+function summarizeGrokToolIntent(toolName, args) {
+  const description = String(args?.description || '').trim();
+  if (description) return description;
+  const normalizedToolName = String(toolName || '').trim().toLowerCase();
+  const filePath = String(args?.path || args?.file_path || args?.target_file || '').trim();
+  if (filePath) {
+    if (normalizedToolName.includes('read')) return `Read ${filePath}`;
+    if (normalizedToolName.includes('list')) return `Inspect ${filePath}`;
+    return `Use ${filePath}`;
+  }
+  const command = String(args?.command || args?.cmd || '').replace(/\s+/g, ' ').trim();
+  if (command) return `Run ${command}`;
+  const query = String(args?.query || args?.q || args?.pattern || '').replace(/\s+/g, ' ').trim();
+  if (query) return `Search ${query}`;
+  const url = String(args?.url || '').trim();
+  if (url) return `Open ${url}`;
+  return '';
+}
+
+function createNormalizedGrokEvent(event) {
+  return {
+    ...event,
+    [GROK_NORMALIZED_PROGRESS_EVENT]: true,
+  };
+}
+
+function takeGrokNarration(progressState) {
+  const text = String(progressState.textBuffer || '').trim();
+  progressState.textBuffer = '';
+  if (!text) return null;
+  return createNormalizedGrokEvent({
+    type: 'assistant_message',
+    message: text,
+    phase: 'commentary',
+  });
+}
+
+function normalizeGrokProgressEvents(event, progressState) {
   const type = String(event?.type || '').trim().toLowerCase();
+  if (type === 'text') {
+    progressState.textBuffer = `${progressState.textBuffer || ''}${String(event?.data || '')}`;
+    return [];
+  }
+  if (type === 'thought' || type === 'usage' || type === 'available_commands' || type === 'end') {
+    if (type === 'end') progressState.textBuffer = '';
+    return [];
+  }
   if (type === 'tool_call') {
     const toolCallId = String(event?.toolCallId || event?.tool_call_id || '').trim();
-    const toolName = String(event?.toolName || event?.tool_name || event?.title || 'tool').trim() || 'tool';
-    const args = event?.rawInput && typeof event.rawInput === 'object' ? event.rawInput : {};
-    if (toolCallId) toolCalls.set(toolCallId, { toolName, args });
-    return {
-      type: 'tool_execution_start',
-      toolCallId,
+    const tracked = progressState.toolCalls.get(toolCallId) || {};
+    const toolName = normalizeGrokToolName(event, tracked);
+    const args = normalizeGrokToolArgs(event, tracked);
+    const nextTracked = {
+      ...tracked,
       toolName,
-      tool_name: toolName,
       args,
-      intent: String(args.description || '').trim(),
+      intent: summarizeGrokToolIntent(toolName, args),
     };
+    const normalized = [];
+    const narration = takeGrokNarration(progressState);
+    if (narration) normalized.push(narration);
+    if (hasMeaningfulGrokToolDetails(args)) {
+      nextTracked.reportedStart = true;
+      normalized.push(createNormalizedGrokEvent({
+        type: 'tool_execution_start',
+        toolCallId,
+        toolName,
+        tool_name: toolName,
+        args,
+        intent: nextTracked.intent,
+      }));
+    }
+    if (toolCallId) progressState.toolCalls.set(toolCallId, nextTracked);
+    return normalized;
   }
-  if (type !== 'tool_call_update') return event;
-
-  const toolCallId = String(event?.toolCallId || event?.tool_call_id || '').trim();
-  const tracked = toolCalls.get(toolCallId) || {};
-  const status = String(event?.status || '').trim().toLowerCase();
-  if (!status) return null;
-  if (['completed', 'failed', 'cancelled', 'canceled'].includes(status)) toolCalls.delete(toolCallId);
-  return {
-    type: 'tool_result',
-    toolCallId,
-    toolName: tracked.toolName || 'tool',
-    tool_name: tracked.toolName || 'tool',
-    status,
-    args: tracked.args || {},
-  };
+  if (type === 'tool_call_update') {
+    const toolCallId = String(event?.toolCallId || event?.tool_call_id || '').trim();
+    const tracked = progressState.toolCalls.get(toolCallId) || {};
+    const toolName = normalizeGrokToolName(event, tracked);
+    const args = normalizeGrokToolArgs(event, tracked);
+    const status = String(event?.status || '').trim().toLowerCase();
+    const nextTracked = {
+      ...tracked,
+      toolName,
+      args,
+      intent: summarizeGrokToolIntent(toolName, args),
+    };
+    const normalized = [];
+    if (!nextTracked.reportedStart && hasMeaningfulGrokToolDetails(args)) {
+      nextTracked.reportedStart = true;
+      normalized.push(createNormalizedGrokEvent({
+        type: 'tool_execution_start',
+        toolCallId,
+        toolName,
+        tool_name: toolName,
+        args,
+        intent: nextTracked.intent,
+      }));
+    }
+    if (status) {
+      normalized.push(createNormalizedGrokEvent({
+        type: 'tool_result',
+        toolCallId,
+        toolName,
+        tool_name: toolName,
+        status,
+        args,
+        intent: nextTracked.intent,
+      }));
+    }
+    if (['completed', 'failed', 'cancelled', 'canceled'].includes(status)) {
+      progressState.toolCalls.delete(toolCallId);
+    } else if (toolCallId) {
+      progressState.toolCalls.set(toolCallId, nextTracked);
+    }
+    return normalized;
+  }
+  if (type === 'error') {
+    const narration = takeGrokNarration(progressState);
+    return [
+      ...(narration ? [narration] : []),
+      createNormalizedGrokEvent(event),
+    ];
+  }
+  return [];
 }
 
 function formatModelValue(modelSetting, language = 'en') {
@@ -891,7 +1043,10 @@ export function createPromptProgressReporterFactory({
     let isEmitting = false;
     let rerunEmit = false;
     let observedModel = '';
-    const grokToolCalls = new Map();
+    const grokProgressState = {
+      textBuffer: '',
+      toolCalls: new Map(),
+    };
     let lastOmpStageKey = '';
     let parentAttentionNotified = false;
     const isDuplicateProgressEvent = createProgressEventDeduper({
@@ -1257,15 +1412,17 @@ export function createPromptProgressReporterFactory({
           observedModelChanged = true;
         }
       }
-      if (normalizedProvider === 'grok') {
-        event = normalizeGrokProgressEvent(event, grokToolCalls);
-        if (!event) {
+      if (normalizedProvider === 'grok' && !event?.[GROK_NORMALIZED_PROGRESS_EVENT]) {
+        const normalizedEvents = normalizeGrokProgressEvents(event, grokProgressState);
+        if (!normalizedEvents.length) {
           if (observedModelChanged) {
             syncActiveRun();
             void emit(false);
           }
           return;
         }
+        for (const normalizedEvent of normalizedEvents) onEvent(normalizedEvent);
+        return;
       }
       if (session?.provider === 'omp') {
         // OMP emits one message_update event per token, followed by a complete
@@ -1331,6 +1488,7 @@ export function createPromptProgressReporterFactory({
         codexSubagentDisplayNameTracker.capture(event);
       }
       const codexProgressOptions = {
+        provider: normalizedProvider,
         subagentDisplayNames: codexSubagentDisplayNameTracker.snapshot(),
       };
       const summaryStep = providerProgress?.summaryStep || summarizeCodexEvent(event, codexProgressOptions);

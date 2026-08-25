@@ -859,6 +859,12 @@ export function summarizeCodexEvent(ev, options = {}) {
     case 'tool_result': {
       const toolName = extractDirectToolName(ev) || 'tool';
       const phase = normalizeStatus(ev.status || '') || 'completed';
+      if (normalizeEventType(options.provider || '') === 'grok') {
+        const intent = extractToolExecutionIntent(ev, options);
+        if (intent) return `${intent} ${phase}`;
+        const detail = summarizeKnownArgObject(ev.args || {}, options);
+        if (detail) return `${detail} ${phase}`;
+      }
       return `tool ${toolName} ${phase}`;
     }
     case 'item_started':
@@ -1310,6 +1316,12 @@ export function extractRawProgressTextFromEvent(ev, options = {}) {
   if (type === 'tool_result') {
     const status = normalizeStatus(ev.status || '');
     if (status === 'completed') {
+      if (normalizeEventType(options.provider || '') === 'grok') {
+        const intent = extractToolExecutionIntent(ev, options);
+        if (intent) return intent;
+        const detail = summarizeKnownArgObject(ev.args || {}, options);
+        if (detail) return detail;
+      }
       const toolName = extractDirectToolName(ev) || 'tool';
       return `tool ${toolName}`;
     }
@@ -1658,6 +1670,12 @@ export function extractCompletedStepFromEvent(ev, options = {}) {
   if (type === 'tool_result') {
     const status = normalizeStatus(ev.status || '');
     if (status !== 'completed') return '';
+    if (normalizeEventType(opts.provider || '') === 'grok') {
+      const intent = extractToolExecutionIntent(ev, opts);
+      if (intent) return intent;
+      const detail = summarizeKnownArgObject(ev.args || {}, opts);
+      if (detail) return detail;
+    }
     const toolName = extractDirectToolName(ev) || 'tool';
     return `tool ${toolName}`;
   }

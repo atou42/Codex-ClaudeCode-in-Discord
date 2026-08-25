@@ -787,8 +787,134 @@ test('createPromptProgressReporterFactory shows Grok tool lifecycle and observed
   const finalCard = harness.edits.at(-1).content;
   assert.equal(session.lastObservedModel, 'grok-4.6-build');
   assert.match(finalCard, /• model: `grok-4\.6-build` \(runtime observed\)/);
-  assert.match(finalCard, /run_terminal_command/);
-  assert.match(finalCard, /completed/);
+  assert.match(finalCard, /Inspect current directory/);
+  assert.doesNotMatch(finalCard, /tool run_terminal_command/);
+  assert.match(finalCard, /Task Completed/);
+});
+
+test('createPromptProgressReporterFactory streams Grok pre-tool narration without exposing thought events', async () => {
+  const harness = createHarness({
+    session: { provider: 'grok', model: null },
+    factoryOptions: {
+      presentation: createRealPresentation(),
+    },
+  });
+
+  await harness.reporter.start();
+  harness.channelState.activeRun.phase = 'exec';
+  harness.reporter.onEvent({
+    type: 'thought',
+    data: 'The user wants me to inspect the related context before answering.',
+  });
+  harness.reporter.onEvent({ type: 'text', data: '先把 Codex 会话、个人 wiki ' });
+  harness.reporter.onEvent({ type: 'text', data: '和组织上下文对上，确认 agents weekly 实际在做什么。' });
+
+  assert.deepEqual(harness.streamed, []);
+
+  harness.reporter.onEvent({
+    type: 'tool_call',
+    toolCallId: 'call-grok-read-1',
+    toolName: 'read_file',
+    title: 'Read',
+    kind: 'read',
+    status: 'in_progress',
+    rawInput: {
+      target_file: '/Users/atou/personal-wiki/_meta/index.md',
+      limit: 150,
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(harness.streamed, [
+    '先把 Codex 会话、个人 wiki 和组织上下文对上，确认 agents weekly 实际在做什么。',
+  ]);
+  assert.doesNotMatch(harness.edits.at(-1).content, /latest activity: thought/);
+  assert.doesNotMatch(harness.edits.at(-1).content, /process content:\n\s+· thought/);
+  assert.match(harness.edits.at(-1).content, /personal-wiki\/_meta\/index\.md/);
+
+  harness.reporter.onEvent({
+    type: 'tool_call_update',
+    toolCallId: 'call-grok-read-1',
+    status: 'completed',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.doesNotMatch(harness.edits.at(-1).content, /tool read_file/);
+
+  harness.reporter.onEvent({ type: 'text', data: '这是最终回答，不应进入过程消息。' });
+  harness.reporter.onEvent({
+    type: 'end',
+    stopReason: 'end_turn',
+    sessionId: 'grok-session-real-shape',
+  });
+  await harness.reporter.finish({ ok: true });
+
+  assert.deepEqual(harness.streamed, [
+    '先把 Codex 会话、个人 wiki 和组织上下文对上，确认 agents weekly 实际在做什么。',
+  ]);
+});
+
+test('createPromptProgressReporterFactory enriches Grok tools from update metadata and exposes failures', async () => {
+  const harness = createHarness({
+    session: { provider: 'grok', model: null },
+    factoryOptions: {
+      presentation: createRealPresentation(),
+    },
+  });
+
+  await harness.reporter.start();
+  harness.channelState.activeRun.phase = 'exec';
+  harness.reporter.onEvent({
+    type: 'tool_call',
+    toolCallId: 'call-grok-shell-1',
+    title: 'run_terminal_command',
+    status: 'pending',
+    rawInput: {},
+  });
+  harness.reporter.onEvent({
+    type: 'tool_call_update',
+    toolCallId: 'call-grok-shell-1',
+    title: 'Execute `npm test`',
+    kind: 'execute',
+    rawInput: {
+      variant: 'Bash',
+      command: 'npm test',
+      description: 'Run the project test suite',
+    },
+  });
+  harness.reporter.onEvent({
+    type: 'tool_call_update',
+    toolCallId: 'call-grok-shell-1',
+    status: 'failed',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const card = harness.edits.at(-1).content;
+  assert.match(card, /Run the project test suite/);
+  assert.match(card, /failed/);
+  assert.doesNotMatch(card, /tool run_terminal_command/);
+  assert.deepEqual(harness.streamed, []);
+});
+
+test('createPromptProgressReporterFactory ignores unknown and known low-signal Grok events', async () => {
+  const harness = createHarness({
+    session: { provider: 'grok', model: null },
+    factoryOptions: {
+      presentation: createRealPresentation(),
+    },
+  });
+
+  await harness.reporter.start();
+  harness.channelState.activeRun.phase = 'exec';
+  harness.reporter.onEvent({ type: 'available_commands', tools: [], commands: [] });
+  harness.reporter.onEvent({ type: 'usage', stopReason: 'tool_use', usage: { input_tokens: 10 } });
+  harness.reporter.onEvent({ type: 'phase_changed', phase: 'waiting_for_model' });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(harness.channelState.activeRun.progressEvents, 0);
+  assert.deepEqual(harness.channelState.activeRun.recentActivities, []);
+  assert.deepEqual(harness.streamed, []);
+  assert.deepEqual(harness.edits, []);
 });
 
 test('createPromptProgressReporterFactory shows resolved default model instead of provider default text', async () => {
