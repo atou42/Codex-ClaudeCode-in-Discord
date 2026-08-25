@@ -97,7 +97,8 @@ function readGrokSessionSummary(summaryPath) {
   const summary = readJsonFile(summaryPath);
   if (!summary || typeof summary !== 'object') return null;
   const sessionDir = path.dirname(summaryPath);
-  const id = String(summary.id || summary.sessionId || summary.session_id || path.basename(sessionDir)).trim();
+  const info = summary.info && typeof summary.info === 'object' ? summary.info : {};
+  const id = String(summary.id || summary.sessionId || summary.session_id || info.id || path.basename(sessionDir)).trim();
   if (!id) return null;
   const encodedCwd = path.basename(path.dirname(sessionDir));
   let decodedCwd = '';
@@ -112,6 +113,7 @@ function readGrokSessionSummary(summaryPath) {
       || summary.working_directory
       || summary.workspaceDir
       || summary.workspace_dir
+      || info.cwd
       || decodedCwd,
   ).trim();
   return { id, cwd, summary, file: summaryPath };

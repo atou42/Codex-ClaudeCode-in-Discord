@@ -6,6 +6,7 @@ import {
   createProviderForkThread,
   formatCodexForkResult,
   parseForkTextInput,
+  providerSupportsNativeFork,
 } from '../src/codex-fork-flow.js';
 
 function createForkSource() {
@@ -453,6 +454,179 @@ test('createProviderForkThread refuses Claude fork when parent workspace cannot 
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'fork_workspace_unavailable');
   assert.equal(createdThread, false);
+});
+
+test('createProviderForkThread prepares Grok fork without mutating the parent session', async () => {
+  const parentSession = { provider: 'grok', runnerSessionId: 'parent-session' };
+  const childSession = { provider: 'grok', runnerSessionId: null };
+  const threadMessages = [];
+  let observedBinding = null;
+  let observedFork = null;
+  const result = await createProviderForkThread({
+    key: 'parent-channel',
+    session: parentSession,
+    source: createForkSource(),
+    provider: 'grok',
+    parentSessionId: 'parent-session',
+    resolveForkWorkspace: () => '/repo/parent-workspace',
+    prepareForkWorkspace: () => '/repo/fork-workspace',
+    async forkGrokSession(options) {
+      observedFork = options;
+      return {
+        sessionId: 'child-session',
+        parentSessionId: 'parent-session',
+        cwd: '/repo/fork-workspace',
+      };
+    },
+    createThread: async () => ({
+      id: 'child-channel',
+      async setName() {},
+      async send(payload) { threadMessages.push(payload); },
+    }),
+    getSession: () => childSession,
+    commandActions: {
+      bindForkedSession(currentSession, binding) {
+        observedBinding = binding;
+        currentSession.runnerSessionId = binding.sessionId;
+        currentSession.forkedFromProvider = binding.provider;
+        currentSession.forkedFromSessionId = binding.parentSessionId;
+        currentSession.pendingForkFromSessionId = binding.pendingForkFromSessionId;
+        return binding;
+      },
+    },
+  });
+
+  assert.equal(providerSupportsNativeFork('grok'), true);
+  assert.equal(result.ok, true);
+  assert.equal(result.provider, 'grok');
+  assert.equal(result.forkedSessionId, 'child-session');
+  assert.deepEqual(observedFork, {
+    sourceSessionId: 'parent-session',
+    sourceCwd: '/repo/parent-workspace',
+    newCwd: '/repo/fork-workspace',
+  });
+  assert.equal(parentSession.runnerSessionId, 'parent-session');
+  assert.equal(childSession.runnerSessionId, 'child-session');
+  assert.equal(childSession.workspaceDir, '/repo/fork-workspace');
+  assert.equal(observedBinding.workspaceDir, '/repo/fork-workspace');
+  assert.equal(childSession.forkedFromProvider, 'grok');
+  assert.equal(childSession.forkedFromSessionId, 'parent-session');
+  assert.equal(childSession.pendingForkFromSessionId, null);
+  assert.match(threadMessages[0].content, /^<@user-1> 这是从 Grok session `parent-session` fork 过来的。/);
+});
+
+test('createProviderForkThread refuses Grok fork before creating a thread when parent workspace is missing', async () => {
+  let createdThread = false;
+  const result = await createProviderForkThread({
+    key: 'parent-channel',
+    session: { provider: 'grok', runnerSessionId: 'parent-session' },
+    source: createForkSource(),
+    provider: 'grok',
+    parentSessionId: 'parent-session',
+    forkGrokSession: async () => ({ sessionId: 'child-session' }),
+    resolveForkWorkspace: () => null,
+    createThread: async () => {
+      createdThread = true;
+      return { id: 'child-channel' };
+    },
+    getSession: () => ({ provider: 'grok' }),
+    commandActions: { bindForkedSession() {} },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'fork_workspace_unavailable');
+  assert.equal(createdThread, false);
+});
+
+test('createProviderForkThread deletes an unbound Grok thread when session binding fails', async () => {
+  const deleted = [];
+  await assert.rejects(
+    () => createProviderForkThread({
+      key: 'parent-channel',
+      session: { provider: 'grok', runnerSessionId: 'parent-session' },
+      source: createForkSource(),
+      provider: 'grok',
+      parentSessionId: 'parent-session',
+      resolveForkWorkspace: () => '/repo/parent-workspace',
+      prepareForkWorkspace: () => '/repo/fork-workspace',
+      forkGrokSession: async () => ({
+        sessionId: 'child-session',
+        parentSessionId: 'parent-session',
+        cwd: '/repo/fork-workspace',
+      }),
+      createThread: async () => ({
+        id: 'child-channel',
+        async setName() {},
+        async delete(reason) { deleted.push(reason); },
+      }),
+      getSession: () => ({ provider: 'grok' }),
+      commandActions: {
+        bindForkedSession() { throw new Error('session persistence failed'); },
+      },
+    }),
+    /session persistence failed/,
+  );
+
+  assert.deepEqual(deleted, ['grok fork failed before session binding']);
+});
+
+test('createProviderForkThread deletes the child thread when native Grok fork fails', async () => {
+  const deleted = [];
+  await assert.rejects(
+    () => createProviderForkThread({
+      key: 'parent-channel',
+      session: { provider: 'grok', runnerSessionId: 'parent-session' },
+      source: createForkSource(),
+      provider: 'grok',
+      parentSessionId: 'parent-session',
+      resolveForkWorkspace: () => '/repo/parent-workspace',
+      prepareForkWorkspace: () => '/repo/fork-workspace',
+      createThread: async () => ({
+        id: 'child-channel',
+        async delete(reason) { deleted.push(reason); },
+      }),
+      forkGrokSession: async () => { throw new Error('native Grok fork failed'); },
+      getSession: () => ({ provider: 'grok' }),
+      commandActions: { bindForkedSession() {} },
+    }),
+    /native Grok fork failed/,
+  );
+
+  assert.deepEqual(deleted, ['Grok fork failed before session binding']);
+});
+
+test('createProviderForkThread generates distinct Grok child sessions across repeated forks', async () => {
+  const generated = ['child-session-1', 'child-session-2'];
+  const observed = [];
+  for (let index = 0; index < 2; index += 1) {
+    const childSession = { provider: 'grok' };
+    const result = await createProviderForkThread({
+      key: 'parent-channel',
+      session: { provider: 'grok', runnerSessionId: 'parent-session' },
+      source: createForkSource(),
+      provider: 'grok',
+      parentSessionId: 'parent-session',
+      resolveForkWorkspace: () => '/repo/parent-workspace',
+      prepareForkWorkspace: () => `/repo/fork-workspace-${index + 1}`,
+      forkGrokSession: async () => ({
+        sessionId: generated[index],
+        parentSessionId: 'parent-session',
+        cwd: `/repo/fork-workspace-${index + 1}`,
+      }),
+      createThread: async () => ({ id: `child-channel-${index + 1}`, async setName() {}, async send() {} }),
+      getSession: () => childSession,
+      commandActions: {
+        bindForkedSession(currentSession, binding) {
+          currentSession.runnerSessionId = binding.sessionId;
+          currentSession.pendingForkFromSessionId = binding.pendingForkFromSessionId;
+          return binding;
+        },
+      },
+    });
+    observed.push(result.forkedSessionId);
+  }
+
+  assert.deepEqual(observed, generated);
 });
 
 test('formatCodexForkResult makes prompt enqueue failure explicit', async () => {

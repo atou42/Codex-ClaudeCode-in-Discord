@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { splitForDiscord } from './discord-message-splitter.js';
 
-const FORKABLE_PROVIDERS = new Set(['codex', 'claude']);
+const FORKABLE_PROVIDERS = new Set(['codex', 'claude', 'grok']);
 
 function normalizeForkProvider(value) {
   const text = String(value || '').trim().toLowerCase();
@@ -229,6 +229,7 @@ export function createSyntheticForkMessage(source, childThread) {
 function formatForkProviderLabel(provider) {
   const normalizedProvider = normalizeForkProvider(provider);
   if (normalizedProvider === 'claude') return 'Claude';
+  if (normalizedProvider === 'grok') return 'Grok';
   if (normalizedProvider === 'antigravity') return 'Antigravity';
   return 'Codex';
 }
@@ -299,6 +300,7 @@ export async function createProviderForkThread({
   getSession,
   commandActions = {},
   forkCodexThread,
+  forkGrokSession,
   enqueuePrompt,
   resolveSecurityContext,
   createThread = createDiscordForkThread,
@@ -324,6 +326,9 @@ export async function createProviderForkThread({
   if (normalizedProvider === 'codex' && typeof forkCodexThread !== 'function') {
     return { ok: false, reason: 'fork_unavailable' };
   }
+  if (normalizedProvider === 'grok' && typeof forkGrokSession !== 'function') {
+    return { ok: false, reason: 'fork_unavailable' };
+  }
   if (typeof getSession !== 'function') {
     throw new Error('getSession is required for provider fork');
   }
@@ -335,9 +340,9 @@ export async function createProviderForkThread({
     ? normalizeForkSessionId(generateSessionId())
     : null;
   if (normalizedProvider === 'claude' && !plannedForkedSessionId) {
-    throw new Error('Claude fork did not receive a generated session id');
+    throw new Error(`${formatForkProviderLabel(normalizedProvider)} fork did not receive a generated session id`);
   }
-  const parentWorkspaceDir = normalizedProvider === 'claude'
+  const parentWorkspaceDir = ['claude', 'grok'].includes(normalizedProvider)
     ? normalizeForkWorkspaceDir(resolveForkWorkspace({
       provider: normalizedProvider,
       parentSessionId: normalizedParentSessionId,
@@ -345,7 +350,7 @@ export async function createProviderForkThread({
       source,
     }))
     : null;
-  if (normalizedProvider === 'claude' && !parentWorkspaceDir) {
+  if (['claude', 'grok'].includes(normalizedProvider) && !parentWorkspaceDir) {
     return {
       ok: false,
       reason: 'fork_workspace_unavailable',
@@ -430,6 +435,28 @@ export async function createProviderForkThread({
       }
       throw new Error('Codex fork did not return a session id');
     }
+  } else if (normalizedProvider === 'grok') {
+    try {
+      forkResult = await forkGrokSession({
+        sourceSessionId: normalizedParentSessionId,
+        sourceCwd: parentWorkspaceDir,
+        newCwd: forkWorkspaceDir,
+      });
+    } catch (err) {
+      try {
+        await childThread.delete?.('Grok fork failed before session binding');
+      } catch {
+      }
+      throw err;
+    }
+    forkedSessionId = normalizeForkSessionId(forkResult?.sessionId);
+    if (!forkedSessionId) {
+      try {
+        await childThread.delete?.('Grok fork did not return a session id');
+      } catch {
+      }
+      throw new Error('Grok fork did not return a session id');
+    }
   }
   if (!normalizeForkThreadName(threadName) && typeof childThread.setName === 'function') {
     try {
@@ -441,19 +468,31 @@ export async function createProviderForkThread({
     }
   }
 
-  const childSession = getSession(childThread.id, {
-    channel: childThread,
-    parentChannelId: key,
-  });
-  childSession.workspaceDir = forkWorkspaceDir;
-  const binding = commandActions.bindForkedSession(childSession, {
-    sessionId: forkedSessionId,
-    parentSessionId: normalizedParentSessionId,
-    parentChannelId: key,
-    provider: normalizedProvider,
-    pendingForkFromSessionId: normalizedProvider === 'claude' ? normalizedParentSessionId : null,
-    workspaceDir: forkWorkspaceDir,
-  });
+  let childSession = null;
+  let binding = null;
+  try {
+    childSession = getSession(childThread.id, {
+      channel: childThread,
+      parentChannelId: key,
+    });
+    childSession.workspaceDir = forkWorkspaceDir;
+    binding = commandActions.bindForkedSession(childSession, {
+      sessionId: forkedSessionId,
+      parentSessionId: normalizedParentSessionId,
+      parentChannelId: key,
+      provider: normalizedProvider,
+      pendingForkFromSessionId: normalizedProvider === 'claude'
+        ? normalizedParentSessionId
+        : null,
+      workspaceDir: forkWorkspaceDir,
+    });
+  } catch (err) {
+    try {
+      await childThread.delete?.(`${normalizedProvider} fork failed before session binding`);
+    } catch {
+    }
+    throw err;
+  }
   const notice = await sendForkOriginNotice(childThread, {
     source,
     provider: normalizedProvider,
@@ -493,7 +532,7 @@ export async function createProviderForkThread({
     provider: normalizedProvider,
     parentSessionId: normalizedParentSessionId,
     forkedSessionId,
-    forkedFromId: normalizeForkSessionId(forkResult?.forkedFromId) || normalizedParentSessionId,
+    forkedFromId: normalizeForkSessionId(forkResult?.forkedFromId || forkResult?.parentSessionId) || normalizedParentSessionId,
     childThread,
     childSession,
     binding,

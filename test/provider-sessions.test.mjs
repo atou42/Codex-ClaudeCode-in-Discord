@@ -57,7 +57,7 @@ test('provider-sessions lists and resolves Grok workspace sessions', () => {
   const older = path.join(olderDir, 'summary.json');
   const newer = path.join(newerDir, 'summary.json');
   fs.writeFileSync(older, JSON.stringify({ sessionId: 'grok-old' }));
-  fs.writeFileSync(newer, JSON.stringify({ sessionId: 'grok-new', cwd: workspaceDir }));
+  fs.writeFileSync(newer, JSON.stringify({ info: { id: 'grok-new', cwd: workspaceDir } }));
   fs.utimesSync(older, new Date(1000), new Date(1000));
   fs.utimesSync(newer, new Date(2000), new Date(2000));
 

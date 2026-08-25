@@ -361,6 +361,82 @@ test('createPromptOrchestrator.handlePrompt keeps pending Claude fork after fail
   assert.equal(session.pendingForkFromSessionId, 'parent-session');
 });
 
+test('createPromptOrchestrator.handlePrompt keeps pending Grok fork after native fork startup fails', async () => {
+  const harness = createOrchestrator({
+    runTask: async () => ({
+      ok: false,
+      cancelled: false,
+      timedOut: false,
+      error: 'grok fork-session failed',
+      logs: [],
+      notes: [],
+      reasonings: [],
+      messages: [],
+      finalAnswerMessages: [],
+      threadId: null,
+      usage: null,
+    }),
+  });
+  const { session, orchestrator } = harness;
+  session.provider = 'grok';
+  session.runnerSessionId = 'child-session';
+  session.codexThreadId = 'child-session';
+  session.pendingForkFromSessionId = 'parent-session';
+  const message = {
+    id: 'msg-1',
+    channel: {
+      async sendTyping() {},
+      async send(payload) { harness.replyLog.push(payload); },
+    },
+  };
+  const channelState = { queue: [], cancelRequested: false, activeRun: null };
+
+  const outcome = await orchestrator.handlePrompt(message, 'thread-1', 'first fork turn', channelState);
+
+  assert.deepEqual(outcome, { ok: false, cancelled: false });
+  assert.equal(session.runnerSessionId, 'child-session');
+  assert.equal(session.pendingForkFromSessionId, 'parent-session');
+  assert.match(String(harness.replyLog.at(-1)?.content || harness.replyLog.at(-1)), /grok fork-session failed/);
+});
+
+test('createPromptOrchestrator.handlePrompt clears pending Grok fork after native fork succeeds', async () => {
+  const harness = createOrchestrator({
+    runTask: async () => ({
+      ok: true,
+      cancelled: false,
+      timedOut: false,
+      error: '',
+      logs: [],
+      notes: [],
+      reasonings: [],
+      messages: ['done'],
+      finalAnswerMessages: ['fork answer'],
+      threadId: 'child-session',
+      usage: { input_tokens: 123 },
+    }),
+  });
+  const { session, orchestrator } = harness;
+  session.provider = 'grok';
+  session.runnerSessionId = 'child-session';
+  session.codexThreadId = 'child-session';
+  session.pendingForkFromSessionId = 'parent-session';
+  const message = {
+    id: 'msg-1',
+    channel: {
+      async sendTyping() {},
+      async send(payload) { harness.replyLog.push(payload); },
+    },
+  };
+  const channelState = { queue: [], cancelRequested: false, activeRun: null };
+
+  const outcome = await orchestrator.handlePrompt(message, 'thread-1', 'first fork turn', channelState);
+
+  assert.deepEqual(outcome, { ok: true, cancelled: false });
+  assert.equal(session.runnerSessionId, 'child-session');
+  assert.equal(session.pendingForkFromSessionId, null);
+  assert.equal(session.lastInputTokens, 123);
+});
+
 test('buildDiscordBridgePromptLine keeps Discord context compact', () => {
   const line = buildDiscordBridgePromptLine({
     key: 'fallback-channel',
