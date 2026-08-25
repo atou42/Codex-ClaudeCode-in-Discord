@@ -725,6 +725,32 @@ test('createRunnerArgsBuilder uses Claude fork-session from pending fork parent'
   assert.equal(args.at(-1), 'first fork turn');
 });
 
+test('createRunnerArgsBuilder resumes a Grok session already forked into its workspace', () => {
+  const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
+    defaultModel: null,
+    normalizeProvider: (value) => value,
+    getSessionId: (session) => session.runnerSessionId,
+    resolveModelSetting: () => ({ value: null, source: 'provider' }),
+    resolveReasoningEffortSetting: () => ({ value: null, source: 'provider' }),
+  });
+
+  const args = buildSessionRunnerArgs({
+    provider: 'grok',
+    session: {
+      provider: 'grok',
+      mode: 'safe',
+      runnerSessionId: 'child-session',
+    },
+    workspaceDir: '/tmp/workspace',
+    prompt: 'first fork turn',
+  });
+
+  assert.equal(args[args.indexOf('--resume') + 1], 'child-session');
+  assert.equal(args.includes('--fork-session'), false);
+  assert.equal(args.includes('--session-id'), false);
+  assert.equal(args[1], 'first fork turn');
+});
+
 test('createRunnerArgsBuilder falls back to prompt context for Antigravity', () => {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     defaultModel: null,

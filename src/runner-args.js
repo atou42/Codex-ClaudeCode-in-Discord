@@ -222,8 +222,11 @@ export function createRunnerArgsBuilder({
       '--cwd', workspaceDir,
       '--output-format', 'streaming-json',
     ];
-    if (sessionId) args.push('--resume', sessionId);
-    else args.push('--session-id', randomUUID());
+    if (sessionId) {
+      args.push('--resume', sessionId);
+    } else {
+      args.push('--session-id', randomUUID());
+    }
     const systemText = String(systemPrompt || '').trim();
     const model = resolveModelSetting(session).value || defaultModel;
     const effort = resolveReasoningEffortSetting(session).value;

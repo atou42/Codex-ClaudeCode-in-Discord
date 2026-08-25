@@ -298,6 +298,34 @@ test('buildRunnerArgs can start a Claude fork from a parent session', () => {
   ]);
 });
 
+test('buildRunnerArgs can start a Grok fork from a parent session', () => {
+  const args = buildRunnerArgs({
+    provider: 'grok',
+    sessionId: 'child-456',
+    pendingForkFromSessionId: 'parent-123',
+    workspaceDir: '/tmp/work',
+    prompt: 'first fork task',
+    mode: 'safe',
+  });
+
+  assert.deepEqual(args, [
+    '-p',
+    'first fork task',
+    '--cwd',
+    '/tmp/work',
+    '--output-format',
+    'streaming-json',
+    '--resume',
+    'parent-123',
+    '--fork-session',
+    '--session-id',
+    'child-456',
+    '--always-approve',
+    '--sandbox',
+    'workspace',
+  ]);
+});
+
 test('buildRunnerArgs builds Antigravity command with provider-specific permissions', () => {
   const args = buildRunnerArgs({
     provider: 'antigravity',

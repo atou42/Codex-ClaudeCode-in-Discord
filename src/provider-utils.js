@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   normalizeProvider as normalizeCliProvider,
   getProviderDisplayName,
@@ -41,6 +42,17 @@ export function buildRunnerArgs({
   if (normalizedProvider === 'claude') {
     return buildClaudeArgs({
       sessionId,
+      prompt,
+      mode,
+      model,
+      effort,
+      pendingForkFromSessionId,
+    });
+  }
+  if (normalizedProvider === 'grok') {
+    return buildGrokArgs({
+      sessionId,
+      workspaceDir,
       prompt,
       mode,
       model,
@@ -178,6 +190,30 @@ function buildClaudeArgs({
   }
 
   args.push('--allowedTools', 'default', '--', prompt);
+  return args;
+}
+
+function buildGrokArgs({
+  sessionId,
+  workspaceDir,
+  prompt,
+  mode,
+  model,
+  effort,
+  pendingForkFromSessionId,
+}) {
+  const args = ['-p', prompt, '--cwd', workspaceDir, '--output-format', 'streaming-json'];
+  if (pendingForkFromSessionId) {
+    args.push('--resume', pendingForkFromSessionId, '--fork-session', '--session-id', sessionId || randomUUID());
+  } else if (sessionId) {
+    args.push('--resume', sessionId);
+  } else {
+    args.push('--session-id', randomUUID());
+  }
+  if (model) args.push('--model', model);
+  if (effort) args.push('--effort', effort);
+  if (mode === 'dangerous') args.push('--always-approve');
+  else args.push('--always-approve', '--sandbox', 'workspace');
   return args;
 }
 
