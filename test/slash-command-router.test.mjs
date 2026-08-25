@@ -1043,6 +1043,62 @@ test('createSlashCommandRouter creates native Claude fork in a new thread and re
   assert.match(state.replies[0].content, /已创建 Claude fork：<#fork-channel-1>/);
 });
 
+test('createSlashCommandRouter creates a native Grok fork in the child workspace', async () => {
+  const parentSession = { provider: 'grok', language: 'zh', runnerSessionId: 'parent-grok-1' };
+  const childSession = { provider: 'grok', language: 'zh' };
+  const threadMessages = [];
+  const childThread = {
+    id: 'fork-channel-1',
+    async join() {},
+    async setName() {},
+    async send(payload) { threadMessages.push(payload); },
+  };
+  const state = createRouterState({
+    getSession(key) {
+      return key === 'fork-channel-1' ? childSession : parentSession;
+    },
+    getSessionProvider: (currentSession) => currentSession.provider,
+    getSessionId: (currentSession) => currentSession?.runnerSessionId || null,
+    getRuntimeSnapshot: () => ({ running: false, queued: 0 }),
+    getProviderDisplayName: () => 'Grok Build',
+    resolveForkWorkspace: () => '/repo/parent-workspace',
+    forkGrokSession: async () => ({
+      sessionId: '01a01fe9-c4b0-7261-96f5-844e71e09b96',
+      parentSessionId: 'parent-grok-1',
+      cwd: '/repo/fork-workspace',
+    }),
+    commandActions: {
+      bindForkedSession(currentSession, binding) {
+        currentSession.runnerSessionId = binding.sessionId;
+        currentSession.forkedFromSessionId = binding.parentSessionId;
+        currentSession.forkedFromProvider = binding.provider;
+        currentSession.pendingForkFromSessionId = binding.pendingForkFromSessionId;
+        return binding;
+      },
+    },
+  });
+  const interaction = createInteraction('grok_fork', { name: 'grok branch' });
+  interaction.channel = {
+    id: 'channel-1',
+    threads: { async create() { return childThread; } },
+  };
+
+  const handled = await state.router({
+    interaction,
+    commandName: 'fork',
+    respond: async (payload) => { state.replies.push(payload); },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(parentSession.runnerSessionId, 'parent-grok-1');
+  assert.match(childSession.runnerSessionId, /^[0-9a-f-]{36}$/i);
+  assert.equal(childSession.forkedFromSessionId, 'parent-grok-1');
+  assert.equal(childSession.forkedFromProvider, 'grok');
+  assert.equal(childSession.pendingForkFromSessionId, null);
+  assert.match(threadMessages[0].content, /^<@user-1> 这是从 Grok session `parent-grok-1` fork 过来的。/);
+  assert.match(state.replies[0].content, /已创建 Grok fork：<#fork-channel-1>/);
+});
+
 test('createSlashCommandRouter refuses Codex fork while parent is running', async () => {
   const state = createRouterState({
     getSessionId: () => 'parent-1',

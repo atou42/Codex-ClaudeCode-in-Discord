@@ -369,7 +369,7 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
         ).setRequired(true));
       },
     },
-    (!lockedProvider || lockedProvider === 'codex' || lockedProvider === 'claude') && {
+    (!lockedProvider || ['codex', 'claude', 'grok'].includes(lockedProvider)) && {
       name: 'fork',
       description: '用当前 provider 原生 fork 创建一个新的 Discord thread，可选指定 thread 名',
       configure(builder) {

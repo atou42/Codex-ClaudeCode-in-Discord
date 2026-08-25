@@ -170,6 +170,7 @@ import {
   setCodexThreadGoal,
   unsubscribeCodexThread,
 } from './codex-app-server.js';
+import { forkGrokSession } from './grok-agent.js';
 import {
   extractInputTokensFromUsage,
   formatTokenValue,
@@ -915,9 +916,16 @@ const appContext = createAppContext({
         env: SPAWN_ENV,
         disabledMcpServers: CODEX_APP_SERVER_DISABLED_MCP_SERVERS,
       }),
+      forkGrokSession: (options) => forkGrokSession({
+        ...options,
+        grokBin: GROK_BIN,
+        env: SPAWN_ENV,
+      }),
       resolveForkWorkspace: ({ provider, parentSessionId } = {}) => (
         normalizeProvider(provider) === 'claude'
           ? readClaudeSessionMetaBySessionId(parentSessionId)?.cwd
+          : normalizeProvider(provider) === 'grok'
+            ? readGrokSessionMetaBySessionId(parentSessionId)?.cwd
           : null
       ),
       prepareForkWorkspace,
@@ -984,9 +992,16 @@ const appContext = createAppContext({
         env: SPAWN_ENV,
         disabledMcpServers: CODEX_APP_SERVER_DISABLED_MCP_SERVERS,
       }),
+      forkGrokSession: (options) => forkGrokSession({
+        ...options,
+        grokBin: GROK_BIN,
+        env: SPAWN_ENV,
+      }),
       resolveForkWorkspace: ({ provider, parentSessionId } = {}) => (
         normalizeProvider(provider) === 'claude'
           ? readClaudeSessionMetaBySessionId(parentSessionId)?.cwd
+          : normalizeProvider(provider) === 'grok'
+            ? readGrokSessionMetaBySessionId(parentSessionId)?.cwd
           : null
       ),
       prepareForkWorkspace,

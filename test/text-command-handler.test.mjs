@@ -591,6 +591,65 @@ test('createTextCommandHandler creates native Claude fork from text command', as
   assert.match(replies[0], /已创建 Claude fork：<#fork-channel-1>/);
 });
 
+test('createTextCommandHandler creates native Grok fork from text command', async () => {
+  const replies = [];
+  const parentSession = { provider: 'grok', language: 'zh', runnerSessionId: 'parent-grok-1' };
+  const childSession = { provider: 'grok', language: 'zh' };
+  const threadMessages = [];
+  const handleCommand = createTextCommandHandler({
+    getSession: (key) => (key === 'fork-channel-1' ? childSession : parentSession),
+    getSessionId: (currentSession) => currentSession?.runnerSessionId || null,
+    getSessionProvider: (currentSession) => currentSession.provider,
+    getSessionLanguage: () => 'zh',
+    getProviderDisplayName: () => 'Grok Build',
+    getRuntimeSnapshot: () => ({ running: false, queued: 0 }),
+    resolveForkWorkspace: () => '/repo/parent-workspace',
+    prepareForkWorkspace: () => '/repo/fork-workspace',
+    forkGrokSession: async () => ({
+      sessionId: '01a01fe9-c4b0-7261-96f5-844e71e09b96',
+      parentSessionId: 'parent-grok-1',
+      cwd: '/repo/fork-workspace',
+    }),
+    commandActions: {
+      bindForkedSession(currentSession, binding) {
+        currentSession.runnerSessionId = binding.sessionId;
+        currentSession.forkedFromSessionId = binding.parentSessionId;
+        currentSession.forkedFromProvider = binding.provider;
+        currentSession.pendingForkFromSessionId = binding.pendingForkFromSessionId;
+        return binding;
+      },
+    },
+    safeReply: async (_message, payload) => { replies.push(payload); },
+  });
+
+  await handleCommand({
+    id: 'message-1',
+    author: { id: 'user-1' },
+    channel: {
+      id: 'channel-1',
+      threads: {
+        async create() {
+          return {
+            id: 'fork-channel-1',
+            async join() {},
+            async setName() {},
+            async send(payload) { threadMessages.push(payload); },
+          };
+        },
+      },
+    },
+  }, 'channel-1', '!fork Grok fork thread');
+
+  assert.equal(parentSession.runnerSessionId, 'parent-grok-1');
+  assert.match(childSession.runnerSessionId, /^[0-9a-f-]{36}$/i);
+  assert.equal(childSession.forkedFromSessionId, 'parent-grok-1');
+  assert.equal(childSession.forkedFromProvider, 'grok');
+  assert.equal(childSession.workspaceDir, '/repo/fork-workspace');
+  assert.equal(childSession.pendingForkFromSessionId, null);
+  assert.match(threadMessages[0].content, /^<@user-1> 这是从 Grok session `parent-grok-1` fork 过来的。/);
+  assert.match(replies[0], /已创建 Grok fork：<#fork-channel-1>/);
+});
+
 test('createTextCommandHandler rejects fork for providers without native fork', async () => {
   const replies = [];
   const session = { provider: 'antigravity', language: 'zh' };

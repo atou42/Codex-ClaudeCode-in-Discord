@@ -63,6 +63,7 @@ test('buildSlashCommandEntries includes aliases and provider toggle only in shar
   assert.ok(buildSlashCommandEntries({ botProvider: 'claude' }).some((entry) => entry.name === 'runtime'));
   assert.ok(buildSlashCommandEntries({ botProvider: 'claude' }).some((entry) => entry.name === 'fork'));
   assert.ok(buildSlashCommandEntries({ botProvider: 'codex' }).some((entry) => entry.name === 'fork'));
+  assert.ok(buildSlashCommandEntries({ botProvider: 'grok' }).some((entry) => entry.name === 'fork'));
   assert.ok(buildSlashCommandEntries({ botProvider: 'codex' }).some((entry) => entry.name === 'goal'));
   const cursorEntries = buildSlashCommandEntries({ botProvider: 'cursor' });
   assert.ok(!cursorEntries.some((entry) => ['compact', 'fork', 'side', 'goal'].includes(entry.name)));
