@@ -524,7 +524,10 @@ export function createPromptOrchestrator({
     const startingPendingForkFromSessionId = String(session?.pendingForkFromSessionId || '').trim() || null;
     const workspaceDir = ensureWorkspace(session, key);
     const language = normalizeUiLanguage(getSessionLanguage(session));
-    const taskRetryPolicy = normalizeTaskRetryPolicy(resolveTaskRetrySetting(session));
+    const providerControlCommand = message?.providerControlCommand === true;
+    const taskRetryPolicy = providerControlCommand
+      ? normalizeTaskRetryPolicy({ maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, source: 'provider control command' })
+      : normalizeTaskRetryPolicy(resolveTaskRetrySetting(session));
     const waitingForWorkspaceText = language === 'en'
       ? `Waiting for workspace lock: ${workspaceDir}`
       : `等待 workspace 锁：${workspaceDir}`;
@@ -629,7 +632,9 @@ export function createPromptOrchestrator({
         return { ok: false, error };
       }
 
-      const extraInfoSetting = resolveExtraInfoSetting(session);
+      const extraInfoSetting = providerControlCommand
+        ? { enabled: false, text: '' }
+        : resolveExtraInfoSetting(session);
       const extraInfoPromptLine = buildExtraInfoPromptLine({
         setting: extraInfoSetting,
         message,
@@ -643,7 +648,7 @@ export function createPromptOrchestrator({
         ? `\n\n${extraInfoPromptLine}`
         : '';
       let promptToRun = prompt;
-      const nativeCompactAutoContinueActive = shouldAutoContinueNativeCompact(session);
+      const nativeCompactAutoContinueActive = !providerControlCommand && shouldAutoContinueNativeCompact(session);
 
       if (channelState.cancelRequested) {
         progressOutcome = { ok: false, cancelled: true, timedOut: false, error: 'cancelled by user' };
@@ -696,7 +701,7 @@ export function createPromptOrchestrator({
       const pendingCompactSourceSessionId = String(session.pendingCompactSourceSessionId || '').trim();
       let consumedPendingCompactSummary = false;
 
-      if (pendingCompactSummary) {
+      if (pendingCompactSummary && !providerControlCommand) {
         promptToRun = buildPromptFromCompactedContext(pendingCompactSummary, promptToRun);
         consumedPendingCompactSummary = true;
         runtimeNotes.push(
@@ -706,7 +711,7 @@ export function createPromptOrchestrator({
         );
       }
 
-      if (shouldCompactSession(session)) {
+      if (!providerControlCommand && shouldCompactSession(session)) {
         const compactSessionId = getSessionId(session);
         progress.setLatestStep(
           language === 'en'

@@ -496,6 +496,57 @@ test('createPromptOrchestrator.handlePrompt sends Discord bridge context as syst
   ]);
 });
 
+test('createPromptOrchestrator sends provider control commands verbatim in the bound session', async () => {
+  const calls = [];
+  const harness = createOrchestrator({
+    runTask: async (options) => {
+      calls.push(options);
+      return {
+        ok: true,
+        cancelled: false,
+        timedOut: false,
+        error: '',
+        logs: [],
+        notes: [],
+        reasonings: [],
+        messages: ['Goal active'],
+        finalAnswerMessages: ['Goal active'],
+        threadId: 'sess-1',
+        usage: null,
+      };
+    },
+  });
+  const { session, orchestrator } = harness;
+  session.provider = 'grok';
+  session.lastInputTokens = 250_000;
+  session.pendingCompactSummary = 'must remain for the next normal prompt';
+  const message = {
+    id: 'goal-command',
+    providerControlCommand: true,
+    channel: {
+      id: 'thread-goal',
+      parentId: 'parent-channel',
+      async sendTyping() {},
+      async send() {},
+    },
+  };
+  const channelState = { queue: [], cancelRequested: false, activeRun: null };
+
+  const outcome = await orchestrator.handlePrompt(
+    message,
+    'thread-goal',
+    '/goal ship the Discord bridge --budget 90000',
+    channelState,
+  );
+
+  assert.deepEqual(outcome, { ok: true, cancelled: false });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].prompt, '/goal ship the Discord bridge --budget 90000');
+  assert.equal(calls[0].systemPrompt, '');
+  assert.equal(session.pendingCompactSummary, 'must remain for the next normal prompt');
+  assert.equal(session.runnerSessionId, 'sess-1');
+});
+
 test('createPromptOrchestrator.handlePrompt can disable or customize stable extra info', async () => {
   const prompts = [];
   const systemPrompts = [];

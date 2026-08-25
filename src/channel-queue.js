@@ -69,6 +69,7 @@ export function createChannelQueue({
 
   async function trySteerRunningPrompt({ state, message, key, content, session }) {
     if (!state.running) return null;
+    if (message?.providerControlCommand === true) return null;
     const busyPrompt = resolveBusyPromptModeSetting(session);
     if (busyPrompt?.mode !== 'steer_if_possible' || !busyPrompt?.canSteer) return null;
     if (typeof steerPrompt !== 'function') return null;

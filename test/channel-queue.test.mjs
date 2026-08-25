@@ -144,6 +144,39 @@ test('createChannelQueue steers running Codex long prompts instead of queueing',
   assert.equal(replyLog[0].payload, '↪️ 已插入当前 Codex 任务。');
 });
 
+test('createChannelQueue never steers provider control commands into a running turn', async () => {
+  const runtime = createChannelRuntimeStore({
+    cloneProgressPlan: (plan) => (plan ? JSON.parse(JSON.stringify(plan)) : null),
+    truncate: (text, max) => (text.length <= max ? text : `${text.slice(0, max - 3)}...`),
+  });
+  const state = runtime.getChannelState('thread-1');
+  state.running = true;
+  const replyLog = [];
+  let steerCalls = 0;
+  const queue = createChannelQueue({
+    getChannelState: runtime.getChannelState,
+    getSession: () => ({ provider: 'grok', runtimeMode: 'long', busyPromptMode: 'steer_if_possible' }),
+    resolveBusyPromptModeSetting: () => ({ mode: 'steer_if_possible', canSteer: true }),
+    resolveSecurityContext: () => ({ maxQueuePerChannel: 10 }),
+    safeReply: async (_message, payload) => replyLog.push(payload),
+    safeError: (error) => error.message,
+    steerPrompt: async () => {
+      steerCalls += 1;
+      return { ok: true, steered: true };
+    },
+    handlePrompt: async () => ({ ok: true, cancelled: false }),
+  });
+  const message = createMessage('goal-control', replyLog, []);
+  message.providerControlCommand = true;
+
+  const result = await queue.enqueuePrompt(message, 'thread-1', '/goal status');
+
+  assert.equal(result.enqueued, true);
+  assert.equal(result.queuedAhead, 1);
+  assert.equal(steerCalls, 0);
+  assert.equal(state.queue[0].content, '/goal status');
+});
+
 test('createChannelQueue falls back to queue when steer fails', async () => {
   const runtime = createChannelRuntimeStore({
     cloneProgressPlan: (plan) => (plan ? JSON.parse(JSON.stringify(plan)) : null),
