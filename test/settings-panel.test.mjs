@@ -161,7 +161,9 @@ function createPanel({
       source: currentSession?.workspaceDir ? 'thread override' : 'provider default',
     }),
     getProviderDefaults: (provider) => ({
-      model: provider === 'codex' ? (session?.globalDefaultModel ?? 'gpt-5.4') : '(provider default)',
+      model: provider === 'codex'
+        ? (session?.globalDefaultModel ?? 'gpt-5.4')
+        : (session?.providerDefaultModel ?? '(provider default)'),
       profile: provider === 'codex' ? (session?.globalDefaultCodexProfile ?? null) : null,
       profileConfigured: provider === 'codex' ? Boolean(session?.globalDefaultCodexProfile) : false,
       modelConfigured: provider === 'codex' ? (session?.globalDefaultModelConfigured ?? true) : false,
@@ -1023,6 +1025,192 @@ test('createSettingsPanel keeps the OMP model section within Discord row limits'
   ]);
   assert.ok(labels.includes('手写模型名'));
   assert.ok(labels.includes('关闭'));
+});
+
+test('createSettingsPanel keeps the effective OMP default visible beyond the Discord option limit', () => {
+  const targetModel = 'openrouter-ox/stealth/ox-alpha';
+  const session = {
+    provider: 'omp',
+    language: 'zh',
+    mode: 'dangerous',
+    model: null,
+    globalDefaultModel: targetModel,
+  };
+  const modelCatalog = {
+    models: [
+      ...Array.from({ length: 30 }, (_, index) => ({
+        slug: `openrouter/example/model-${index + 1}`,
+        displayName: `Example ${index + 1}`,
+        supportedReasoningLevels: [],
+        visibility: 'catalog',
+      })),
+      {
+        slug: targetModel,
+        displayName: 'Ox Alpha (OpenRouter)',
+        supportedReasoningLevels: ['low', 'medium', 'high'],
+        visibility: 'catalog',
+      },
+    ],
+    error: null,
+  };
+  const panel = createPanel({ session, modelCatalog });
+
+  const payload = panel.openModelSettingsPanel({
+    key: 'thread-1',
+    session,
+    userId: '12345',
+    flags: 64,
+  });
+
+  const modelOptions = payload.components[0].components[0].data.options;
+  assert.equal(modelOptions.length, 25);
+  assert.equal(modelOptions[1].value, targetModel);
+  assert.equal(modelOptions[1].description, '当前生效模型');
+});
+
+test('createSettingsPanel keeps the OMP provider default visible beside a channel override', () => {
+  const targetModel = 'openrouter-ox/stealth/ox-alpha';
+  const channelModel = 'ccswitch-newapi/gpt-5.6-sol';
+  const session = {
+    provider: 'omp',
+    language: 'zh',
+    mode: 'dangerous',
+    model: channelModel,
+    providerDefaultModel: targetModel,
+  };
+  const modelCatalog = {
+    models: [
+      {
+        slug: channelModel,
+        displayName: 'GPT-5.6 Sol (CCSwitch NewAPI)',
+        supportedReasoningLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        visibility: 'catalog',
+      },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        slug: `openrouter/example/model-${index + 1}`,
+        displayName: `Example ${index + 1}`,
+        supportedReasoningLevels: [],
+        visibility: 'catalog',
+      })),
+      {
+        slug: targetModel,
+        displayName: 'Ox Alpha (OpenRouter)',
+        supportedReasoningLevels: ['low', 'medium', 'high'],
+        visibility: 'catalog',
+      },
+    ],
+    error: null,
+  };
+  const panel = createPanel({ session, modelCatalog });
+
+  const payload = panel.openModelSettingsPanel({
+    key: 'thread-1',
+    session,
+    userId: '12345',
+    flags: 64,
+  });
+
+  const modelOptions = payload.components[0].components[0].data.options;
+  assert.equal(modelOptions.find((option) => option.value === channelModel).default, true);
+  assert.equal(modelOptions.find((option) => option.value === targetModel).description, 'provider 默认模型');
+});
+
+test('createSettingsPanel searches the full OMP catalog from the model panel', async () => {
+  const targetModel = 'openrouter-ox/stealth/ox-alpha';
+  const session = {
+    provider: 'omp',
+    language: 'zh',
+    mode: 'dangerous',
+    model: null,
+  };
+  const modelCatalog = {
+    models: [
+      ...Array.from({ length: 30 }, (_, index) => ({
+        slug: `openrouter/example/model-${index + 1}`,
+        displayName: `Example ${index + 1}`,
+        supportedReasoningLevels: [],
+        visibility: 'catalog',
+      })),
+      {
+        slug: targetModel,
+        displayName: 'Ox Alpha (OpenRouter)',
+        description: 'Pi-family model from openrouter-ox',
+        supportedReasoningLevels: ['low', 'medium', 'high'],
+        visibility: 'catalog',
+      },
+    ],
+    error: null,
+  };
+  const panel = createPanel({
+    session,
+    modelCatalog,
+    commandActions: {
+      setModel(currentSession, value) {
+        currentSession.model = value === 'default' ? null : value;
+      },
+    },
+  });
+  const opened = panel.openModelSettingsPanel({
+    key: 'thread-1',
+    session,
+    userId: '12345',
+    flags: 64,
+  });
+  const searchButton = opened.components
+    .flatMap((row) => row.components)
+    .find((component) => component.data.label === '搜索模型');
+  assert.ok(searchButton);
+
+  const modals = [];
+  await panel.handleSettingsPanelInteraction({
+    customId: searchButton.data.customId,
+    channelId: 'thread-1',
+    user: { id: '12345' },
+    async showModal(modal) {
+      modals.push(modal);
+    },
+  });
+  assert.equal(modals.length, 1);
+  assert.match(modals[0].data.customId, /^stgm:quick_model_search:12345:/);
+
+  const replies = [];
+  await panel.handleSettingsPanelModalSubmit({
+    customId: modals[0].data.customId,
+    channelId: 'thread-1',
+    user: { id: '12345' },
+    fields: {
+      getTextInputValue() {
+        return 'ox alpha';
+      },
+    },
+    async reply(payload) {
+      replies.push(payload);
+    },
+  });
+
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /ox alpha/);
+  const searchOptions = replies[0].components[0].components[0].data.options;
+  assert.deepEqual(searchOptions.map((option) => option.value), ['default', targetModel]);
+
+  const updates = [];
+  await panel.handleSettingsPanelInteraction({
+    customId: replies[0].components[0].components[0].data.customId,
+    channelId: 'thread-1',
+    user: { id: '12345' },
+    values: [targetModel],
+    async update(payload) {
+      updates.push(payload);
+    },
+    async reply() {
+      throw new Error('should not reply');
+    },
+  });
+
+  assert.equal(session.model, targetModel);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].components[0].components[0].data.options
+    .find((option) => option.value === targetModel).default, true);
 });
 
 test('createSettingsPanel uses the selected catalog model effort levels and hides hidden models', () => {

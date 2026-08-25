@@ -11,6 +11,7 @@ import {
 const SETTINGS_COMPONENT_PREFIX = 'stg';
 const SETTINGS_MODAL_PREFIX = 'stgm';
 const MODEL_INPUT_ID = 'model_name';
+const MODEL_SEARCH_INPUT_ID = 'model_search_query';
 const CODEX_PROFILE_INPUT_ID = 'codex_profile_name';
 const COMPACT_THRESHOLD_INPUT_ID = 'compact_threshold_tokens';
 
@@ -264,12 +265,38 @@ function normalizeModelCatalog(catalog) {
   };
 }
 
+function normalizeModelSearchQuery(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function rankModelSearchMatch(model, query) {
+  const fields = [model.slug, model.displayName, model.description]
+    .map((value) => String(value || '').trim().toLowerCase());
+  if (fields.some((value) => value === query)) return 0;
+  if (fields.some((value) => value.startsWith(query))) return 1;
+  if (fields.some((value) => value.includes(query))) return 2;
+  return null;
+}
+
+function searchModelCatalog(models, query) {
+  const normalizedQuery = normalizeModelSearchQuery(query);
+  if (!normalizedQuery) return [...models];
+  return models
+    .map((model, index) => ({ model, index, score: rankModelSearchMatch(model, normalizedQuery) }))
+    .filter((entry) => entry.score !== null)
+    .sort((left, right) => left.score - right.score || left.index - right.index)
+    .map((entry) => entry.model);
+}
+
 function buildModelSelectOptions(snapshot, session, {
   currentOverride: overrideValue = session?.model,
   effectiveModel: effectiveValue = snapshot.modelValue,
+  query = '',
 } = {}) {
   const currentOverride = String(overrideValue || '').trim();
   const effectiveModel = String(effectiveValue || '').trim();
+  const providerDefaultModel = String(snapshot.defaults?.model || '').trim();
+  const normalizedQuery = normalizeModelSearchQuery(query);
   const options = [{
     label: snapshot.language === 'en' ? 'Use provider default' : '使用 provider 默认',
     value: 'default',
@@ -281,23 +308,61 @@ function buildModelSelectOptions(snapshot, session, {
   const seen = new Set(['default']);
   let hasCurrentOverride = !currentOverride;
 
-  for (const model of snapshot.modelCatalog.models) {
-    if (seen.has(model.slug)) continue;
+  const addModelOption = (model, { effective = false, providerDefault = false } = {}) => {
+    if (!model || seen.has(model.slug) || options.length >= 25) return;
     seen.add(model.slug);
     if (model.visibility === 'hide' || model.visibility === 'hidden') {
       if (currentOverride === model.slug) hasCurrentOverride = true;
-      continue;
+      return;
     }
     const isCurrent = currentOverride === model.slug;
     if (isCurrent) hasCurrentOverride = true;
     options.push({
       label: truncateOptionText(model.displayName || model.slug),
       value: model.slug,
-      description: truncateOptionText(model.defaultReasoningLevel
-        ? `default effort: ${model.defaultReasoningLevel}`
-        : (model.description || model.slug)),
+      description: truncateOptionText(providerDefault && !isCurrent
+        ? (snapshot.language === 'en'
+          ? 'Provider default model'
+          : 'provider 默认模型')
+        : (effective && !isCurrent
+          ? (snapshot.language === 'en' ? 'Current effective model' : '当前生效模型')
+          : (model.defaultReasoningLevel
+            ? `default effort: ${model.defaultReasoningLevel}`
+            : (model.description || model.slug)))),
       default: isCurrent,
     });
+  };
+
+  if (!normalizedQuery) {
+    const initiallyVisible = new Set(snapshot.modelCatalog.models
+      .filter((model) => model.visibility !== 'hide' && model.visibility !== 'hidden')
+      .slice(0, 24)
+      .map((model) => model.slug));
+    for (const { slug, effective, providerDefault } of [
+      { slug: currentOverride, effective: currentOverride === effectiveModel, providerDefault: false },
+      { slug: providerDefaultModel, effective: providerDefaultModel === effectiveModel, providerDefault: true },
+      { slug: effectiveModel, effective: true, providerDefault: false },
+    ]) {
+      if (!slug) continue;
+      const model = snapshot.modelCatalog.models.find((entry) => entry.slug === slug);
+      if (model && !initiallyVisible.has(slug)) {
+        addModelOption(model, { effective, providerDefault });
+      }
+    }
+    if (currentOverride && !snapshot.modelCatalog.models.some((model) => model.slug === currentOverride)) {
+      seen.add(currentOverride);
+      hasCurrentOverride = true;
+      options.push({
+        label: truncateOptionText(currentOverride),
+        value: currentOverride,
+        description: snapshot.language === 'en' ? 'Current custom model' : '当前手写模型',
+        default: true,
+      });
+    }
+  }
+
+  for (const model of searchModelCatalog(snapshot.modelCatalog.models, normalizedQuery)) {
+    addModelOption(model);
     if (options.length >= 25) break;
   }
 
@@ -414,6 +479,8 @@ export function createSettingsPanel({
     'model_effort',
     'quick_model',
     'quick_model_effort',
+    'model_search',
+    'quick_model_search',
     'default_model',
     'default_effort',
   ].includes(target);
@@ -590,10 +657,10 @@ export function createSettingsPanel({
     );
   }
 
-  function buildModelControlRows(session, userId, snapshot, { quick = false, generation = '' } = {}) {
+  function buildModelControlRows(session, userId, snapshot, { quick = false, generation = '', modelQuery = '' } = {}) {
     const modelTarget = quick ? 'quick_model' : 'model';
     const effortTarget = quick ? 'quick_model_effort' : 'model_effort';
-    const modelOptions = buildModelSelectOptions(snapshot, session);
+    const modelOptions = buildModelSelectOptions(snapshot, session, { query: modelQuery });
     const rows = [
       new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
@@ -605,6 +672,10 @@ export function createSettingsPanel({
       ),
     ];
     const modelActionButtons = [
+      new ButtonBuilder()
+        .setCustomId(buildSettingsComponentId('act', modelTarget, 'search', userId, generation))
+        .setLabel(snapshot.language === 'en' ? 'Search models' : '搜索模型')
+        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(buildSettingsComponentId('act', modelTarget, 'custom', userId, generation))
         .setLabel(snapshot.language === 'en' ? 'Type custom model' : '手写模型名')
@@ -628,7 +699,7 @@ export function createSettingsPanel({
       ));
       const lastEffortRow = effortRows.at(-1);
       const lastEffortRowSize = [...snapshot.modelEffortLevels, 'default'].length % 5 || 5;
-      if (lastEffortRowSize <= 3) {
+      if (lastEffortRowSize + modelActionButtons.length <= 5) {
         lastEffortRow.addComponents(...modelActionButtons);
       } else {
         effortRows.push(new ActionRowBuilder().addComponents(...modelActionButtons));
@@ -1192,12 +1263,12 @@ function formatOverviewSection(snapshot) {
     return lines.filter(Boolean).join('\n');
   }
 
-  function buildModelSettingsPayload({ key, session, userId, flags = undefined, notice = '' } = {}) {
+  function buildModelSettingsPayload({ key, session, userId, flags = undefined, notice = '', modelQuery = '' } = {}) {
     const snapshot = buildSnapshot(key, session);
     const generation = issueModelPanelGeneration(key, userId);
     const closeLabel = snapshot.language === 'en' ? 'close' : '关闭';
     const components = [
-      ...buildModelControlRows(session, userId, snapshot, { quick: true, generation }),
+      ...buildModelControlRows(session, userId, snapshot, { quick: true, generation, modelQuery }),
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(buildSettingsComponentId('act', 'quick_model', 'close', userId, generation))
@@ -1211,6 +1282,22 @@ function formatOverviewSection(snapshot) {
     };
     if (flags !== undefined) payload.flags = flags;
     return payload;
+  }
+
+  function buildModelSearchModal(session, userId, { target = 'model_search', generation = '' } = {}) {
+    const language = normalizeUiLanguage(getSessionLanguage(session) || defaultUiLanguage);
+    const input = new TextInputBuilder()
+      .setCustomId(MODEL_SEARCH_INPUT_ID)
+      .setLabel(language === 'en' ? 'Model name, provider, or keyword' : '模型名、provider 或关键词')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder(language === 'en' ? 'e.g. ox alpha or openrouter-ox' : '例如 ox alpha 或 openrouter-ox')
+      .setRequired(true)
+      .setMaxLength(100);
+
+    return new ModalBuilder()
+      .setCustomId(buildSettingsModalId(target, userId, generation))
+      .setTitle(language === 'en' ? 'Search model catalog' : '搜索模型目录')
+      .addComponents(new ActionRowBuilder().addComponents(input));
   }
 
   function buildModelModal(session, userId, { useGlobalDefault = false, target = '', generation = '' } = {}) {
@@ -1360,6 +1447,14 @@ function formatOverviewSection(snapshot) {
           content: language === 'en' ? 'Model panel closed.' : '模型面板已关闭。',
           components: [],
         });
+        return true;
+      }
+
+      if ((parsed.target === 'model' || parsed.target === 'quick_model') && parsed.value === 'search') {
+        await interaction.showModal(buildModelSearchModal(session, interaction.user.id, {
+          target: `${parsed.target}_search`,
+          generation: parsed.generation,
+        }));
         return true;
       }
 
@@ -1720,6 +1815,29 @@ function formatOverviewSection(snapshot) {
           : `❌ 这个${isGlobalDefault ? '设置' : '模型'}面板已过期，请重新打开 /${isGlobalDefault ? 'settings' : 'model'}。`,
         flags: 64,
       });
+      return true;
+    }
+
+    if (parsed.target === 'model_search' || parsed.target === 'quick_model_search') {
+      const query = String(interaction.fields.getTextInputValue(MODEL_SEARCH_INPUT_ID) || '').trim();
+      const snapshot = buildSnapshot(key, session);
+      const matches = searchModelCatalog(snapshot.modelCatalog.models, query)
+        .filter((model) => model.visibility !== 'hide' && model.visibility !== 'hidden');
+      const notice = matches.length
+        ? (language === 'en'
+          ? `Found ${matches.length} model${matches.length === 1 ? '' : 's'} for \`${query}\`.`
+          : `找到 ${matches.length} 个与 \`${query}\` 匹配的模型。`)
+        : (language === 'en'
+          ? `No catalog models matched \`${query}\`. You can search again or type an exact model name.`
+          : `没有找到与 \`${query}\` 匹配的目录模型，可以重新搜索或手写完整模型名。`);
+      await interaction.reply(buildModelSettingsPayload({
+        key,
+        session,
+        userId: interaction.user.id,
+        flags: 64,
+        notice,
+        modelQuery: query,
+      }));
       return true;
     }
 
