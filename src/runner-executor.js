@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { createRunnerArgsBuilder, uniqueDirs } from './runner-args.js';
 import { createClaudeLongRunner } from './claude-long-runner.js';
 import { createCodexAppServerRunner } from './codex-app-server-runner.js';
+import { createOmpInteractiveRunner } from './omp-interactive-runner.js';
 import { CODEX_GOAL_CONTINUATION_PROMPT, isCodexGoalContinuationPrompt } from './codex-goal-flow.js';
 import {
   createRunnerEventParser,
@@ -52,8 +53,11 @@ export function createRunnerExecutor({
   codexAppServerIdleMs = 15 * 60_000,
   codexAppServerMaxSessions = 8,
   codexAppServerDisabledMcpServers = [],
+  ompInteractiveIdleMs = 15 * 60_000,
+  ompInteractiveMaxSessions = 8,
   createClaudeLongRunnerFn = createClaudeLongRunner,
   createCodexAppServerRunnerFn = createCodexAppServerRunner,
+  createOmpInteractiveRunnerFn = createOmpInteractiveRunner,
 } = {}) {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     defaultModel,
@@ -104,6 +108,20 @@ export function createRunnerExecutor({
     maxSessions: codexAppServerMaxSessions,
     disabledMcpServers: codexAppServerDisabledMcpServers,
   });
+  const ompInteractiveRunner = createOmpInteractiveRunnerFn({
+    spawnEnv,
+    getProviderBin,
+    getSessionId,
+    resolveModelSetting,
+    resolveReasoningEffortSetting,
+    resolveFastModeSetting,
+    resolveTimeoutSetting,
+    normalizeTimeoutMs,
+    safeError,
+    stopChildProcess,
+    idleMs: ompInteractiveIdleMs,
+    maxSessions: ompInteractiveMaxSessions,
+  });
 
   async function runProviderTask({
     session,
@@ -126,6 +144,22 @@ export function createRunnerExecutor({
     const additionalWorkspaceDirs = normalizeProvider(provider) === 'claude'
       ? uniqueDirs([providerDefault.workspaceDir].filter((dir) => dir && dir !== workspaceDir))
       : [];
+
+    if (normalizeProvider(provider) === 'omp') {
+      return ompInteractiveRunner.runTask({
+        session,
+        sessionKey,
+        workspaceDir,
+        prompt,
+        systemPrompt,
+        inputImages,
+        onSpawn,
+        onThreadReady,
+        wasCancelled,
+        onEvent,
+        onLog,
+      });
+    }
 
     if (normalizeProvider(provider) === 'claude' && resolveRuntimeModeSetting(session).mode === 'long') {
       return claudeLongRunner.runTask({
@@ -740,11 +774,17 @@ export function createRunnerExecutor({
     closeRuntimeSession: (sessionKey, reason = 'closed') => {
       const closedClaude = claudeLongRunner.closeSession(sessionKey, reason);
       const closedCodex = codexAppServerRunner.closeSession(sessionKey, reason);
-      return Boolean(closedClaude || closedCodex);
+      const closedOmp = ompInteractiveRunner.closeSession(sessionKey, reason);
+      return Boolean(closedClaude || closedCodex || closedOmp);
     },
-    closeAllRuntimeSessions: (reason = 'closed') => claudeLongRunner.closeAll(reason) + codexAppServerRunner.closeAll(reason),
+    closeAllRuntimeSessions: (reason = 'closed') => (
+      claudeLongRunner.closeAll(reason)
+      + codexAppServerRunner.closeAll(reason)
+      + ompInteractiveRunner.closeAll(reason)
+    ),
     getClaudeLongSessions: () => claudeLongRunner.getSnapshot(),
     getCodexAppServerSessions: () => codexAppServerRunner.getSnapshot(),
+    getOmpInteractiveSessions: () => ompInteractiveRunner.getSnapshot(),
   };
 }
 

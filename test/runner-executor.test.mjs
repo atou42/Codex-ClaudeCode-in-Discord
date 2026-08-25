@@ -104,13 +104,8 @@ test('createRunnerExecutor reads Antigravity stdout and conversation id', async 
   assert.deepEqual(result.finalAnswerMessages, ['Antigravity done']);
 });
 
-test('createRunnerExecutor completes an OMP JSON turn and preserves its session id', async () => {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.killed = false;
-  const spawnCalls = [];
-
+test('createRunnerExecutor routes every OMP turn through the persistent interactive runner', async () => {
+  const calls = [];
   const executor = createRunnerExecutor({
     spawnEnv: process.env,
     ensureDir: () => {},
@@ -130,32 +125,68 @@ test('createRunnerExecutor completes an OMP JSON turn and preserves its session 
     startSessionProgressBridge: () => () => {},
     extractAgentMessageText,
     isFinalAnswerLikeAgentMessage,
-    spawnFn: (bin, args) => {
-      spawnCalls.push({ bin, args });
-      setImmediate(() => {
-        child.stdout.emit('data', Buffer.from([
-          '{"type":"session","version":3,"id":"019-omp-session","cwd":"/tmp/workspace"}',
-          '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"OMP_DONE"}],"usage":{"input":8,"output":2,"totalTokens":10},"stopReason":"stop"}}',
-          '',
-        ].join('\n')));
-        child.emit('close', 0, null);
-      });
-      return child;
-    },
+    createOmpInteractiveRunnerFn: () => ({
+      async runTask(options) {
+        calls.push(options);
+        return { ok: true, threadId: 'omp-live-1', finalAnswerMessages: ['OMP_DONE'] };
+      },
+      closeSession: () => false,
+      closeAll: () => 0,
+      getSnapshot: () => [],
+    }),
   });
 
   const result = await executor.runProviderTask({
     session: { provider: 'omp', mode: 'dangerous', runnerSessionId: null },
+    sessionKey: 'discord-thread-1',
     workspaceDir: '/tmp/workspace',
-    prompt: 'hello',
+    prompt: '/goal set ship it',
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.threadId, '019-omp-session');
-  assert.deepEqual(result.finalAnswerMessages, ['OMP_DONE']);
-  assert.deepEqual(result.usage, { input: 8, output: 2, totalTokens: 10 });
-  assert.equal(spawnCalls[0].bin, 'omp');
-  assert.deepEqual(spawnCalls[0].args, ['-p', '--mode', 'json', '--approval-mode', 'yolo', 'hello']);
+  assert.equal(result.threadId, 'omp-live-1');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].sessionKey, 'discord-thread-1');
+  assert.equal(calls[0].prompt, '/goal set ship it');
+});
+
+test('createRunnerExecutor includes OMP in targeted and global runtime cleanup', () => {
+  const closes = [];
+  const executor = createRunnerExecutor({
+    spawnEnv: process.env,
+    ensureDir: () => {},
+    normalizeProvider: testNormalizeProvider,
+    getSessionProvider: (session) => session.provider,
+    getProviderBin: () => 'omp',
+    getSessionId: () => null,
+    resolveModelSetting: () => ({ value: null }),
+    resolveReasoningEffortSetting: () => ({ value: null }),
+    resolveTimeoutSetting: () => ({ timeoutMs: 0 }),
+    resolveCompactStrategySetting: () => ({ strategy: 'hard' }),
+    resolveCompactEnabledSetting: () => ({ enabled: false }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 0 }),
+    normalizeTimeoutMs: (value) => Number(value || 0),
+    safeError: (err) => String(err?.message || err),
+    stopChildProcess: () => {},
+    extractAgentMessageText,
+    isFinalAnswerLikeAgentMessage,
+    createOmpInteractiveRunnerFn: () => ({
+      runTask: async () => ({ ok: true }),
+      closeSession(key, reason) {
+        closes.push(['one', key, reason]);
+        return true;
+      },
+      closeAll(reason) {
+        closes.push(['all', reason]);
+        return 2;
+      },
+      getSnapshot: () => [],
+    }),
+  });
+
+  assert.equal(executor.closeRuntimeSession('thread-1', 'reset'), true);
+  assert.equal(executor.closeAllRuntimeSessions('shutdown'), 2);
+  assert.deepEqual(closes, [['one', 'thread-1', 'reset'], ['all', 'shutdown']]);
 });
 
 test('createRunnerExecutor completes a Cursor JSON turn and preserves its chat id', async () => {

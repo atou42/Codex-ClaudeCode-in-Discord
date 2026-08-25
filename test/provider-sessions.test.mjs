@@ -182,7 +182,11 @@ test('provider-sessions lists Pi and OMP session journals from separate roots', 
   const piFile = path.join(piDir, '2026-07-25T00-00-00-000Z_019-pi.jsonl');
   const ompFile = path.join(ompDir, '2026-07-25T00-00-00-000Z_019-omp.jsonl');
   fs.writeFileSync(piFile, `${JSON.stringify({ type: 'session', id: '019-pi', cwd: '/tmp/workspace' })}\n`);
-  fs.writeFileSync(ompFile, `${JSON.stringify({ type: 'session', id: '019-omp', cwd: '/tmp/workspace' })}\n`);
+  fs.writeFileSync(ompFile, [
+    JSON.stringify({ type: 'title', title: '' }),
+    JSON.stringify({ type: 'session', id: '019-omp', cwd: '/tmp/workspace' }),
+    '',
+  ].join('\n'));
   fs.writeFileSync(path.join(ompDir, 'broken.jsonl'), '{not-json}\n');
   fs.utimesSync(piFile, new Date(1000), new Date(1000));
   fs.utimesSync(ompFile, new Date(2000), new Date(2000));
@@ -214,7 +218,7 @@ test('provider-sessions resolves Pi-family session workspace from its own journa
   );
   fs.writeFileSync(
     path.join(ompDir, 'omp-session.jsonl'),
-    `${JSON.stringify({ type: 'session', id: 'omp-session', cwd: '/tmp/omp-workspace' })}\n`,
+    `${JSON.stringify({ type: 'title', title: '' })}\n${JSON.stringify({ type: 'session', id: 'omp-session', cwd: '/tmp/omp-workspace' })}\n`,
   );
 
   const previousHome = process.env.HOME;

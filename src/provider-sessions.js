@@ -164,7 +164,7 @@ function listRecentPiFamilySessions(provider, limit = 10, workspaceDir = '') {
   const targetWorkspace = String(workspaceDir || '').trim();
   const latestById = new Map();
   for (const file of findFilesRecursive(sessionsRoot, (name) => name.endsWith('.jsonl'))) {
-    const header = readFirstJsonLine(file);
+    const header = readFirstJsonLineMatching(file, (row) => row?.type === 'session');
     if (header?.type !== 'session') continue;
     const id = String(header.id || '').trim();
     const cwd = String(header.cwd || '').trim();
@@ -193,7 +193,7 @@ export function readPiFamilySessionMetaBySessionId(provider, sessionId, notOlder
 
   let latest = null;
   for (const file of findFilesRecursive(sessionsRoot, (name) => name.endsWith('.jsonl'))) {
-    const header = readFirstJsonLine(file);
+    const header = readFirstJsonLineMatching(file, (row) => row?.type === 'session');
     if (header?.type !== 'session' || String(header.id || '').trim() !== targetId) continue;
     const cwd = String(header.cwd || '').trim();
     if (!cwd) continue;
