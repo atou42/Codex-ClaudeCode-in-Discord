@@ -1,0 +1,36 @@
+#!/usr/bin/expect -f
+
+package require base64
+
+log_user 1
+set timeout -1
+
+if {[llength $argv] < 1} {
+  puts stderr "omp-pty-bridge: missing command"
+  exit 64
+}
+
+spawn -noecho {*}$argv
+
+proc forward_stdin {} {
+  if {[gets stdin encoded] < 0} {
+    fileevent stdin readable {}
+    return
+  }
+  if {[catch {::base64::decode $encoded} decoded]} {
+    puts stderr "omp-pty-bridge: invalid input frame"
+    flush stderr
+    return
+  }
+  send -raw -- $decoded
+}
+
+fileevent stdin readable forward_stdin
+expect eof
+
+set child_status [wait]
+set exit_code [lindex $child_status 3]
+if {![string is integer -strict $exit_code]} {
+  exit 1
+}
+exit $exit_code

@@ -1,0 +1,7 @@
+setupVersion: 2
+startup:
+  setupWizard: false
+  showSplash: false
+  quiet: true
+goal:
+  enabled: true
