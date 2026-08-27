@@ -14,10 +14,19 @@ function appendRow(file, row) {
   fs.appendFileSync(file, `${JSON.stringify(row)}\n`);
 }
 
-function createFakeRuntime() {
+function createFakeRuntime({ acceptInputAfterMs = 0, runnerOptions = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'omp-interactive-runner-'));
   const children = [];
   let nextPid = 100;
+  const resumedSessionId = 'resume-session';
+  const resumedDir = path.join(root, 'resumed');
+  const resumedFile = path.join(resumedDir, `${resumedSessionId}.jsonl`);
+  fs.mkdirSync(resumedDir, { recursive: true });
+  fs.writeFileSync(resumedFile, [
+    JSON.stringify({ type: 'title', title: '' }),
+    JSON.stringify({ type: 'session', id: resumedSessionId, cwd: '/tmp/resumed' }),
+    '',
+  ].join('\n'));
 
   function spawnFn(_bin, args, options) {
     const child = new EventEmitter();
@@ -25,18 +34,22 @@ function createFakeRuntime() {
     child.exitCode = null;
     child.signalCode = null;
     child.killed = false;
+    child.spawnedAt = Date.now();
     child.stderr = new EventEmitter();
     child.stdout = new EventEmitter();
     const sessionDirIndex = args.indexOf('--session-dir');
     const sessionDir = args[sessionDirIndex + 1];
+    const resumeIndex = args.indexOf('--resume');
     fs.mkdirSync(sessionDir, { recursive: true });
-    const id = `omp-session-${child.pid}`;
+    const id = resumeIndex >= 0 ? args[resumeIndex + 1] : `omp-session-${child.pid}`;
     const file = path.join(sessionDir, `${id}.jsonl`);
-    fs.writeFileSync(file, [
-      JSON.stringify({ type: 'title', title: '' }),
-      JSON.stringify({ type: 'session', id, cwd: options.cwd }),
-      '',
-    ].join('\n'));
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'title', title: '' }),
+        JSON.stringify({ type: 'session', id, cwd: options.cwd }),
+        '',
+      ].join('\n'));
+    }
     child.sessionId = id;
     child.file = file;
     child.writes = [];
@@ -46,6 +59,11 @@ function createFakeRuntime() {
         const input = String(value)
           .replace(/^\u001b\[200~/, '')
           .replace(/\u001b\[201~\r$/, '');
+        if (input && Date.now() - child.spawnedAt < acceptInputAfterMs) {
+          child.stdout.emit('data', Buffer.from(input));
+          callback?.();
+          return true;
+        }
         if (input === '/goal show') {
           child.stdout.emit('data', Buffer.from('Objective: ship it\nStatus: active\n'));
           callback?.();
@@ -136,6 +154,9 @@ function createFakeRuntime() {
     spawnEnv: { HOME: root },
     getProviderBin: () => '/fake/omp',
     getSessionId: (session) => session.runnerSessionId || null,
+    readSessionMeta: (_provider, sessionId) => (
+      sessionId === resumedSessionId ? { file: resumedFile } : null
+    ),
     resolveSessionDir: ({ key }) => path.join(root, 'sessions', key),
     pollIntervalMs: 2,
     startupSettleMs: 0,
@@ -147,8 +168,9 @@ function createFakeRuntime() {
     idleMs: 20,
     stopChildProcess: (child) => child.kill('SIGTERM'),
     log: () => {},
+    ...runnerOptions,
   });
-  return { root, runner, children };
+  return { root, runner, children, resumedSessionId };
 }
 
 test('readOmpSessionJournal accepts OMP v18 title rows and preserves native goal state', () => {
@@ -262,4 +284,46 @@ test('OMP runner cleans up idle sessions without closing an active native goal',
   assert.equal(children[1].killed, false);
   assert.deepEqual(runner.getSnapshot().map((entry) => entry.key), ['active']);
   runner.closeAll('test complete');
+});
+
+test('OMP runner waits longer before submitting the first prompt to a resumed TUI', async () => {
+  const { runner, resumedSessionId } = createFakeRuntime({
+    acceptInputAfterMs: 20,
+    runnerOptions: {
+      startupSettleMs: 0,
+      resumedStartupSettleMs: 30,
+    },
+  });
+  const result = await runner.runTask({
+    session: { mode: 'safe', runnerSessionId: resumedSessionId },
+    sessionKey: 'resumed-startup',
+    workspaceDir: '/tmp/resumed',
+    prompt: 'continue',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.finalAnswerMessages[0], 'reply:continue');
+  runner.closeAll('test complete');
+});
+
+test('OMP runner closes a TUI whose submitted prompt is never accepted', async () => {
+  const { runner, children } = createFakeRuntime({
+    acceptInputAfterMs: 10_000,
+    runnerOptions: {
+      inputAcceptanceTimeoutMs: 20,
+      resolveTimeoutSetting: () => ({ timeoutMs: 200 }),
+    },
+  });
+  const result = await runner.runTask({
+    session: { mode: 'safe' },
+    sessionKey: 'dropped-input',
+    workspaceDir: '/tmp/dropped-input',
+    prompt: 'continue',
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, false);
+  assert.match(result.error, /prompt was not accepted/i);
+  assert.equal(children[0].killed, true);
+  assert.deepEqual(runner.getSnapshot(), []);
 });

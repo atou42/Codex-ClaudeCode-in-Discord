@@ -246,10 +246,13 @@ export function createOmpInteractiveRunner({
   readJournal = readOmpSessionJournal,
   pollIntervalMs = 100,
   startupSettleMs = 750,
+  resumedStartupSettleMs = 5000,
   localCommandSettleMs = 750,
   localCommandTimeoutMs = 10_000,
   clearConfirmTimeoutMs = 5000,
+  inputAcceptanceTimeoutMs = 15_000,
   inputSubmitDelayMs = 50,
+  firstInputSubmitDelayMs = 1000,
   inputClearDelayMs = 25,
   goalQuietMs = 2500,
   discoveryTimeoutMs = 30_000,
@@ -431,13 +434,17 @@ export function createOmpInteractiveRunner({
       rawOutputTail: '',
       lastOutputAt: 0,
       sawTerminalInit: false,
+      inputWriteCount: 0,
       existingJournalFiles,
     };
     entries.set(key, entry);
     attachProcessHandlers(entry);
     try {
       if (spawnFn === spawn) await waitForTuiReady(entry);
-      if (startupSettleMs > 0) await wait(startupSettleMs);
+      const settleMs = requestedSessionId
+        ? Math.max(startupSettleMs, resumedStartupSettleMs)
+        : startupSettleMs;
+      if (settleMs > 0) await wait(settleMs);
       if (entry.journalFile) {
         entry.lastJournal = readJournal(entry.journalFile);
       } else {
@@ -498,6 +505,10 @@ export function createOmpInteractiveRunner({
     const text = [String(prompt || ''), ...attachments].filter(Boolean).join('\n');
     const paste = text.includes('\n') ? `\u001b[200~${text}\u001b[201~` : text;
     const confirmAutocomplete = /^\/goal\s+(show|pause|resume|drop)\s*$/i.test(text);
+    const submitDelayMs = entry.inputWriteCount === 0
+      ? Math.max(inputSubmitDelayMs, firstInputSubmitDelayMs)
+      : inputSubmitDelayMs;
+    entry.inputWriteCount += 1;
     if (inputSubmitDelayMs <= 0 && inputClearDelayMs <= 0) {
       const testPaste = `\u001b[200~${text}\u001b[201~`;
       entry.child.stdin.write(`${testPaste}\r`, callback);
@@ -513,8 +524,8 @@ export function createOmpInteractiveRunner({
           callback?.(submitErr);
           return;
         }
-        setTimeout(() => entry.child.stdin.write('\r', callback), inputSubmitDelayMs);
-      }), inputSubmitDelayMs);
+        setTimeout(() => entry.child.stdin.write('\r', callback), submitDelayMs);
+      }), submitDelayMs);
     });
     entry.child.stdin.write('\u0015', (err) => {
       if (err) {
@@ -571,6 +582,12 @@ export function createOmpInteractiveRunner({
         turn.onEvent?.(row?.type === 'message' ? { ...row, type: 'message_end' } : row);
       }
       emittedRows = journal.rowCount;
+      const journalAcceptedInput = journal.rows
+        .slice(baseline.rowCount)
+        .some((row) => (
+          row?.type === 'message'
+          && ['user', 'assistant'].includes(normalize(row.message?.role).toLowerCase())
+        ) || (command && row?.type === 'mode_change'));
 
       if (command?.action === 'show') {
         const visible = cleanTerminalOutput(turn.rawOutput);
@@ -601,7 +618,7 @@ export function createOmpInteractiveRunner({
             ? `OMP goal ${command.action} did not complete: ${detail.slice(-1000)}`
             : `OMP goal ${command.action} did not complete`,
           entry.sessionId,
-          { logs: turn.logs },
+          { logs: turn.logs, submissionFailed: !journalAcceptedInput && !turn.localOutputSeenAt },
         );
       }
 
@@ -612,7 +629,16 @@ export function createOmpInteractiveRunner({
             ? `Timed out waiting for OMP interactive session journal: ${detail.slice(-1000)}`
             : 'Timed out waiting for OMP interactive session journal',
           entry.sessionId,
-          { logs: turn.logs },
+          { logs: turn.logs, submissionFailed: true },
+        );
+      }
+
+      const inputAccepted = Boolean(turn.localOutputSeenAt) || journalAcceptedInput;
+      if (!inputAccepted && Date.now() - turn.startedAt >= inputAcceptanceTimeoutMs) {
+        return buildEmptyResult(
+          `OMP prompt was not accepted by the interactive TUI within ${inputAcceptanceTimeoutMs}ms`,
+          entry.sessionId,
+          { logs: turn.logs, submissionFailed: true },
         );
       }
 
@@ -744,6 +770,11 @@ export function createOmpInteractiveRunner({
             return;
           }
           const result = await waitForCommandResult(entry, turn, baseline, command);
+          if (result.submissionFailed) {
+            logEvent('submission-timeout', { key: entry.key, pid: entry.child?.pid ?? 'none' });
+            closeEntry(entry, result.error);
+            return;
+          }
           if (entry.currentTurn === turn) resolveTurn(entry, result);
         });
       } catch (err) {
