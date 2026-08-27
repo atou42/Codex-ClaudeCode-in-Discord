@@ -37,8 +37,25 @@ function composePromptWithSystemFallback(prompt, systemPrompt) {
   ].join('\n');
 }
 
+function matchesContextModel(model, targetModel) {
+  const target = String(targetModel || '').trim();
+  return !target || String(model || '').trim().toLowerCase() === target.toLowerCase();
+}
+
+function modelLimit(map, model) {
+  if (!map || typeof map !== 'object') return null;
+  const key = String(model || '').trim().toLowerCase();
+  const entry = Object.entries(map).find(([name]) => String(name).trim().toLowerCase() === key);
+  return entry ? entry[1] : null;
+}
+
 export function createRunnerArgsBuilder({
   defaultModel = null,
+  codexModelContextWindow = null,
+  codexModelContextWindowModel = null,
+  codexModelContextWindows = null,
+  codexModelCompactTokenLimits = null,
+  codexModelCatalogJson = null,
   normalizeProvider = (value) => String(value || '').trim().toLowerCase(),
   getSessionId = () => null,
   resolveModelSetting = () => ({ value: defaultModel, source: 'provider' }),
@@ -143,6 +160,9 @@ export function createRunnerArgsBuilder({
       || fastMode.enabled === false;
 
     const common = ['--enable', 'goals', ...buildCodexOpenAICuratedMarketplaceArgs()];
+    if (codexModelCatalogJson) {
+      common.push('-c', `model_catalog_json=${tomlString(codexModelCatalogJson)}`);
+    }
     if (systemText) common.push('-c', `developer_instructions=${tomlString(systemText)}`);
     if (codexProfile?.isExplicit) {
       if (!codexProfile.valid) {
@@ -155,8 +175,19 @@ export function createRunnerArgsBuilder({
     if (shouldPassFastMode) {
       common.push('-c', `features.fast_mode=${fastMode.enabled ? 'true' : 'false'}`);
     }
+    const modelContextWindow = modelLimit(codexModelContextWindows, model)
+      ?? (codexModelContextWindow !== null && matchesContextModel(model, codexModelContextWindowModel)
+        ? codexModelContextWindow
+        : null);
+    if (modelContextWindow !== null) {
+      common.push('-c', `model_context_window=${modelContextWindow}`);
+    }
     if (compactSetting.strategy === 'native' && compactEnabled.enabled) {
-      common.push('-c', `model_auto_compact_token_limit=${nativeLimit.tokens}`);
+      const modelCompactLimit = modelLimit(codexModelCompactTokenLimits, model);
+      const effectiveNativeLimit = modelCompactLimit !== null && nativeLimit.source === 'env default'
+        ? modelCompactLimit
+        : nativeLimit.tokens;
+      common.push('-c', `model_auto_compact_token_limit=${effectiveNativeLimit}`);
     }
     for (const cfg of extraConfigs) common.push('-c', cfg);
     for (const imagePath of inputImages) {

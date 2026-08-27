@@ -68,6 +68,11 @@ import { stopChildProcess } from './channel-runtime.js';
 import { loadRuntimeEnv } from './env-loader.js';
 import { buildCompactThresholdDefaults } from './compact-threshold-defaults.js';
 import {
+  prepareCodexModelCatalog,
+  resolveCodexContextLimits,
+  resolveCodexModelLimits,
+} from './codex-context-limits.js';
+import {
   extractRawProgressTextFromEvent as extractRawProgressTextFromEventBase,
 } from './progress-utils.js';
 import {
@@ -417,6 +422,28 @@ const MODEL_AUTO_COMPACT_TOKEN_LIMIT = toInt(
   process.env.MODEL_AUTO_COMPACT_TOKEN_LIMIT,
   MAX_INPUT_TOKENS_BEFORE_COMPACT,
 );
+const CODEX_CONTEXT_LIMITS = resolveCodexContextLimits({
+  env: process.env,
+  compactThreshold: MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+  appliedProviderScope: envState.appliedProviderScope,
+  appliedScopedKeys: envState.appliedScopedKeys,
+  defaultModel: DEFAULT_MODEL,
+});
+const CODEX_MODEL_LIMITS = resolveCodexModelLimits({
+  env: process.env,
+  compactThreshold: MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+  appliedProviderScope: envState.appliedProviderScope,
+  appliedScopedKeys: envState.appliedScopedKeys,
+  defaultModel: DEFAULT_MODEL,
+});
+const CODEX_MODEL_CATALOG_JSON = (BOT_PROVIDER === null || BOT_PROVIDER === 'codex')
+  && Object.keys(CODEX_MODEL_LIMITS.contextWindows).length
+  ? prepareCodexModelCatalog({
+    sourcePath: path.join(process.env.HOME || '', '.codex', 'models_cache.json'),
+    outputPath: path.join(DATA_DIR, 'codex-model-catalog.json'),
+    modelContextWindows: CODEX_MODEL_LIMITS.contextWindows,
+  })
+  : null;
 const CLAUDE_RUNTIME_MODE = normalizeSessionRuntimeMode(
   process.env.CLAUDE__RUNTIME_MODE || process.env.CLAUDE_RUNTIME_MODE || 'normal',
 ) || 'normal';
@@ -574,6 +601,7 @@ const appContext = createAppContext({
     maxInputTokensBeforeCompact: MAX_INPUT_TOKENS_BEFORE_COMPACT,
     compactThresholdDefaults: COMPACT_THRESHOLD_DEFAULTS,
     modelAutoCompactTokenLimit: MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+    modelCompactTokenLimits: CODEX_MODEL_LIMITS.compactTokenLimits,
     defaultReplyDeliveryMode: resolveReplyDeliveryDefault().mode,
     readDefaultReplyDeliveryMode: () => resolveReplyDeliveryDefault().mode,
     defaultExtraInfoEnabled: EXTRA_INFO_ENABLED === null ? true : EXTRA_INFO_ENABLED,
@@ -695,6 +723,11 @@ const appContext = createAppContext({
       spawnEnv: SPAWN_ENV,
       defaultTimeoutMs: CODEX_TIMEOUT_MS,
       defaultModel: DEFAULT_MODEL,
+      codexModelContextWindow: CODEX_CONTEXT_LIMITS.modelContextWindow,
+      codexModelContextWindowModel: CODEX_CONTEXT_LIMITS.model,
+      codexModelContextWindows: CODEX_MODEL_LIMITS.contextWindows,
+      codexModelCompactTokenLimits: CODEX_MODEL_LIMITS.compactTokenLimits,
+      codexModelCatalogJson: CODEX_MODEL_CATALOG_JSON,
       claudeLongIdleMs: CLAUDE_LONG_IDLE_MS,
       claudeLongMaxSessions: CLAUDE_LONG_MAX_SESSIONS,
       codexAppServerIdleMs: CODEX_APP_SERVER_IDLE_MS,
@@ -1086,6 +1119,11 @@ console.log([
   `• DEFAULT_PROVIDER=${DEFAULT_PROVIDER}`,
   `• DEFAULT_MODE=${DEFAULT_MODE}`,
   `• CODEX_RUNTIME_MODE=${CODEX_RUNTIME_MODE}`,
+  `• CODEX_MODEL_CONTEXT_WINDOW=${CODEX_CONTEXT_LIMITS.modelContextWindow ?? 'provider-catalog'}`,
+  `• CODEX_MODEL_CONTEXT_MODEL=${CODEX_CONTEXT_LIMITS.model ?? 'active-model'}`,
+  `• CODEX_MODEL_CATALOG_JSON=${CODEX_MODEL_CATALOG_JSON ?? 'none'}`,
+  `• CODEX_NATIVE_COMPACT_LIMIT=${MODEL_AUTO_COMPACT_TOKEN_LIMIT}`,
+  `• CODEX_MODEL_LIMITS=${JSON.stringify(CODEX_MODEL_LIMITS.compactTokenLimits)}`,
   `• CODEX_APP_SERVER_IDLE_MS=${CODEX_APP_SERVER_IDLE_MS}`,
   `• CODEX_APP_SERVER_MAX_SESSIONS=${CODEX_APP_SERVER_MAX_SESSIONS}`,
   `• CODEX_APP_SERVER_DISABLED_MCP_SERVERS=${CODEX_APP_SERVER_DISABLED_MCP_SERVERS.length ? CODEX_APP_SERVER_DISABLED_MCP_SERVERS.join(',') : '(none)'}`,

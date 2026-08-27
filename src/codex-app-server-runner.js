@@ -10,6 +10,18 @@ function normalizeText(value) {
   return text || null;
 }
 
+function matchesContextModel(model, targetModel) {
+  const target = String(targetModel || '').trim();
+  return !target || String(model || '').trim().toLowerCase() === target.toLowerCase();
+}
+
+function modelLimit(map, model) {
+  if (!map || typeof map !== 'object') return null;
+  const key = String(model || '').trim().toLowerCase();
+  const entry = Object.entries(map).find(([name]) => String(name).trim().toLowerCase() === key);
+  return entry ? entry[1] : null;
+}
+
 function normalizeProviderItemType(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -63,6 +75,10 @@ function setConfigPath(target, path, value) {
 
 export function buildCodexLongConfig({
   session,
+  modelContextWindow = null,
+  modelContextWindowModel = null,
+  modelContextWindows = null,
+  modelCompactTokenLimits = null,
   resolveFastModeSetting,
   resolveCompactStrategySetting,
   resolveCompactEnabledSetting,
@@ -73,6 +89,13 @@ export function buildCodexLongConfig({
   }
 
   const config = {};
+  const selectedContextWindow = modelLimit(modelContextWindows, session?.model)
+    ?? (modelContextWindow !== null && matchesContextModel(session?.model, modelContextWindowModel)
+      ? modelContextWindow
+      : null);
+  if (selectedContextWindow !== null) {
+    setConfigPath(config, 'model_context_window', selectedContextWindow);
+  }
   const fastMode = resolveFastModeSetting(session);
   if (fastMode.source === 'session override' || fastMode.source === 'parent channel' || fastMode.enabled === false) {
     setConfigPath(config, 'features.fast_mode', Boolean(fastMode.enabled));
@@ -82,7 +105,11 @@ export function buildCodexLongConfig({
   const compactEnabled = resolveCompactEnabledSetting(session);
   const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
   if (compactSetting.strategy === 'native' && compactEnabled.enabled) {
-    setConfigPath(config, 'model_auto_compact_token_limit', nativeLimit.tokens);
+    const modelCompactLimit = modelLimit(modelCompactTokenLimits, session?.model);
+    const effectiveNativeLimit = modelCompactLimit !== null && nativeLimit.source === 'env default'
+      ? modelCompactLimit
+      : nativeLimit.tokens;
+    setConfigPath(config, 'model_auto_compact_token_limit', effectiveNativeLimit);
   }
 
   applyCodexOpenAICuratedMarketplaceConfig(config);
@@ -218,6 +245,10 @@ function buildRuntimeSignature({
   resolveCompactStrategySetting,
   resolveCompactEnabledSetting,
   resolveNativeCompactTokenLimitSetting,
+  modelContextWindow,
+  modelContextWindowModel,
+  modelContextWindows,
+  modelCompactTokenLimits,
 }) {
   const codexProfile = resolveCodexProfileSetting(session);
   return JSON.stringify({
@@ -230,6 +261,10 @@ function buildRuntimeSignature({
     compact: resolveCompactStrategySetting(session),
     compactEnabled: resolveCompactEnabledSetting(session),
     nativeLimit: resolveNativeCompactTokenLimitSetting(session),
+    modelContextWindow,
+    modelContextWindowModel,
+    modelContextWindows,
+    modelCompactTokenLimits,
     configOverrides: session?.configOverrides || [],
     systemPrompt: String(systemPrompt || '').trim(),
   });
@@ -246,6 +281,11 @@ export function createCodexAppServerRunner({
   resolveCompactStrategySetting = () => ({ strategy: 'hard' }),
   resolveCompactEnabledSetting = () => ({ enabled: false }),
   resolveNativeCompactTokenLimitSetting = () => ({ tokens: 0 }),
+  modelContextWindow = null,
+  modelContextWindowModel = null,
+  modelContextWindows = null,
+  modelCompactTokenLimits = null,
+  modelCatalogJson = null,
   normalizeTimeoutMs = (value, fallback) => Number(value || fallback || 0),
   resolveTimeoutSetting = () => ({ timeoutMs: 0 }),
   safeError = formatError,
@@ -697,7 +737,11 @@ export function createCodexAppServerRunner({
 
     const model = resolveModelSetting(session).value || null;
     const config = buildCodexLongConfig({
-      session,
+      session: { ...session, model },
+      modelContextWindow,
+      modelContextWindowModel,
+      modelContextWindows,
+      modelCompactTokenLimits,
       resolveFastModeSetting,
       resolveCompactStrategySetting,
       resolveCompactEnabledSetting,
@@ -828,6 +872,10 @@ export function createCodexAppServerRunner({
       resolveCompactStrategySetting,
       resolveCompactEnabledSetting,
       resolveNativeCompactTokenLimitSetting,
+      modelContextWindow,
+      modelContextWindowModel,
+      modelContextWindows,
+      modelCompactTokenLimits,
     });
     const existing = entries.get(key);
     if (existing) {
@@ -853,6 +901,7 @@ export function createCodexAppServerRunner({
     const child = spawnFn(getProviderBin('codex'), buildCodexAppServerArgs({
       enabledFeatures: ['goals'],
       disabledMcpServers,
+      modelCatalogJson,
     }), {
       cwd: workspaceDir,
       env: spawnEnv,

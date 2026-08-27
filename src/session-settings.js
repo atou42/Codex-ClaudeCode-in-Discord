@@ -377,6 +377,7 @@ export function createSessionSettings({
   maxInputTokensBeforeCompact = 250000,
   compactThresholdDefaults = null,
   modelAutoCompactTokenLimit = maxInputTokensBeforeCompact,
+  modelCompactTokenLimits = null,
   defaultReplyDeliveryMode = 'card_mention',
   readDefaultReplyDeliveryMode = () => defaultReplyDeliveryMode,
   defaultExtraInfoEnabled = true,
@@ -847,7 +848,15 @@ export function createSessionSettings({
     return tokens;
   }
 
-  function resolveProviderCompactThresholdDefault(provider) {
+  function resolveProviderCompactThresholdDefault(provider, session = null) {
+    if (provider === 'codex' && modelCompactTokenLimits && typeof modelCompactTokenLimits === 'object') {
+      const model = String(resolveModelSetting(session)?.value || '').trim().toLowerCase();
+      const match = Object.entries(modelCompactTokenLimits)
+        .find(([name]) => String(name).trim().toLowerCase() === model);
+      if (match) {
+        return { tokens: match[1], source: 'model env default' };
+      }
+    }
     const configured = compactThresholdDefaults?.[provider];
     if (configured !== null && configured !== undefined) {
       const rawTokens = typeof configured === 'object' && !Array.isArray(configured)
@@ -881,7 +890,7 @@ export function createSessionSettings({
 
   function resolveCompactThresholdSetting(session) {
     const provider = normalizeProvider(session?.provider);
-    const providerDefault = resolveProviderCompactThresholdDefault(provider);
+    const providerDefault = resolveProviderCompactThresholdDefault(provider, session);
     if (getSupportedCompactStrategies(provider).length === 0) {
       return { tokens: null, source: 'provider unsupported' };
     }
@@ -995,6 +1004,15 @@ export function createSessionSettings({
       return { tokens: parentThreshold, source: 'parent channel threshold fallback' };
     }
 
+    const model = String(resolveModelSetting(session)?.value || '').trim().toLowerCase();
+    const modelMatch = Object.entries(modelCompactTokenLimits || {})
+      .find(([name]) => String(name).trim().toLowerCase() === model);
+    if (modelMatch) {
+      return {
+        tokens: readStrictCompactTokenLimit(modelMatch[1], `native default for ${model}`),
+        source: 'model env default',
+      };
+    }
     const tokens = readStrictCompactTokenLimit(modelAutoCompactTokenLimit, 'native default for codex');
     return { tokens, source: 'env default' };
   }

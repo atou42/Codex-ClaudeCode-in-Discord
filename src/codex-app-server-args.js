@@ -24,8 +24,10 @@ export function normalizeDisabledMcpServers(value) {
 export function buildCodexAppServerArgs({
   enabledFeatures = [],
   disabledMcpServers = [],
+  modelCatalogJson = null,
 } = {}) {
   const args = ['app-server', '--listen', 'stdio://'];
+  if (modelCatalogJson) args.push('-c', `model_catalog_json=${JSON.stringify(String(modelCatalogJson))}`);
   for (const serverName of normalizeDisabledMcpServers(disabledMcpServers)) {
     args.push('-c', `mcp_servers.${serverName}.enabled=false`);
   }
