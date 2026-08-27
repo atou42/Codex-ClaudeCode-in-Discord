@@ -135,6 +135,50 @@ test('buildCodexLongConfig pins openai-curated marketplace to local cache when p
   }
 });
 
+test('buildCodexLongConfig forwards the configured model context window with native compaction', () => {
+  const config = buildCodexLongConfig({
+    session: {},
+    modelContextWindow: 1_050_000,
+    resolveFastModeSetting: () => ({ enabled: true, source: 'provider default' }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 400_000 }),
+  });
+
+  assert.equal(config.model_context_window, 1_050_000);
+  assert.equal(config.model_auto_compact_token_limit, 400_000);
+});
+
+test('buildCodexLongConfig limits the context override to its target model', () => {
+  const config = buildCodexLongConfig({
+    session: { model: 'gpt-5.5' },
+    modelContextWindow: 1_050_000,
+    modelContextWindowModel: 'gpt-5.6-sol',
+    resolveFastModeSetting: () => ({ enabled: true, source: 'provider default' }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 400_000 }),
+  });
+
+  assert.equal(config.model_context_window, undefined);
+  assert.equal(config.model_auto_compact_token_limit, 400_000);
+});
+
+test('buildCodexLongConfig applies Luna native compaction independently from Sol', () => {
+  const config = buildCodexLongConfig({
+    session: { model: 'gpt-5.6-luna' },
+    modelContextWindows: { 'gpt-5.6-sol': 1050000, 'gpt-5.6-luna': 1050000 },
+    modelCompactTokenLimits: { 'gpt-5.6-sol': 400000, 'gpt-5.6-luna': 40000 },
+    resolveFastModeSetting: () => ({ enabled: true, source: 'provider default' }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 400000, source: 'env default' }),
+  });
+
+  assert.equal(config.model_context_window, 1050000);
+  assert.equal(config.model_auto_compact_token_limit, 40000);
+});
+
 test('createCodexAppServerRunner runs a turn over persistent app-server and closes after idle', async () => {
   const fake = createFakeAppServerSpawn();
   const events = [];
@@ -189,6 +233,48 @@ test('createCodexAppServerRunner runs a turn over persistent app-server and clos
 
   await sleep(20);
   assert.equal(fake.child.killed, true);
+});
+
+test('createCodexAppServerRunner starts Codex with the configured model catalog', async () => {
+  const fake = createFakeAppServerSpawn();
+  const runner = createCodexAppServerRunner({
+    spawnEnv: { HOME: '/tmp/home' },
+    getProviderBin: () => 'codex-test',
+    getSessionId: () => null,
+    resolveModelSetting: () => ({ value: 'gpt-5.6-sol' }),
+    resolveCodexProfileSetting: () => ({ value: null, isExplicit: false, valid: true }),
+    resolveReasoningEffortSetting: () => ({ value: null }),
+    resolveFastModeSetting: () => ({ enabled: true, source: 'provider default' }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 400000 }),
+    modelContextWindow: 1050000,
+    modelContextWindowModel: 'gpt-5.6-sol',
+    modelCatalogJson: '/tmp/codex-model-catalog.json',
+    resolveTimeoutSetting: () => ({ timeoutMs: 0 }),
+    normalizeTimeoutMs: (value) => Number(value || 0),
+    idleMs: 0,
+    spawnFn: fake.spawnFn,
+    stopChildProcess: (child) => child.kill(),
+    log: () => {},
+  });
+  const result = await runner.runTask({
+    session: { provider: 'codex', mode: 'safe' },
+    sessionKey: 'catalog-session',
+    workspaceDir: '/tmp/workspace',
+    prompt: 'hello',
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(fake.calls[0].args, [
+    'app-server',
+    '--listen',
+    'stdio://',
+    '-c',
+    'model_catalog_json="/tmp/codex-model-catalog.json"',
+    '--enable',
+    'goals',
+  ]);
+  runner.closeAll('test done');
 });
 
 test('createCodexAppServerRunner forwards completed native reasoning summaries as progress events', async () => {

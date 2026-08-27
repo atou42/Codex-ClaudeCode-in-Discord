@@ -133,6 +133,29 @@ test('session-settings resolves timeout security profile and compact values with
   });
 });
 
+test('session-settings exposes the effective Codex compact limit for each selected model', () => {
+  const settings = createSessionSettings({
+    modelCompactTokenLimits: { 'gpt-5.6-sol': 400000, 'gpt-5.6-luna': 40000 },
+    readCodexDefaults: () => ({ model: 'gpt-5.6-sol', modelConfigured: true, effort: 'high' }),
+    normalizeProvider: testNormalizeProvider,
+  });
+
+  assert.deepEqual(settings.resolveCompactThresholdSetting({
+    provider: 'codex',
+    model: 'gpt-5.6-luna',
+  }), {
+    tokens: 40000,
+    source: 'model env default',
+  });
+  assert.deepEqual(settings.resolveNativeCompactTokenLimitSetting({
+    provider: 'codex',
+    model: 'gpt-5.6-luna',
+  }), {
+    tokens: 40000,
+    source: 'model env default',
+  });
+});
+
 test('session-settings isolates compact threshold defaults by provider without losing explicit overrides', () => {
   const settings = createSessionSettings({
     maxInputTokensBeforeCompact: 272_000,

@@ -280,6 +280,7 @@ test('createRunnerArgsBuilder maps OMP fast overrides to service tier without af
 test('createRunnerArgsBuilder adds native compact config for fresh codex sessions when enabled', () => {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     defaultModel: 'gpt-5-codex',
+    codexModelContextWindow: 1_050_000,
     normalizeProvider: (value) => value,
     getSessionId: () => null,
     resolveFastModeSetting: () => ({ enabled: true, source: 'session override' }),
@@ -317,6 +318,8 @@ test('createRunnerArgsBuilder adds native compact config for fresh codex session
     '-c',
     'features.fast_mode=true',
     '-c',
+    'model_context_window=1050000',
+    '-c',
     'model_auto_compact_token_limit=123456',
     '-c',
     'foo="bar"',
@@ -327,6 +330,7 @@ test('createRunnerArgsBuilder adds native compact config for fresh codex session
 test('createRunnerArgsBuilder keeps native compact config for resumed codex sessions', () => {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     defaultModel: 'gpt-5-codex',
+    codexModelContextWindow: 1_050_000,
     normalizeProvider: (value) => value,
     getSessionId: () => 'sess-1',
     resolveFastModeSetting: () => ({ enabled: true, source: 'session override' }),
@@ -362,12 +366,55 @@ test('createRunnerArgsBuilder keeps native compact config for resumed codex sess
     '-c',
     'features.fast_mode=true',
     '-c',
+    'model_context_window=1050000',
+    '-c',
     'model_auto_compact_token_limit=123456',
     '-c',
     'foo="bar"',
     'sess-1',
     'inspect',
   ]);
+});
+
+test('createRunnerArgsBuilder never passes the Codex context window to non-Codex providers', () => {
+  const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
+    codexModelContextWindow: 1_050_000,
+    normalizeProvider: (value) => value,
+    getSessionId: () => null,
+  });
+
+  for (const provider of ['claude', 'cursor', 'grok', 'antigravity', 'zcode', 'pi', 'omp']) {
+    const args = buildSessionRunnerArgs({
+      provider,
+      session: { provider, mode: 'safe', configOverrides: [] },
+      workspaceDir: '/tmp/workspace',
+      prompt: 'inspect',
+    });
+    assert.equal(args.join(' ').includes('model_context_window'), false, provider);
+    assert.equal(args.join(' ').includes('1050000'), false, provider);
+  }
+});
+
+test('createRunnerArgsBuilder applies model-specific Codex context and compact limits', () => {
+  const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
+    codexModelContextWindows: { 'gpt-5.6-sol': 1050000, 'gpt-5.6-luna': 1050000 },
+    codexModelCompactTokenLimits: { 'gpt-5.6-sol': 400000, 'gpt-5.6-luna': 40000 },
+    normalizeProvider: (value) => value,
+    getSessionId: () => null,
+    resolveModelSetting: (session) => ({ value: session.model, source: 'session override' }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 400000, source: 'env default' }),
+  });
+  const args = buildSessionRunnerArgs({
+    provider: 'codex',
+    session: { provider: 'codex', mode: 'safe', model: 'gpt-5.6-luna', configOverrides: [] },
+    workspaceDir: '/tmp/workspace',
+    prompt: 'inspect',
+  });
+  assert.equal(args.includes('model_context_window=1050000'), true);
+  assert.equal(args.includes('model_auto_compact_token_limit=40000'), true);
+  assert.equal(args.includes('model_auto_compact_token_limit=400000'), false);
 });
 
 test('createRunnerArgsBuilder never passes the Codex compact threshold to non-Codex providers', () => {
