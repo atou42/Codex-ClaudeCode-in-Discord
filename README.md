@@ -271,6 +271,12 @@ compact 相关配置可以在 `.env` 里设默认，也可以在 Discord 里按�
 COMPACT_STRATEGY=native
 COMPACT_ON_THRESHOLD=true
 CODEX__MAX_INPUT_TOKENS_BEFORE_COMPACT=272000
+# Optional: ask Codex to use a larger native context window. The active CLI
+# route may clamp this to the model catalog maximum.
+CODEX__MODEL_CONTEXT_WINDOW=1050000
+CODEX__MODEL_CONTEXT_MODEL=gpt-5.6-sol
+CODEX__MODEL_CONTEXT_WINDOWS={"gpt-5.6-sol":1050000,"gpt-5.6-luna":1050000}
+CODEX__MODEL_AUTO_COMPACT_TOKEN_LIMITS={"gpt-5.6-sol":400000,"gpt-5.6-luna":40000}
 ```
 
 进度卡默认只展示 agent 自己的过程叙述，不展示模型的 reasoning 摘要。想开的话设 `SHOW_REASONING=true`，同时 CLI 那边也要产出 reasoning 事件——Codex 需要在 `~/.codex/config.toml` 里设 `model_reasoning_summary = "detailed"`。
