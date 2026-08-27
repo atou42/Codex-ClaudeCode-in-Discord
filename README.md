@@ -1,3 +1,5 @@
+
+
 # Agents in Discord
 
 在 Discord 线程里运行 Codex CLI、Claude Code、Cursor Agent、Grok Build、Antigravity CLI、ZCode CLI、Pi Agent 和 Oh My Pi 的 bot。
@@ -188,7 +190,7 @@ workspace 是 CLI 真正执行任务的目录。
 
 ## 运行模式
 
-本地开发可以直接跑 shared bot。
+本地开发可以直接跑 shared bot。调试时推荐使用 `npm run dev`（或 `npm run dev:<provider>`），它基于 `node --watch` 会在代码变更后自动重启。
 
 ```bash
 npm start
