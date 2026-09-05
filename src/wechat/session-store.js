@@ -69,9 +69,13 @@ export function createWechatSessionStore({
       .filter(Boolean)
       .map((item) => path.resolve(item)),
   )];
-  let db = readJson(dataFile, { version: 1, users: {} });
-  if (!db || typeof db !== 'object' || Array.isArray(db)) db = { version: 1, users: {} };
-  if (!db.users || typeof db.users !== 'object' || Array.isArray(db.users)) db.users = {};
+  const db = readJson(dataFile, { version: 1, users: {} });
+  const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!isRecord(db) || !isRecord(db.users)
+    || (db.version !== undefined && db.version !== 1)
+    || Object.values(db.users).some((session) => !isRecord(session))) {
+    throw new Error(`Invalid WeChat session state in ${dataFile}; preserve the file and repair it before restarting`);
+  }
   const recentSelections = new Map();
 
   function save() {
