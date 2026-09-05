@@ -24,6 +24,7 @@ export function createChannelQueue({
   slashRef = (name) => `/${name}`,
   safeReply,
   safeError,
+  logger = console,
   getCurrentUserId,
   handlePrompt,
   steerPrompt = null,
@@ -82,29 +83,34 @@ export function createChannelQueue({
       };
     }
 
+    let outcome;
     try {
-      const outcome = await steerPrompt({
+      outcome = await steerPrompt({
         message,
         key,
         content,
         session,
         channelState: state,
       });
-      if (outcome?.steered) {
-        await safeReply(message, '↪️ 已插入当前 Codex 任务。');
-        return { ok: true, steered: true };
-      }
+    } catch (err) {
+      return { ok: false, steered: false, fallbackReason: safeError(err) };
+    }
+    if (!outcome?.steered) {
       return {
         ok: false,
         steered: false,
         fallbackReason: outcome?.error || outcome?.reason || 'steer failed',
       };
+    }
+
+    // Delivery failure does not undo a steer already accepted by the runner.
+    try {
+      await safeReply(message, '↪️ 已插入当前 Codex 任务。');
+      return { ok: true, steered: true };
     } catch (err) {
-      return {
-        ok: false,
-        steered: false,
-        fallbackReason: safeError(err),
-      };
+      const notificationError = safeError(err);
+      logger.warn(`steer accepted for ${key}, but notification failed: ${notificationError}`);
+      return { ok: true, steered: true, notificationError };
     }
   }
 
@@ -129,7 +135,10 @@ export function createChannelQueue({
       session,
     });
     if (steerAttempt?.steered) {
-      return { ok: true, enqueued: false, steered: true };
+      return {
+        ok: true, enqueued: false, steered: true,
+        ...(steerAttempt.notificationError ? { notificationError: steerAttempt.notificationError } : {}),
+      };
     }
 
     const maxQueue = security.maxQueuePerChannel;
