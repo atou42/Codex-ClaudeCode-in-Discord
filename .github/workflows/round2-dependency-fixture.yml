@@ -1,0 +1,35 @@
+name: Round-two isolated dependency fixture
+on:
+  push:
+    branches: [review/round2-dependency-fixture-20260905]
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.16.0'
+      - name: Install exact locked dependencies without lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir fixture
+          cd fixture
+          root=https://raw.githubusercontent.com/atou42/agents-in-discord/88244c11b9f4b4b0f4c7f7213b8d1c1f501f48d2
+          curl --fail --silent --show-error "$root/package.json" -o package.json
+          curl --fail --silent --show-error "$root/package-lock.json" -o package-lock.json
+          test "$(git hash-object package.json)" = 0b4d989bfcc9c1b5330b35063ebdb4c99301ab2d
+          test "$(git hash-object package-lock.json)" = 5b79dc1bdc04ffe414ea97fcc01b728f713a06b6
+          npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tee install.log
+          npm ls --all --json > dependency-tree.json
+          { node --version; npm --version; sha256sum package-lock.json; } > versions.txt
+          tar -czf ../locked-dependencies.tgz node_modules package.json package-lock.json install.log dependency-tree.json versions.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: round2-locked-dependencies
+          path: locked-dependencies.tgz
+          retention-days: 7
+          if-no-files-found: error
