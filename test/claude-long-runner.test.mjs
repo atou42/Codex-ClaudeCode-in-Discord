@@ -118,6 +118,51 @@ test('Claude long runner resolves a turn on result and reuses the hot process fo
   assert.match(logs.join('\n'), /\[claude-long\] reuse .*sessionId=sess-1/);
 });
 
+test('Claude long runner applies native auto-compact and restarts when its limit changes', async () => {
+  const fake = createFakeSpawn();
+  const runner = createClaudeLongRunner({
+    spawnFn: fake.spawnFn,
+    getProviderBin: () => 'claude',
+    getSessionId: (session) => session.runnerSessionId || null,
+    resolveModelSetting: () => ({ value: 'claude-fable-5-1' }),
+    resolveReasoningEffortSetting: () => ({ value: null }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: (session) => ({ tokens: session.nativeCompactTokenLimit ?? null }),
+    resolveTimeoutSetting: () => ({ timeoutMs: 0 }),
+    normalizeTimeoutMs: (value) => Number(value || 0),
+    stopChildProcess: (child) => child.kill('SIGTERM'),
+    log: () => {},
+  });
+
+  const firstSession = { provider: 'claude', mode: 'safe', runnerSessionId: null, nativeCompactTokenLimit: null };
+  const first = runner.runTask({
+    session: firstSession,
+    sessionKey: 'thread-compact',
+    workspaceDir: '/tmp/workspace-compact',
+    prompt: 'hello',
+  });
+  assert.equal(fake.children[0].args[fake.children[0].args.indexOf('--autocompact') + 1], 'auto');
+  emitEvent(fake.children[0], { type: 'result', session_id: 'compact-session' });
+  await first;
+
+  const second = runner.runTask({
+    session: {
+      provider: 'claude',
+      mode: 'safe',
+      runnerSessionId: 'compact-session',
+      nativeCompactTokenLimit: 320000,
+    },
+    sessionKey: 'thread-compact',
+    workspaceDir: '/tmp/workspace-compact',
+    prompt: 'again',
+  });
+  assert.equal(fake.children.length, 2);
+  assert.equal(fake.children[1].args[fake.children[1].args.indexOf('--autocompact') + 1], '320000');
+  emitEvent(fake.children[1], { type: 'result', session_id: 'compact-session' });
+  await second;
+});
+
 test('Claude long runner starts pending forks with --fork-session and the child session id', async () => {
   const fake = createFakeSpawn();
   const runner = createClaudeLongRunner({

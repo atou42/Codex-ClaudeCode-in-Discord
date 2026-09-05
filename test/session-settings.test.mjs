@@ -25,6 +25,7 @@ import {
   parseWorkspaceCommandAction,
 } from '../src/session-settings.js';
 import {
+  getProviderCompactCapabilities as testGetProviderCompactCapabilities,
   getSupportedCompactStrategies as testGetSupportedCompactStrategies,
   normalizeProvider as testNormalizeProvider,
 } from '../src/provider-metadata.js';
@@ -153,6 +154,32 @@ test('session-settings exposes the effective Codex compact limit for each select
   }), {
     tokens: 40000,
     source: 'model env default',
+  });
+});
+
+test('session-settings keeps Claude native auto-compact separate from the hard threshold', () => {
+  const settings = createSessionSettings({
+    normalizeProvider: testNormalizeProvider,
+    getSupportedCompactStrategies: testGetSupportedCompactStrategies,
+    getProviderCompactCapabilities: testGetProviderCompactCapabilities,
+    modelAutoCompactTokenLimit: 400_000,
+  });
+
+  assert.deepEqual(settings.resolveNativeCompactTokenLimitSetting({
+    provider: 'claude',
+    compactThresholdTokens: 192_000,
+    nativeCompactTokenLimit: null,
+  }), {
+    tokens: null,
+    source: 'provider default',
+  });
+  assert.deepEqual(settings.resolveNativeCompactTokenLimitSetting({
+    provider: 'claude',
+    compactThresholdTokens: 192_000,
+    nativeCompactTokenLimit: 320_000,
+  }), {
+    tokens: 320_000,
+    source: 'session override',
   });
 });
 

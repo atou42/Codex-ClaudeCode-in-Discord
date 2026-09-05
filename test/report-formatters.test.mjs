@@ -28,7 +28,7 @@ function createFormatters(overrides = {}) {
     getProviderCompactCapabilities: (provider) => ({
       strategies: ['hard', 'native', 'off'],
       supportsNativeStrategy: true,
-      supportsNativeLimit: provider === 'codex',
+      supportsNativeLimit: provider === 'codex' || provider === 'claude',
     }),
     providerSupportsRawConfigOverrides: (provider) => provider === 'codex',
     formatProviderSessionTerm: (provider) => {
@@ -610,6 +610,9 @@ test('createReportFormatters config helpers and reports remain available from on
   const compactHelp = formatters.formatCompactStrategyConfigHelp('en');
   const antigravityCompactHelp = formatters.formatCompactStrategyConfigHelp('en', 'antigravity');
   const compactReport = formatters.formatCompactConfigReport('zh', {}, true);
+  const claudeCompactReport = createFormatters({
+    resolveNativeCompactTokenLimitSetting: () => ({ tokens: null, source: 'provider default' }),
+  }).formatCompactConfigReport('zh', { provider: 'claude', language: 'zh' }, false);
   const antigravityCompactReport = formatters.formatCompactConfigReport('en', { provider: 'antigravity', language: 'en' }, false);
   const timeoutHelp = formatters.formatTimeoutConfigHelp('en');
   const languageReport = formatters.formatLanguageConfigReport('en', true);
@@ -626,6 +629,7 @@ test('createReportFormatters config helpers and reports remain available from on
   assert.match(compactReport, /策略:native（频道覆盖）/);
   assert.doesNotMatch(compactReport, /!compact continue/);
   assert.match(compactReport, /bot 会明确显示新的 session id/);
+  assert.match(claudeCompactReport, /native compact limit: auto（provider 默认）/);
   assert.match(antigravityCompactReport, /native compact: provider default behavior/);
   assert.doesNotMatch(antigravityCompactReport, /native compact limit:/);
   assert.match(timeoutHelp, /\/bot-timeout <ms\|off\|status>/);

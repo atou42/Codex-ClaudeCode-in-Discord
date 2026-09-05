@@ -213,6 +213,17 @@ test('buildSlashCommands narrows locked-provider surfaces to native aliases and 
   ]);
 });
 
+test('buildSlashCommands exposes Claude native compact limit control', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'cc',
+    botProvider: 'claude',
+  }).map((command) => command.toJSON());
+
+  const compact = commands.find((command) => command.name === 'cc_compact');
+  assert.ok(compact.options[0].choices.some((choice) => choice.value === 'native_limit'));
+});
+
 test('buildSlashCommands makes Claude goal content the primary input', () => {
   const commands = buildSlashCommands({
     SlashCommandBuilder: MockSlashCommandBuilder,

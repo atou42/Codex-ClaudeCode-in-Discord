@@ -75,6 +75,42 @@ test('createRunnerArgsBuilder passes a selected Claude model to fresh and resume
   }
 });
 
+test('createRunnerArgsBuilder passes Claude native auto-compact settings to fresh and resumed runs', () => {
+  const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
+    defaultModel: null,
+    normalizeProvider: (value) => value,
+    getSessionId: (session) => session.runnerSessionId,
+    resolveModelSetting: () => ({ value: 'claude-fable-5-1', source: 'session override' }),
+    resolveReasoningEffortSetting: () => ({ value: null, source: 'provider' }),
+    resolveFastModeSetting: () => ({ enabled: false, source: 'provider unsupported' }),
+    resolveCompactStrategySetting: () => ({ strategy: 'native' }),
+    resolveCompactEnabledSetting: () => ({ enabled: true }),
+    resolveNativeCompactTokenLimitSetting: (session) => ({
+      tokens: session.nativeCompactTokenLimit ?? null,
+      source: session.nativeCompactTokenLimit ? 'session override' : 'provider default',
+    }),
+  });
+
+  for (const [runnerSessionId, nativeCompactTokenLimit, expected] of [
+    [null, null, 'auto'],
+    ['claude-session-1', 320000, '320000'],
+  ]) {
+    const args = buildSessionRunnerArgs({
+      provider: 'claude',
+      session: {
+        provider: 'claude',
+        mode: 'dangerous',
+        runnerSessionId,
+        nativeCompactTokenLimit,
+      },
+      workspaceDir: '/tmp/workspace',
+      prompt: 'inspect',
+    });
+
+    assert.equal(args[args.indexOf('--autocompact') + 1], expected);
+  }
+});
+
 test('createRunnerArgsBuilder builds sandboxed and dangerous Grok headless runs', () => {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     defaultModel: null,
@@ -420,13 +456,15 @@ test('createRunnerArgsBuilder applies model-specific Codex context and compact l
   assert.equal(args.includes('model_auto_compact_token_limit=400000'), false);
 });
 
-test('createRunnerArgsBuilder never passes the Codex compact threshold to non-Codex providers', () => {
+test('createRunnerArgsBuilder keeps the Codex compact threshold out of non-Codex provider args', () => {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     normalizeProvider: (value) => value,
     getSessionId: () => null,
     resolveCompactStrategySetting: () => ({ strategy: 'native' }),
     resolveCompactEnabledSetting: () => ({ enabled: true }),
-    resolveNativeCompactTokenLimitSetting: () => ({ tokens: 272_000 }),
+    resolveNativeCompactTokenLimitSetting: (session) => ({
+      tokens: session.provider === 'claude' ? null : 272_000,
+    }),
   });
 
   for (const provider of ['claude', 'cursor', 'grok', 'antigravity', 'zcode', 'pi', 'omp']) {
@@ -439,6 +477,9 @@ test('createRunnerArgsBuilder never passes the Codex compact threshold to non-Co
     });
     assert.equal(args.join(' ').includes('272000'), false, provider);
     assert.equal(args.join(' ').includes('model_auto_compact_token_limit'), false, provider);
+    if (provider === 'claude') {
+      assert.equal(args[args.indexOf('--autocompact') + 1], 'auto');
+    }
   }
 });
 

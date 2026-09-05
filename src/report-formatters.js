@@ -433,10 +433,13 @@ export function createReportFormatters({
   function formatNativeCompactValue(provider, nativeLimit, language = 'en') {
     const compact = getProviderCompactCapabilities(provider);
     if (compact.supportsNativeLimit) {
+      const value = nativeLimit.tokens === null || nativeLimit.tokens === undefined
+        ? 'auto'
+        : String(nativeLimit.tokens);
       if (language === 'en') {
-        return `${nativeLimit.tokens} (${formatSettingSourceLabel(nativeLimit.source, language)})`;
+        return `${value} (${formatSettingSourceLabel(nativeLimit.source, language)})`;
       }
-      return `${nativeLimit.tokens}（${formatSettingSourceLabel(nativeLimit.source, language)}）`;
+      return `${value}（${formatSettingSourceLabel(nativeLimit.source, language)}）`;
     }
     if (compact.supportsNativeStrategy) {
       if (language === 'en') {

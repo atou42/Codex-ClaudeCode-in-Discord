@@ -979,14 +979,6 @@ export function createSessionSettings({
       return { tokens: direct, source: 'session override' };
     }
 
-    const threshold = readStrictCompactTokenLimit(
-      session?.compactThresholdTokens,
-      `override for ${provider}`,
-    );
-    if (threshold !== null) {
-      return { tokens: threshold, source: 'session threshold fallback' };
-    }
-
     const parentSession = resolveParentSession(session);
     const parentDirect = readStrictCompactTokenLimit(
       readProviderScopedValue(parentSession, provider, 'nativeCompactTokenLimit'),
@@ -994,6 +986,18 @@ export function createSessionSettings({
     );
     if (parentDirect !== null) {
       return { tokens: parentDirect, source: 'parent channel' };
+    }
+
+    if (provider !== 'codex') {
+      return { tokens: null, source: 'provider default' };
+    }
+
+    const threshold = readStrictCompactTokenLimit(
+      session?.compactThresholdTokens,
+      `override for ${provider}`,
+    );
+    if (threshold !== null) {
+      return { tokens: threshold, source: 'session threshold fallback' };
     }
 
     const parentThreshold = readStrictCompactTokenLimit(

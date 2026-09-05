@@ -218,6 +218,7 @@ export function createAppContext({
       resolveBusyPromptModeSetting: sessionSettings.resolveBusyPromptModeSetting,
       resolveCompactStrategySetting: sessionSettings.resolveCompactStrategySetting,
       resolveCompactThresholdSetting: sessionSettings.resolveCompactThresholdSetting,
+      resolveNativeCompactTokenLimitSetting: sessionSettings.resolveNativeCompactTokenLimitSetting,
       resolveReplyDeliverySetting: sessionSettings.resolveReplyDeliverySetting,
       resolveExtraInfoSetting: sessionSettings.resolveExtraInfoSetting,
       getDefaultCodexProfile: commandActionsOptions.resolveDefaultCodexProfile,

@@ -34,7 +34,7 @@ const PROVIDER_METADATA = Object.freeze({
       compact: Object.freeze({
         strategies: Object.freeze(['hard', 'native', 'off']),
         supportsNativeStrategy: true,
-        supportsNativeLimit: false,
+        supportsNativeLimit: true,
       }),
       workspaceSessionPolicy: 'strict',
     }),

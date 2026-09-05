@@ -109,6 +109,14 @@ function formatValueLabel(value, fallback, language) {
   return `\`${text}\``;
 }
 
+function formatNativeCompactLimit(setting, language) {
+  const value = setting?.tokens === null || setting?.tokens === undefined
+    ? 'auto'
+    : String(setting.tokens);
+  const source = formatSettingSourceLabel(setting?.source, language);
+  return language === 'en' ? `${value} (${source})` : `${value}（${source}）`;
+}
+
 function formatModelPlaceholder(provider, language) {
   if (provider === 'antigravity') {
     return language === 'en'
@@ -448,6 +456,7 @@ export function createSettingsPanel({
   resolveBusyPromptModeSetting = () => ({ mode: 'queue', requestedMode: 'queue', canSteer: false, supported: true, source: 'built-in default', reason: null }),
   resolveCompactStrategySetting = () => ({ strategy: 'native', source: 'env default' }),
   resolveCompactThresholdSetting = () => ({ tokens: 0, source: 'env default' }),
+  resolveNativeCompactTokenLimitSetting = () => ({ tokens: null, source: 'provider default' }),
   resolveReplyDeliverySetting = () => ({ mode: 'card_mention', source: 'env default' }),
   getReplyDeliveryDefault = () => ({ mode: 'card_mention', source: 'env default' }),
   getChannelState = () => null,
@@ -595,6 +604,7 @@ export function createSettingsPanel({
     const busyPromptMode = resolveBusyPromptModeSetting(session);
     const compact = resolveCompactStrategySetting(session);
     const compactThreshold = resolveCompactThresholdSetting(session);
+    const nativeCompactLimit = resolveNativeCompactTokenLimitSetting(session);
     const replyDelivery = resolveReplyDeliverySetting(session);
     const replyDefault = getReplyDeliveryDefault(session);
     const workspace = getWorkspaceBinding(session, key) || { workspaceDir: null, source: 'unset' };
@@ -614,6 +624,7 @@ export function createSettingsPanel({
       busyPromptMode,
       compact,
       compactThreshold,
+      nativeCompactLimit,
       replyDelivery,
       replyDefault,
       workspace,
@@ -932,8 +943,7 @@ export function createSettingsPanel({
       case 'compact': {
         const compactCapabilities = getProviderCompactCapabilities(snapshot.provider);
         const values = ['follow', ...compactCapabilities.strategies];
-        const thresholdUsesDefault = session?.compactThresholdTokens === null || session?.compactThresholdTokens === undefined;
-        return [
+        const rows = [
           new ActionRowBuilder().addComponents(
             ...values.map((value) => {
               const selected = value === 'follow'
@@ -948,17 +958,32 @@ export function createSettingsPanel({
                 .setStyle(selected ? ButtonStyle.Primary : ButtonStyle.Secondary);
             }),
           ),
+        ];
+        if (snapshot.compact.strategy === 'off') return rows;
+
+        const usesNativeLimit = snapshot.compact.strategy === 'native'
+          && compactCapabilities.supportsNativeLimit;
+        const target = usesNativeLimit ? 'native_compact_limit' : 'compact_threshold';
+        const usesDefault = usesNativeLimit
+          ? session?.nativeCompactTokenLimit === null || session?.nativeCompactTokenLimit === undefined
+          : session?.compactThresholdTokens === null || session?.compactThresholdTokens === undefined;
+        rows.push(
           new ActionRowBuilder().addComponents(
             new ButtonBuilder()
-              .setCustomId(buildSettingsComponentId('act', 'compact_threshold', 'custom', userId))
-              .setLabel(snapshot.language === 'en' ? 'Set token limit' : '设置阈值')
+              .setCustomId(buildSettingsComponentId('act', target, 'custom', userId))
+              .setLabel(snapshot.language === 'en'
+                ? (usesNativeLimit ? 'Set native limit' : 'Set hard threshold')
+                : (usesNativeLimit ? '设置 native 阈值' : '设置 hard 阈值'))
               .setStyle(ButtonStyle.Success),
             new ButtonBuilder()
-              .setCustomId(buildSettingsComponentId('act', 'compact_threshold', 'default', userId))
-              .setLabel(snapshot.language === 'en' ? 'Follow default limit' : '跟随默认阈值')
-              .setStyle(thresholdUsesDefault ? ButtonStyle.Primary : ButtonStyle.Secondary),
+              .setCustomId(buildSettingsComponentId('act', target, 'default', userId))
+              .setLabel(snapshot.language === 'en'
+                ? (usesNativeLimit ? 'Use auto' : 'Follow default threshold')
+                : (usesNativeLimit ? '使用 auto' : '跟随默认阈值'))
+              .setStyle(usesDefault ? ButtonStyle.Primary : ButtonStyle.Secondary),
           ),
-        ];
+        );
+        return rows;
       }
 
       case 'reply': {
@@ -1077,8 +1102,8 @@ function formatOverviewSection(snapshot) {
           : 'reasoning effort 的可选值由 provider 决定。选择 `default` 会清掉当前频道覆盖。';
       case 'compact':
         return snapshot.language === 'en'
-          ? `Compact has two parts here. Strategy decides how compaction runs. Token limit decides when the bot considers a turn large enough to compact. Follow default removes this channel override. For deeper native-only details, \`${compactSurface}\` is still available.`
-          : `这里的压缩设置分两层。strategy 决定怎么压缩。token 阈值决定消息多大时开始考虑 compact。跟随默认会清掉当前频道的阈值覆盖。更细的 native 专属细节仍可继续用 \`${compactSurface}\`。`;
+          ? `Native uses Claude Code's own auto-compaction window or a channel override. Hard uses the separate bot-managed threshold. The same controls are available through \`${compactSurface}\`.`
+          : `native 使用 Claude Code 自己的 auto 压缩窗口，也可以单独覆盖。hard 使用另一套由 bot 管理的阈值。相同设置也可以通过 \`${compactSurface}\` 调整。`;
       case 'reply':
         return snapshot.language === 'en'
           ? 'Choose whether the channel only updates the progress card or also sends process messages, and whether completion should trigger @.'
@@ -1176,9 +1201,14 @@ function formatOverviewSection(snapshot) {
           snapshot.language === 'en'
             ? `• compact: \`${snapshot.compact.strategy}\` (${formatSettingSourceLabel(snapshot.compact.source, snapshot.language)})`
             : `• compact：\`${snapshot.compact.strategy}\`（${formatSettingSourceLabel(snapshot.compact.source, snapshot.language)}）`,
+          getProviderCompactCapabilities(snapshot.provider).supportsNativeLimit
+            ? (snapshot.language === 'en'
+              ? `• native compact: ${formatNativeCompactLimit(snapshot.nativeCompactLimit, snapshot.language)}`
+              : `• native compact：${formatNativeCompactLimit(snapshot.nativeCompactLimit, snapshot.language)}`)
+            : null,
           snapshot.language === 'en'
-            ? `• compact token limit: ${formatCompactThresholdValue(snapshot.compactThreshold, snapshot.language)} (${formatSettingSourceLabel(snapshot.compactThreshold.source, snapshot.language)})`
-            : `• compact 阈值：${formatCompactThresholdValue(snapshot.compactThreshold, snapshot.language)}（${formatSettingSourceLabel(snapshot.compactThreshold.source, snapshot.language)}）`,
+            ? `• hard compact threshold: ${formatCompactThresholdValue(snapshot.compactThreshold, snapshot.language)} (${formatSettingSourceLabel(snapshot.compactThreshold.source, snapshot.language)})`
+            : `• hard compact 阈值：${formatCompactThresholdValue(snapshot.compactThreshold, snapshot.language)}（${formatSettingSourceLabel(snapshot.compactThreshold.source, snapshot.language)}）`,
           snapshot.language === 'en'
             ? `• reply delivery: ${formatReplyDeliveryModeLabel(snapshot.replyDelivery.mode, snapshot.language)} (${formatSettingSourceLabel(snapshot.replyDelivery.source, snapshot.language)})`
             : `• 回复方式：${formatReplyDeliveryModeLabel(snapshot.replyDelivery.mode, snapshot.language)}（${formatSettingSourceLabel(snapshot.replyDelivery.source, snapshot.language)}）`,
@@ -1362,7 +1392,7 @@ function formatOverviewSection(snapshot) {
       );
   }
 
-  function buildCompactThresholdModal(session, userId) {
+  function buildCompactThresholdModal(session, userId, { native = false } = {}) {
     const language = normalizeUiLanguage(getSessionLanguage(session) || defaultUiLanguage);
     const input = new TextInputBuilder()
       .setCustomId(COMPACT_THRESHOLD_INPUT_ID)
@@ -1371,13 +1401,16 @@ function formatOverviewSection(snapshot) {
       .setPlaceholder(language === 'en' ? 'e.g. 272000 or default' : '例如 272000 或 default')
       .setRequired(true)
       .setMaxLength(20);
-    if (session?.compactThresholdTokens !== null && session?.compactThresholdTokens !== undefined) {
-      input.setValue(String(session.compactThresholdTokens));
+    const currentValue = native ? session?.nativeCompactTokenLimit : session?.compactThresholdTokens;
+    if (currentValue !== null && currentValue !== undefined) {
+      input.setValue(String(currentValue));
     }
 
     return new ModalBuilder()
-      .setCustomId(buildSettingsModalId('compact_threshold', userId))
-      .setTitle(language === 'en' ? 'Set compact token limit' : '设置 compact token 阈值')
+      .setCustomId(buildSettingsModalId(native ? 'native_compact_limit' : 'compact_threshold', userId))
+      .setTitle(language === 'en'
+        ? (native ? 'Set native compact limit' : 'Set hard compact threshold')
+        : (native ? '设置 native compact 阈值' : '设置 hard compact 阈值'))
       .addComponents(
         new ActionRowBuilder().addComponents(input),
       );
@@ -1494,6 +1527,11 @@ function formatOverviewSection(snapshot) {
         return true;
       }
 
+      if (parsed.target === 'native_compact_limit' && parsed.value === 'custom') {
+        await interaction.showModal(buildCompactThresholdModal(session, interaction.user.id, { native: true }));
+        return true;
+      }
+
       if (parsed.target === 'model' && parsed.value === 'default') {
         const conflict = findModelEffortConflict(key, session, 'default');
         if (conflict) {
@@ -1595,6 +1633,19 @@ function formatOverviewSection(snapshot) {
           userId: interaction.user.id,
           activeSection: 'compact',
           notice: language === 'en' ? '✅ Compact token limit now follows the default.' : '✅ compact 阈值已改为跟随默认。',
+        }));
+        return true;
+      }
+
+      if (parsed.target === 'native_compact_limit' && parsed.value === 'default') {
+        commandActions.applyCompactConfig?.(session, { type: 'set_native_limit', tokens: null });
+        closeRuntimeForKey(key);
+        await interaction.update(buildSettingsPayload({
+          key,
+          session,
+          userId: interaction.user.id,
+          activeSection: 'compact',
+          notice: language === 'en' ? '✅ Native compact now uses auto.' : '✅ native compact 已改为 auto。',
         }));
         return true;
       }
@@ -1943,10 +1994,12 @@ function formatOverviewSection(snapshot) {
       return true;
     }
 
-    if (parsed.target === 'compact_threshold') {
+    if (parsed.target === 'compact_threshold' || parsed.target === 'native_compact_limit') {
       const rawValue = String(interaction.fields.getTextInputValue(COMPACT_THRESHOLD_INPUT_ID) || '').trim();
-      const parsedCompact = parseCompactConfigAction('token_limit', rawValue);
-      if (parsedCompact?.type !== 'set_threshold') {
+      const isNative = parsed.target === 'native_compact_limit';
+      const parsedCompact = parseCompactConfigAction(isNative ? 'native_limit' : 'token_limit', rawValue);
+      const expectedType = isNative ? 'set_native_limit' : 'set_threshold';
+      if (parsedCompact?.type !== expectedType) {
         await interaction.reply({
           content: language === 'en' ? '❌ Invalid compact token limit. Use a positive integer or `default`.' : '❌ compact 阈值无效。请输入正整数或 `default`。',
           flags: 64,
@@ -1961,7 +2014,9 @@ function formatOverviewSection(snapshot) {
         userId: interaction.user.id,
         activeSection: 'compact',
         flags: 64,
-        notice: language === 'en' ? '✅ Compact token limit updated. This is the latest settings panel.' : '✅ compact 阈值已更新。这是最新的设置面板。',
+        notice: language === 'en'
+          ? `✅ ${isNative ? 'Native compact limit' : 'Hard compact threshold'} updated. This is the latest settings panel.`
+          : `✅ ${isNative ? 'native compact 阈值' : 'hard compact 阈值'}已更新。这是最新的设置面板。`,
       }));
       return true;
     }

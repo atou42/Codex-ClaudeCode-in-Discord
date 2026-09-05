@@ -216,11 +216,17 @@ export function createRunnerArgsBuilder({
     }
     const model = resolveModelSetting(session).value || defaultModel;
     const effort = resolveReasoningEffortSetting(session).value;
+    const compactSetting = resolveCompactStrategySetting(session);
+    const compactEnabled = resolveCompactEnabledSetting(session);
+    const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
     const sessionId = getSessionId(session);
     const pendingForkFromSessionId = String(session?.pendingForkFromSessionId || '').trim();
 
     if (model) args.push('--model', model);
     if (effort) args.push('--effort', effort);
+    if (compactSetting.strategy === 'native' && compactEnabled.enabled) {
+      args.push('--autocompact', nativeLimit.tokens === null ? 'auto' : String(nativeLimit.tokens));
+    }
 
     if (session.mode === 'dangerous') {
       args.push('--dangerously-skip-permissions');

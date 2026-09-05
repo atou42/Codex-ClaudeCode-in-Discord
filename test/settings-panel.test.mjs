@@ -203,6 +203,8 @@ function createPanel({
     },
     getProviderCompactCapabilities: (provider) => ({
       strategies: provider === 'cursor' ? [] : ['hard', 'native', 'off'],
+      supportsNativeStrategy: provider !== 'cursor',
+      supportsNativeLimit: provider === 'codex' || provider === 'claude',
     }),
     normalizeUiLanguage: (value) => String(value || '').trim().toLowerCase() === 'en' ? 'en' : 'zh',
     resolveModelSetting: (currentSession) => ({
@@ -274,6 +276,12 @@ function createPanel({
             : currentSession?.provider === 'cursor'
               ? 'provider unsupported'
               : 'provider default')),
+    }),
+    resolveNativeCompactTokenLimitSetting: (currentSession) => ({
+      tokens: currentSession?.nativeCompactTokenLimit ?? (currentSession?.provider === 'codex' ? 320000 : null),
+      source: currentSession?.nativeCompactTokenLimit === null || currentSession?.nativeCompactTokenLimit === undefined
+        ? (currentSession?.provider === 'codex' ? 'env default' : 'provider default')
+        : 'session override',
     }),
     resolveReplyDeliverySetting: (currentSession) => ({
       mode: currentSession?.replyDeliveryMode || currentSession?.inheritedReplyDeliveryMode || 'card_only',
@@ -2273,7 +2281,7 @@ test('createSettingsPanel shows compact threshold in the panel and opens compact
     provider: 'codex',
     language: 'zh',
     mode: 'safe',
-    compactStrategy: 'native',
+    compactStrategy: 'hard',
     compactThresholdTokens: 333000,
   };
   const modals = [];
@@ -2308,6 +2316,77 @@ test('createSettingsPanel shows compact threshold in the panel and opens compact
   assert.equal(modals[0].data.customId, 'stgm:compact_threshold:12345');
   assert.equal(modals[0].data.components[0].components[0].data.customId, 'compact_threshold_tokens');
   assert.equal(modals[0].data.components[0].components[0].data.value, '333000');
+});
+
+test('createSettingsPanel shows and edits Claude native auto-compact independently from the hard threshold', async () => {
+  const session = {
+    provider: 'claude',
+    language: 'zh',
+    mode: 'safe',
+    compactStrategy: 'native',
+    compactThresholdTokens: 192000,
+    nativeCompactTokenLimit: null,
+  };
+  const modals = [];
+  const replies = [];
+  const panel = createPanel({
+    session,
+    commandActions: {
+      applyCompactConfig(currentSession, parsed) {
+        if (parsed.type === 'set_native_limit') currentSession.nativeCompactTokenLimit = parsed.tokens;
+        return { nativeCompactTokenLimit: currentSession.nativeCompactTokenLimit };
+      },
+    },
+  });
+  const payload = panel.openSettingsPanel({
+    key: 'thread-1',
+    session,
+    userId: '12345',
+    activeSection: 'compact',
+  });
+
+  assert.match(payload.content, /native compact.*auto/);
+  assert.match(payload.content, /hard compact 阈值：192000/);
+  const compactRows = payload.components.slice(1, -1);
+  assert.equal(compactRows[1].components[0].data.customId, 'stg:act:native_compact_limit:custom:12345');
+  assert.equal(compactRows[1].components[1].data.label, '使用 auto');
+
+  await panel.handleSettingsPanelInteraction({
+    customId: 'stg:act:native_compact_limit:custom:12345',
+    channelId: 'thread-1',
+    user: { id: '12345' },
+    async update() {
+      throw new Error('should not update');
+    },
+    async reply() {
+      throw new Error('should not reply');
+    },
+    async showModal(modal) {
+      modals.push(modal);
+    },
+  });
+
+  assert.equal(modals[0].data.customId, 'stgm:native_compact_limit:12345');
+  assert.equal(modals[0].data.components[0].components[0].data.customId, 'compact_threshold_tokens');
+  assert.equal(modals[0].data.components[0].components[0].data.value, undefined);
+
+  await panel.handleSettingsPanelModalSubmit({
+    customId: 'stgm:native_compact_limit:12345',
+    channelId: 'thread-1',
+    user: { id: '12345' },
+    fields: {
+      getTextInputValue() {
+        return '320000';
+      },
+    },
+    async reply(reply) {
+      replies.push(reply);
+    },
+  });
+
+  assert.equal(session.nativeCompactTokenLimit, 320000);
+  assert.match(replies[0].content, /native compact 阈值已更新/);
+  assert.match(replies[0].content, /native compact：320000（当前频道）/);
 });
 
 test('createSettingsPanel applies model modal submit and replies with a refreshed panel', async () => {
@@ -2356,7 +2435,7 @@ test('createSettingsPanel applies compact threshold modal submit and refreshes c
     provider: 'codex',
     language: 'en',
     mode: 'safe',
-    compactStrategy: 'native',
+    compactStrategy: 'hard',
     compactThresholdTokens: null,
   };
   const replies = [];
@@ -2387,8 +2466,8 @@ test('createSettingsPanel applies compact threshold modal submit and refreshes c
   assert.equal(session.compactThresholdTokens, 320000);
   assert.equal(replies.length, 1);
   assert.equal(replies[0].flags, 64);
-  assert.match(replies[0].content, /Compact token limit updated/);
-  assert.match(replies[0].content, /compact token limit: 320000 \(this channel\)/);
+  assert.match(replies[0].content, /Hard compact threshold updated/);
+  assert.match(replies[0].content, /hard compact threshold: 320000 \(this channel\)/);
   assert.match(replies[0].content, /Active: Context Compaction/);
 });
 
@@ -2397,7 +2476,7 @@ test('createSettingsPanel clears compact threshold override through button inter
     provider: 'codex',
     language: 'zh',
     mode: 'safe',
-    compactStrategy: 'native',
+    compactStrategy: 'hard',
     compactThresholdTokens: 320000,
   };
   const updates = [];

@@ -57,6 +57,9 @@ function buildClaudeLongArgs({
   pendingForkFromSessionId = null,
   resolveModelSetting,
   resolveReasoningEffortSetting,
+  resolveCompactStrategySetting,
+  resolveCompactEnabledSetting,
+  resolveNativeCompactTokenLimitSetting,
 }) {
   const args = [
     '--print',
@@ -72,8 +75,14 @@ function buildClaudeLongArgs({
 
   const model = resolveModelSetting(session).value;
   const effort = resolveReasoningEffortSetting(session).value;
+  const compact = resolveCompactStrategySetting(session);
+  const compactEnabled = resolveCompactEnabledSetting(session);
+  const nativeLimit = resolveNativeCompactTokenLimitSetting(session);
   if (model) args.push('--model', model);
   if (effort) args.push('--effort', effort);
+  if (compact.strategy === 'native' && compactEnabled.enabled) {
+    args.push('--autocompact', nativeLimit.tokens === null ? 'auto' : String(nativeLimit.tokens));
+  }
 
   if (session?.mode === 'dangerous') {
     args.push('--dangerously-skip-permissions');
@@ -103,6 +112,9 @@ function buildRuntimeSignature({
   additionalWorkspaceDirs = [],
   resolveModelSetting,
   resolveReasoningEffortSetting,
+  resolveCompactStrategySetting,
+  resolveCompactEnabledSetting,
+  resolveNativeCompactTokenLimitSetting,
 }) {
   return JSON.stringify({
     workspaceDir,
@@ -110,6 +122,9 @@ function buildRuntimeSignature({
     mode: session?.mode || 'safe',
     model: resolveModelSetting(session).value || null,
     effort: resolveReasoningEffortSetting(session).value || null,
+    compactStrategy: resolveCompactStrategySetting(session).strategy,
+    compactEnabled: resolveCompactEnabledSetting(session).enabled,
+    nativeCompactTokenLimit: resolveNativeCompactTokenLimitSetting(session).tokens,
   });
 }
 
@@ -168,6 +183,9 @@ export function createClaudeLongRunner({
   getSessionId = () => null,
   resolveModelSetting = () => ({ value: null }),
   resolveReasoningEffortSetting = () => ({ value: null }),
+  resolveCompactStrategySetting = () => ({ strategy: 'native' }),
+  resolveCompactEnabledSetting = () => ({ enabled: true }),
+  resolveNativeCompactTokenLimitSetting = () => ({ tokens: null }),
   normalizeTimeoutMs = (value, fallback) => Number(value || fallback || 0),
   resolveTimeoutSetting = () => ({ timeoutMs: 0 }),
   safeError = formatError,
@@ -380,6 +398,9 @@ export function createClaudeLongRunner({
       additionalWorkspaceDirs,
       resolveModelSetting,
       resolveReasoningEffortSetting,
+      resolveCompactStrategySetting,
+      resolveCompactEnabledSetting,
+      resolveNativeCompactTokenLimitSetting,
     });
     const existing = entries.get(key);
     if (existing) {
@@ -411,6 +432,9 @@ export function createClaudeLongRunner({
       pendingForkFromSessionId: session?.pendingForkFromSessionId,
       resolveModelSetting,
       resolveReasoningEffortSetting,
+      resolveCompactStrategySetting,
+      resolveCompactEnabledSetting,
+      resolveNativeCompactTokenLimitSetting,
     });
     const child = spawnFn(getProviderBin('claude'), args, {
       cwd: workspaceDir,

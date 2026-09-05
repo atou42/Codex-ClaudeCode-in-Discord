@@ -94,8 +94,10 @@ test('provider-metadata exposes workspace, compact, and reasoning capabilities',
   assert.deepEqual(getSupportedCompactStrategies('claude'), ['hard', 'native', 'off']);
   assert.deepEqual(getSupportedCompactStrategies('cursor'), []);
   assert.deepEqual(getSupportedCompactStrategies('grok'), ['hard', 'native', 'off']);
+  assert.equal(getProviderCompactCapabilities('claude').supportsNativeLimit, true);
   assert.equal(getProviderCompactCapabilities('antigravity').supportsNativeLimit, false);
   assert.equal(providerSupportsCompactConfigAction('claude', { type: 'set_strategy', strategy: 'native' }), true);
+  assert.equal(providerSupportsCompactConfigAction('claude', { type: 'set_native_limit', tokens: 320000 }), true);
   assert.equal(providerSupportsCompactConfigAction('antigravity', { type: 'set_native_limit', tokens: 123 }), false);
   assert.equal(providerSupportsCompactConfigAction('antigravity', { type: 'set_threshold', tokens: 123 }), true);
   assert.equal(isReasoningEffortSupported('codex', 'xhigh'), true);
