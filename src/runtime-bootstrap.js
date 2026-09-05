@@ -326,10 +326,16 @@ export function readClaudeDefaults({ env = process.env } = {}) {
 
 function normalizeCodexModelCatalog(raw) {
   const parsed = JSON.parse(String(raw || ''));
-  const models = Array.isArray(parsed?.models) ? parsed.models : [];
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Array.isArray(parsed.models)) {
+    throw new Error('Invalid Codex model catalog: models must be an array');
+  }
   return {
-    models: models.map((model) => {
-      const slug = String(model?.slug || '').trim();
+    models: parsed.models.map((model, index) => {
+      if (!model || typeof model !== 'object' || Array.isArray(model)
+        || typeof model.slug !== 'string' || !model.slug.trim()) {
+        throw new Error(`Invalid Codex model catalog: models[${index}].slug must be a non-empty string`);
+      }
+      const slug = model.slug.trim();
       const displayName = String(model?.display_name || model?.displayName || slug).trim();
       const supportedReasoningLevels = Array.isArray(model?.supported_reasoning_levels)
         ? model.supported_reasoning_levels
@@ -344,7 +350,7 @@ function normalizeCodexModelCatalog(raw) {
         supportedReasoningLevels,
         visibility: String(model?.visibility || '').trim(),
       };
-    }).filter((model) => model.slug),
+    }),
     error: null,
   };
 }
