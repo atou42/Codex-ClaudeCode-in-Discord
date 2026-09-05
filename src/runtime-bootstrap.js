@@ -431,6 +431,18 @@ function normalizeCursorModelCatalog(raw) {
       visibility: 'catalog',
     });
   }
+  const fable51Index = models.findIndex((model) => model.slug.startsWith('claude-fable-5-1'));
+  const fable51StandardContext = 'claude-fable-5-1[context=300k,effort=high]';
+  if (fable51Index !== -1 && !seen.has(fable51StandardContext)) {
+    models.splice(fable51Index, 0, {
+      slug: fable51StandardContext,
+      displayName: 'Claude Fable 5.1 300k Thinking High',
+      description: 'Cursor Agent standard-context Fable 5.1',
+      defaultReasoningLevel: 'high',
+      supportedReasoningLevels: ['high'],
+      visibility: 'catalog',
+    });
+  }
   return {
     models,
     error: models.length ? null : 'Cursor Agent did not report any models',
@@ -818,7 +830,7 @@ export function readCursorModelCatalog({
       encoding: 'utf-8',
       env,
       maxBuffer: 8 * 1024 * 1024,
-      timeout: 10_000,
+      timeout: 30_000,
     });
     catalog = normalizeCursorModelCatalog(raw);
   } catch (err) {

@@ -30,8 +30,8 @@ test('readCursorModelCatalog parses the Cursor Agent model list', () => {
   const catalog = readCursorModelCatalog({
     cursorBin: '/tmp/cursor-agent-test-bin',
     now: () => 1,
-    execFileSyncFn(bin, args) {
-      calls.push({ bin, args });
+    execFileSyncFn(bin, args, options) {
+      calls.push({ bin, args, timeout: options.timeout });
       return [
         'Available models',
         '',
@@ -43,12 +43,36 @@ test('readCursorModelCatalog parses the Cursor Agent model list', () => {
     },
   });
 
-  assert.deepEqual(calls, [{ bin: '/tmp/cursor-agent-test-bin', args: ['models'] }]);
+  assert.deepEqual(calls, [{ bin: '/tmp/cursor-agent-test-bin', args: ['models'], timeout: 30_000 }]);
   assert.deepEqual(catalog.models.map((model) => [model.slug, model.displayName]), [
     ['auto', 'Auto (default)'],
     ['gpt-5.6-sol-high', 'GPT-5.6 Sol 1M High'],
   ]);
   assert.equal(catalog.error, null);
+});
+
+test('readCursorModelCatalog exposes Fable 5.1 high with the standard 300k context', () => {
+  const catalog = readCursorModelCatalog({
+    cursorBin: '/tmp/cursor-agent-fable-test-bin',
+    now: () => 2,
+    execFileSyncFn() {
+      return [
+        'Available models',
+        '',
+        'claude-fable-5-1-thinking-high - Claude Fable 5.1 1M Thinking (NO ZDR)',
+      ].join('\n');
+    },
+  });
+
+  assert.deepEqual(catalog.models[0], {
+    slug: 'claude-fable-5-1[context=300k,effort=high]',
+    displayName: 'Claude Fable 5.1 300k Thinking High',
+    description: 'Cursor Agent standard-context Fable 5.1',
+    defaultReasoningLevel: 'high',
+    supportedReasoningLevels: ['high'],
+    visibility: 'catalog',
+  });
+  assert.equal(catalog.models[1].slug, 'claude-fable-5-1-thinking-high');
 });
 
 function makeTempRoot() {
