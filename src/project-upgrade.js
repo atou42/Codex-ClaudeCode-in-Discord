@@ -251,9 +251,9 @@ export function createProjectUpgradeManager({
         validateRemoteHeadInWorktree(before.remoteHead, { install, dryRun, logs });
 
         logs.push(`upgrading ${before.localShort} -> ${before.remoteShort}`);
-        runGit(['merge', '--ff-only', remoteRef], { capture: false, mutates: true, dryRun });
+        runGit(['merge', '--ff-only', before.remoteHead], { capture: false, mutates: true, dryRun });
         merged = !dryRun;
-        logs.push(`merged ${remoteRef}`);
+        logs.push(`merged validated revision ${before.remoteHead} (${remoteRef})`);
 
         runShell(install, { capture: false, mutates: true, dryRun });
         logs.push(`main install command completed: ${install}`);
