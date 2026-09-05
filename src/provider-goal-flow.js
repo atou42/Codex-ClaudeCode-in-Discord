@@ -1,4 +1,4 @@
-const NATIVE_GOAL_PROVIDERS = new Set(['grok', 'zcode', 'omp']);
+const NATIVE_GOAL_PROVIDERS = new Set(['claude', 'grok', 'zcode', 'omp']);
 
 function normalize(value) {
   return String(value || '').trim();
@@ -40,7 +40,9 @@ export function parseProviderGoalSlashInput({
   }
 
   const normalizedAction = normalizeAction(action);
-  const supportedActions = new Set(['set', 'status', 'pause', 'resume', 'clear']);
+  const supportedActions = normalizedProvider === 'claude'
+    ? new Set(['set', 'status', 'clear'])
+    : new Set(['set', 'status', 'pause', 'resume', 'clear']);
   if (!supportedActions.has(normalizedAction)) {
     throw new Error(`${normalizedProvider} goal does not support action: ${normalizedAction || '(empty)'}`);
   }
@@ -66,6 +68,12 @@ export function parseProviderGoalSlashInput({
 export function buildProviderGoalCommand(input) {
   const parsed = parseProviderGoalSlashInput(input);
   const { provider, action, objective, tokenBudget } = parsed;
+
+  if (provider === 'claude') {
+    if (action === 'set') return `/goal ${objective}`;
+    if (action === 'status') return '/goal';
+    return '/goal clear';
+  }
 
   if (provider === 'grok') {
     if (action === 'set') {

@@ -1391,7 +1391,7 @@ test('createSlashCommandRouter rejects goal for providers without a headless-saf
       throw new Error('should not call app-server');
     },
   });
-  state.session.provider = 'claude';
+  state.session.provider = 'cursor';
 
   const handled = await state.router({
     interaction: createInteraction('cx_goal', { action: 'status' }),
@@ -1481,6 +1481,30 @@ test('createSlashCommandRouter defaults OMP goal to native set in its interactiv
   assert.equal(queuedPrompts[0].content, '/goal set ship Discord goal command');
   assert.equal(queuedPrompts[0].message.providerControlCommand, true);
   assert.match(state.replies[0].content, /omp goal set 已开始/);
+});
+
+test('createSlashCommandRouter starts Claude native goal from objective-only input', async () => {
+  const queuedPrompts = [];
+  const state = createRouterState({
+    async enqueuePrompt(message, key, content) {
+      queuedPrompts.push({ message, key, content });
+      return { ok: true, enqueued: true, queuedAhead: 0 };
+    },
+  });
+  state.session.provider = 'claude';
+
+  const handled = await state.router({
+    interaction: createInteraction('cc_goal', { objective: 'finish the release checks' }),
+    commandName: 'goal',
+    respond: async (payload) => {
+      state.replies.push(payload);
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(queuedPrompts[0].content, '/goal finish the release checks');
+  assert.equal(queuedPrompts[0].message.providerControlCommand, true);
+  assert.match(state.replies[0].content, /claude goal set 已开始/);
 });
 
 test('createSlashCommandRouter reports native goal queue failures explicitly', async () => {

@@ -390,13 +390,19 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
           .addStringOption(o => o.setName('question').setDescription('start 时要问的问题').setRequired(false));
       },
     },
-    (!lockedProvider || ['codex', 'grok', 'zcode', 'omp'].includes(lockedProvider)) && {
+    (!lockedProvider || ['codex', 'claude', 'grok', 'zcode', 'omp'].includes(lockedProvider)) && {
       name: 'goal',
       description: lockedProvider === 'codex'
         ? '管理当前 Codex session 的持久目标；active 时会自动续跑'
         : '管理当前 session 的原生 goal',
       configure(builder) {
-        const actionChoices = ['grok', 'zcode', 'omp'].includes(lockedProvider)
+        const actionChoices = lockedProvider === 'claude'
+          ? [
+              { name: 'set 设置 goal', value: 'set' },
+              { name: 'status 查当前 goal', value: 'status' },
+              { name: 'clear 清除 goal', value: 'clear' },
+            ]
+          : ['grok', 'zcode', 'omp'].includes(lockedProvider)
           ? [
               { name: 'set 设置 goal', value: 'set' },
               { name: 'status 查当前 goal', value: 'status' },
@@ -413,10 +419,18 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
               { name: 'clear 清除 goal', value: 'clear' },
               { name: 'budget 设置预算', value: 'budget' },
             ];
-        let configured = builder
-          .addStringOption(o => o.setName('action').setDescription('goal 操作；留空默认 set').setRequired(false)
-            .addChoices(...actionChoices))
-          .addStringOption(o => o.setName('objective').setDescription('set 时填写目标').setRequired(false));
+        let configured = builder;
+        if (!lockedProvider || lockedProvider === 'codex' || lockedProvider === 'claude') {
+          configured = configured
+            .addStringOption(o => o.setName('objective').setDescription('目标；直接输入即可，action 留空默认 set').setRequired(false))
+            .addStringOption(o => o.setName('action').setDescription('goal 操作；留空默认 set').setRequired(false)
+              .addChoices(...actionChoices));
+        } else {
+          configured = configured
+            .addStringOption(o => o.setName('action').setDescription('goal 操作；留空默认 set').setRequired(false)
+              .addChoices(...actionChoices))
+            .addStringOption(o => o.setName('objective').setDescription('set 时填写目标').setRequired(false));
+        }
         if (!lockedProvider || lockedProvider === 'codex' || lockedProvider === 'grok') {
           configured = configured.addStringOption(o => o.setName('token_budget').setDescription('token 预算，如 120000；clear 清除预算').setRequired(false));
         }

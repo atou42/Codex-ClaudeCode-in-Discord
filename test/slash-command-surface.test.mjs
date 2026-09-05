@@ -116,9 +116,10 @@ test('buildSlashCommands includes workspace commands and aliases', () => {
   assert.ok(!names.includes('cx_process_lines'));
 
   const goal = commands.find((command) => command.name === 'cx_goal');
-  assert.deepEqual(goal.options.map((option) => option.name), ['action', 'objective', 'token_budget']);
+  assert.deepEqual(goal.options.map((option) => option.name), ['objective', 'action', 'token_budget']);
   assert.equal(goal.options[0].required, false);
-  assert.deepEqual(goal.options[0].choices.map((choice) => choice.value), [
+  assert.match(goal.options[0].description, /直接输入即可/);
+  assert.deepEqual(goal.options[1].choices.map((choice) => choice.value), [
     'set',
     'status',
     'pause',
@@ -209,6 +210,24 @@ test('buildSlashCommands narrows locked-provider surfaces to native aliases and 
     'token_limit',
     'enabled',
     'reset',
+  ]);
+});
+
+test('buildSlashCommands makes Claude goal content the primary input', () => {
+  const commands = buildSlashCommands({
+    SlashCommandBuilder: MockSlashCommandBuilder,
+    slashPrefix: 'cc',
+    botProvider: 'claude',
+  }).map((command) => command.toJSON());
+
+  const goal = commands.find((command) => command.name === 'cc_goal');
+  assert.ok(goal);
+  assert.deepEqual(goal.options.map((option) => option.name), ['objective', 'action']);
+  assert.match(goal.options[0].description, /直接输入即可/);
+  assert.deepEqual(goal.options[1].choices.map((choice) => choice.value), [
+    'set',
+    'status',
+    'clear',
   ]);
 });
 

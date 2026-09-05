@@ -8,10 +8,23 @@ import {
 } from '../src/provider-goal-flow.js';
 
 test('providerSupportsNativeGoalSlash exposes native goal providers with safe Discord transports', () => {
+  assert.equal(providerSupportsNativeGoalSlash('claude'), true);
   assert.equal(providerSupportsNativeGoalSlash('grok'), true);
   assert.equal(providerSupportsNativeGoalSlash('zcode'), true);
   assert.equal(providerSupportsNativeGoalSlash('omp'), true);
-  assert.equal(providerSupportsNativeGoalSlash('claude'), false);
+});
+
+test('buildProviderGoalCommand maps Claude goal actions to its native command forms', () => {
+  assert.equal(buildProviderGoalCommand({
+    provider: 'claude',
+    objective: 'ship the Discord bridge',
+  }), '/goal ship the Discord bridge');
+  assert.equal(buildProviderGoalCommand({ provider: 'claude', action: 'status' }), '/goal');
+  assert.equal(buildProviderGoalCommand({ provider: 'claude', action: 'clear' }), '/goal clear');
+  assert.throws(
+    () => buildProviderGoalCommand({ provider: 'claude', action: 'pause' }),
+    /does not support action: pause/,
+  );
 });
 
 test('buildProviderGoalCommand maps OMP actions to its interactive native goal commands', () => {
