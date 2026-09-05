@@ -5,9 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 LABEL="${LABEL:-com.atou.agents-in-discord.auto-upgrade}"
-BOT_LABEL="${BOT_LABEL:-com.atou.agents-in-discord}"
-SCHEDULE_HOUR="${SCHEDULE_HOUR:-5}"
-SCHEDULE_MINUTE="${SCHEDULE_MINUTE:-15}"
+SCHEDULE_HOUR="${SCHEDULE_HOUR:-8}"
+SCHEDULE_MINUTE="${SCHEDULE_MINUTE:-30}"
 
 if ! [[ "$SCHEDULE_HOUR" =~ ^[0-9]+$ ]] || ((SCHEDULE_HOUR < 0 || SCHEDULE_HOUR > 23)); then
   echo "invalid SCHEDULE_HOUR=${SCHEDULE_HOUR} (expected 0-23)" >&2
@@ -20,7 +19,7 @@ fi
 
 AGENTS_DIR="${HOME}/Library/LaunchAgents"
 PLIST_PATH="${AGENTS_DIR}/${LABEL}.plist"
-UPGRADE_SCRIPT="${PROJECT_ROOT}/scripts/agents-in-discord-auto-upgrade.sh"
+UPGRADE_SCRIPT="${PROJECT_ROOT}/scripts/agent-cli-auto-upgrade.mjs"
 STDOUT_PATH="${PROJECT_ROOT}/logs/agents-in-discord.auto-upgrade.log"
 STDERR_PATH="${PROJECT_ROOT}/logs/agents-in-discord.auto-upgrade.err.log"
 UID_VALUE="$(id -u)"
@@ -38,7 +37,7 @@ cat > "${PLIST_PATH}" <<EOF
 
     <key>ProgramArguments</key>
     <array>
-      <string>/bin/bash</string>
+      <string>/opt/homebrew/bin/node</string>
       <string>${UPGRADE_SCRIPT}</string>
     </array>
 
@@ -48,11 +47,13 @@ cat > "${PLIST_PATH}" <<EOF
     <key>EnvironmentVariables</key>
     <dict>
       <key>PATH</key>
-      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-      <key>BOT_LABEL</key>
-      <string>${BOT_LABEL}</string>
-      <key>CODEX_CASK_NAME</key>
-      <string>codex</string>
+      <string>${HOME}/.local/bin:${HOME}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <key>HOME</key>
+      <string>${HOME}</string>
+      <key>LANG</key>
+      <string>C.UTF-8</string>
+      <key>LC_ALL</key>
+      <string>C.UTF-8</string>
     </dict>
 
     <key>StartCalendarInterval</key>
@@ -62,9 +63,6 @@ cat > "${PLIST_PATH}" <<EOF
       <key>Minute</key>
       <integer>${SCHEDULE_MINUTE}</integer>
     </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
 
     <key>StandardOutPath</key>
     <string>${STDOUT_PATH}</string>

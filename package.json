@@ -43,6 +43,7 @@
     "release:major": "node scripts/cut-release.mjs major",
     "upgrade:project": "node scripts/agents-in-discord-project-upgrade.mjs",
     "run:auto-upgrade": "node scripts/agents-in-discord-auto-upgrade.mjs",
+    "run:agent-upgrade": "node scripts/agent-cli-auto-upgrade.mjs",
     "install:auto-upgrade": "node scripts/install-agents-in-discord-auto-upgrade.mjs",
     "patch-ws": "node scripts/patch-discord-ws.mjs",
     "postinstall": "node scripts/patch-discord-ws.mjs"
