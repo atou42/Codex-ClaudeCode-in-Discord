@@ -95,11 +95,12 @@ test('createRunnerArgsBuilder builds sandboxed and dangerous Grok headless runs'
     },
     workspaceDir: '/tmp/workspace',
     prompt: 'inspect',
+    promptFile: '/tmp/grok-prompt.txt',
     systemPrompt: 'discord context',
     inputImages: ['/tmp/input.png'],
   });
   assert.deepEqual(safe, [
-    '-p', 'inspect\n@/tmp/input.png',
+    '--prompt-file', '/tmp/grok-prompt.txt',
     '--cwd', '/tmp/workspace',
     '--output-format', 'streaming-json',
     '--resume', 'grok-session-1',
@@ -115,6 +116,7 @@ test('createRunnerArgsBuilder builds sandboxed and dangerous Grok headless runs'
     session: { provider: 'grok', mode: 'dangerous', runnerSessionId: 'grok-session-1' },
     workspaceDir: '/tmp/workspace',
     prompt: 'continue',
+    promptFile: '/tmp/grok-prompt.txt',
   });
   assert.equal(dangerous.includes('--always-approve'), true);
   assert.equal(dangerous.includes('--sandbox'), false);
@@ -389,6 +391,7 @@ test('createRunnerArgsBuilder never passes the Codex context window to non-Codex
       session: { provider, mode: 'safe', configOverrides: [] },
       workspaceDir: '/tmp/workspace',
       prompt: 'inspect',
+      promptFile: provider === 'grok' ? '/tmp/grok-prompt.txt' : '',
     });
     assert.equal(args.join(' ').includes('model_context_window'), false, provider);
     assert.equal(args.join(' ').includes('1050000'), false, provider);
@@ -432,6 +435,7 @@ test('createRunnerArgsBuilder never passes the Codex compact threshold to non-Co
       session: { provider, mode: 'safe', configOverrides: [] },
       workspaceDir: '/tmp/workspace',
       prompt: 'inspect',
+      promptFile: provider === 'grok' ? '/tmp/grok-prompt.txt' : '',
     });
     assert.equal(args.join(' ').includes('272000'), false, provider);
     assert.equal(args.join(' ').includes('model_auto_compact_token_limit'), false, provider);
@@ -790,12 +794,14 @@ test('createRunnerArgsBuilder resumes a Grok session already forked into its wor
     },
     workspaceDir: '/tmp/workspace',
     prompt: 'first fork turn',
+    promptFile: '/tmp/grok-prompt.txt',
   });
 
   assert.equal(args[args.indexOf('--resume') + 1], 'child-session');
   assert.equal(args.includes('--fork-session'), false);
   assert.equal(args.includes('--session-id'), false);
-  assert.equal(args[1], 'first fork turn');
+  assert.equal(args[args.indexOf('--prompt-file') + 1], '/tmp/grok-prompt.txt');
+  assert.equal(args.includes('first fork turn'), false);
 });
 
 test('createRunnerArgsBuilder falls back to prompt context for Antigravity', () => {

@@ -3,6 +3,7 @@ import { createRunnerArgsBuilder, uniqueDirs } from './runner-args.js';
 import { createClaudeLongRunner } from './claude-long-runner.js';
 import { createCodexAppServerRunner } from './codex-app-server-runner.js';
 import { createOmpInteractiveRunner } from './omp-interactive-runner.js';
+import { stageGrokPromptFile } from './grok-prompt-file.js';
 import { CODEX_GOAL_CONTINUATION_PROMPT, isCodexGoalContinuationPrompt } from './codex-goal-flow.js';
 import {
   createRunnerEventParser,
@@ -63,6 +64,7 @@ export function createRunnerExecutor({
   createClaudeLongRunnerFn = createClaudeLongRunner,
   createCodexAppServerRunnerFn = createCodexAppServerRunner,
   createOmpInteractiveRunnerFn = createOmpInteractiveRunner,
+  stageGrokPromptFileFn = stageGrokPromptFile,
 } = {}) {
   const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
     defaultModel,
@@ -221,31 +223,38 @@ export function createRunnerExecutor({
       }
     }
 
-    const args = buildSessionRunnerArgs({
-      provider,
-      session,
-      workspaceDir,
-      prompt,
-      systemPrompt,
-      additionalWorkspaceDirs,
-      inputImages,
-    });
+    const grokPrompt = normalizedProvider === 'grok'
+      ? await stageGrokPromptFileFn({ prompt, inputImages })
+      : null;
     const timeoutMs = resolveTimeoutSetting(session).timeoutMs;
     const bin = getProviderBin(provider);
-
-    if (debugEvents) {
-      console.log(`Running ${provider}:`, [bin, ...args].join(' '));
+    let result;
+    try {
+      const args = buildSessionRunnerArgs({
+        provider,
+        session,
+        workspaceDir,
+        prompt,
+        promptFile: grokPrompt?.path,
+        systemPrompt,
+        additionalWorkspaceDirs,
+        inputImages: grokPrompt ? [] : inputImages,
+      });
+      if (debugEvents) {
+        console.log(`Running ${provider}:`, [bin, ...args].join(' '));
+      }
+      result = await spawnRunner({ provider, args, cwd: workspaceDir, workspaceDir }, {
+        onSpawn,
+        wasCancelled,
+        onEvent,
+        onLog,
+        timeoutMs,
+        initialThreadId: normalizeProvider(provider) === 'zcode' ? getSessionId(session) : null,
+        goalMonitor: createCodexGoalMonitor({ provider, session, prompt }),
+      });
+    } finally {
+      await grokPrompt?.cleanup();
     }
-
-    const result = await spawnRunner({ provider, args, cwd: workspaceDir, workspaceDir }, {
-      onSpawn,
-      wasCancelled,
-      onEvent,
-      onLog,
-      timeoutMs,
-      initialThreadId: normalizeProvider(provider) === 'zcode' ? getSessionId(session) : null,
-      goalMonitor: createCodexGoalMonitor({ provider, session, prompt }),
-    });
     const normalizedResult = normalizeProvider(provider) === 'claude'
       ? normalizeClaudeResultForDisplay(result)
       : result;

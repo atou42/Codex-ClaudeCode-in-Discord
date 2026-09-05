@@ -368,6 +368,8 @@ test('createRunnerExecutor completes a Grok JSON turn and preserves its session 
   child.stderr = new EventEmitter();
   child.killed = false;
   const spawnCalls = [];
+  const stagedPrompts = [];
+  const cleanedPromptFiles = [];
 
   const executor = createRunnerExecutor({
     spawnEnv: process.env,
@@ -388,6 +390,13 @@ test('createRunnerExecutor completes a Grok JSON turn and preserves its session 
     startSessionProgressBridge: () => () => {},
     extractAgentMessageText,
     isFinalAnswerLikeAgentMessage,
+    stageGrokPromptFileFn: async ({ prompt, inputImages }) => {
+      stagedPrompts.push({ prompt, inputImages });
+      return {
+        path: '/tmp/grok-prompt.txt',
+        cleanup: async () => cleanedPromptFiles.push('/tmp/grok-prompt.txt'),
+      };
+    },
     spawnFn: (bin, args) => {
       spawnCalls.push({ bin, args });
       setImmediate(() => {
@@ -406,7 +415,8 @@ test('createRunnerExecutor completes a Grok JSON turn and preserves its session 
   const result = await executor.runProviderTask({
     session: { provider: 'grok', mode: 'safe', runnerSessionId: null },
     workspaceDir: '/tmp/workspace',
-    prompt: 'hello',
+    prompt: 'x'.repeat(19_448),
+    inputImages: ['/tmp/input.png'],
   });
 
   assert.equal(result.ok, true);
@@ -416,6 +426,10 @@ test('createRunnerExecutor completes a Grok JSON turn and preserves its session 
   assert.equal(spawnCalls[0].args.includes('--always-approve'), true);
   assert.equal(spawnCalls[0].args.includes('--permission-mode'), false);
   assert.equal(spawnCalls[0].args.includes('--sandbox'), true);
+  assert.equal(spawnCalls[0].args[spawnCalls[0].args.indexOf('--prompt-file') + 1], '/tmp/grok-prompt.txt');
+  assert.equal(spawnCalls[0].args.some((arg) => arg.length > 8192), false);
+  assert.deepEqual(stagedPrompts, [{ prompt: 'x'.repeat(19_448), inputImages: ['/tmp/input.png'] }]);
+  assert.deepEqual(cleanedPromptFiles, ['/tmp/grok-prompt.txt']);
 });
 
 test('createRunnerExecutor rejects a cancelled Grok turn and does not promote commentary to final output', async () => {

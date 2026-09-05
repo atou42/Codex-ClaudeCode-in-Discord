@@ -95,11 +95,10 @@ export function createRunnerArgsBuilder({
       }),
     }),
     createGrokProviderAdapter({
-      buildArgs: ({ session, workspaceDir, prompt, inputImages = [], systemPrompt = '' }) => buildGrokArgs({
+      buildArgs: ({ session, workspaceDir, promptFile, systemPrompt = '' }) => buildGrokArgs({
         session,
         workspaceDir,
-        prompt,
-        inputImages,
+        promptFile,
         systemPrompt,
       }),
     }),
@@ -131,6 +130,7 @@ export function createRunnerArgsBuilder({
     additionalWorkspaceDirs = [],
     inputImages = [],
     systemPrompt = '',
+    promptFile = '',
   }) {
     const adapter = providerAdapters.get(provider);
     return adapter.runtime.buildArgs({
@@ -140,6 +140,7 @@ export function createRunnerArgsBuilder({
       additionalWorkspaceDirs,
       inputImages,
       systemPrompt,
+      promptFile,
     });
   }
 
@@ -241,15 +242,12 @@ export function createRunnerArgsBuilder({
     return args;
   }
 
-  function buildGrokArgs({ session, workspaceDir, prompt, inputImages = [], systemPrompt = '' }) {
-    const attachments = inputImages
-      .map((imagePath) => String(imagePath || '').trim())
-      .filter(Boolean)
-      .map((imagePath) => `@${imagePath}`);
-    const promptText = [String(prompt || ''), ...attachments].filter(Boolean).join('\n');
+  function buildGrokArgs({ session, workspaceDir, promptFile, systemPrompt = '' }) {
+    const normalizedPromptFile = String(promptFile || '').trim();
+    if (!normalizedPromptFile) throw new Error('Grok prompt file is required');
     const sessionId = getSessionId(session);
     const args = [
-      '-p', promptText,
+      '--prompt-file', normalizedPromptFile,
       '--cwd', workspaceDir,
       '--output-format', 'streaming-json',
     ];
