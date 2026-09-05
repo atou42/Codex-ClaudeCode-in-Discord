@@ -205,11 +205,15 @@ export function createChannelQueue({
       return { ok: false, enqueued: false, reason: 'missing_failed_prompt' };
     }
 
+    // Claim synchronously: another retry must not submit the same input while we await acceptance.
     clearLastFailedPrompt(key);
+    const restoreIfUnreplaced = () => {
+      if (!getLastFailedPrompt(key)) rememberFailedPrompt(key, failedPrompt);
+    };
     try {
       const result = await enqueuePrompt(failedPrompt.message, failedPrompt.key, failedPrompt.content, null);
-      if (!result?.enqueued) {
-        rememberFailedPrompt(key, failedPrompt);
+      if (!result?.enqueued && !result?.steered) {
+        restoreIfUnreplaced();
         return {
           ok: false,
           enqueued: false,
@@ -218,9 +222,15 @@ export function createChannelQueue({
         };
       }
 
-      return { ok: true, enqueued: true, queuedAhead: result.queuedAhead || 0 };
+      return {
+        ok: true,
+        ...(result.steered
+          ? { enqueued: false, steered: true }
+          : { enqueued: true, queuedAhead: result.queuedAhead || 0 }),
+        ...(result.notificationError ? { notificationError: result.notificationError } : {}),
+      };
     } catch (err) {
-      rememberFailedPrompt(key, failedPrompt);
+      restoreIfUnreplaced();
       throw err;
     }
   }
