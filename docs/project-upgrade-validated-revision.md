@@ -10,3 +10,9 @@ This guarantee concerns the selected commit. It does not make dependency
 installation reproducible, reserve the main worktree against unrelated local
 writers, implement rollback after installation failure, or change dry-run and
 restart behavior. Those concerns require separate safeguards.
+
+If A has already passed validation and remains fast-forwardable, a later fetch
+of B does not reject A. The final HEAD is A; the apply report and returned status
+identify B as still available and requiring validation. Revision tests invoke
+real Git only in temporary repositories and inject installation/verification
+results; no real dependency install, service command, or notification is run.

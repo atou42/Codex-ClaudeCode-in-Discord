@@ -266,6 +266,9 @@ export function createProjectUpgradeManager({
         }
 
         const after = dryRun ? before : await check({ fetch: false });
+        if (!dryRun && after.updateAvailable && after.remoteHead !== before.remoteHead) {
+          logs.push(`newer revision ${after.remoteHead} remains available and requires validation`);
+        }
         cachedStatus = after;
         cachedAt = Date.now();
         return {

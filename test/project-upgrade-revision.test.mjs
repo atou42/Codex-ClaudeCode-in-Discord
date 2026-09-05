@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createProjectUpgradeManager } from '../src/project-upgrade.js';
+import { createProjectUpgradeManager, formatProjectUpgradeReport } from '../src/project-upgrade.js';
 
 function git(cwd, args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -44,15 +44,21 @@ for (const moves of [true, false]) {
     const f = fixture(t);
     let mergeCalls = 0;
     let validatedVersion = null;
+    const shellCalls = [];
     const manager = createProjectUpgradeManager({
       projectRoot: f.local,
       env: { ...process.env },
       lockDir: path.join(f.root, 'upgrade.lock'),
-      installCommand: 'node -e ""',
-      verifyCommand: 'node -e "if(require(\'./package.json\').version!==\'0.1.1\')process.exit(7)"',
+      installCommand: 'fixture-install',
+      // Exercise the default verification contract without running installation or services.
+      spawnFn: () => { throw new Error('service launch forbidden in this fixture'); },
       spawnSyncFn: (cmd, args, options) => {
-        if (cmd !== 'git' && options.cwd !== f.local) {
-          validatedVersion = JSON.parse(fs.readFileSync(path.join(options.cwd, 'package.json'), 'utf8')).version;
+        if (cmd !== 'git') {
+          const version = JSON.parse(fs.readFileSync(path.join(options.cwd, 'package.json'), 'utf8')).version;
+          const command = args.at(-1);
+          shellCalls.push({ command, staging: options.cwd !== f.local, version });
+          if (command === 'npm run test:progress') validatedVersion = version;
+          return { status: version === '0.1.1' ? 0 : 7, stdout: '', stderr: '' };
         }
         if (cmd === 'git' && args[0] === 'merge') {
           mergeCalls += 1;
@@ -66,10 +72,26 @@ for (const moves of [true, false]) {
       },
     });
     const result = await manager.apply();
+    assert.equal(git(f.local, ['rev-parse', 'HEAD']), f.validated, 'only the tested revision may reach the worktree');
     assert.equal(result.ok, true, result.error);
     assert.equal(mergeCalls, 1);
     assert.equal(validatedVersion, '0.1.1');
     assert.equal(result.before.remoteHead, f.validated);
+    assert.deepEqual(shellCalls, [
+      { command: 'fixture-install', staging: true, version: '0.1.1' },
+      { command: 'npm run test:progress', staging: true, version: '0.1.1' },
+      { command: 'fixture-install', staging: false, version: '0.1.1' },
+    ]);
+    assert.equal(result.restartRequested, false);
+    assert.equal(result.check.localHead, f.validated);
+    assert.equal(result.check.remoteHead, moves ? f.unvalidated : f.validated);
+    assert.equal(result.check.updateAvailable, moves, 'a newer revision must still be reported as unvalidated');
+    if (moves) {
+      const report = formatProjectUpgradeReport(result.check, 'en', { applyResult: result });
+      assert.match(report, /upgraded to 0\.1\.1/);
+      assert.ok(report.includes(`newer revision ${f.unvalidated} remains available and requires validation`));
+    }
+    assert.ok(result.logs.some((line) => line.includes(`merged validated revision ${f.validated}`)));
     assert.equal(git(f.local, ['rev-parse', 'HEAD']), f.validated, 'only the tested revision may reach the worktree');
     assert.equal(JSON.parse(fs.readFileSync(path.join(f.local, 'package.json'), 'utf8')).version, '0.1.1');
     assert.equal(git(f.local, ['rev-parse', 'origin/main']), moves ? f.unvalidated : f.validated);
