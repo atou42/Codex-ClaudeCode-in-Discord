@@ -17,6 +17,7 @@ function looksLikeMutatingSidePrompt(content) {
 }
 
 export function createChannelQueue({
+  logger = console,
   getChannelState,
   getSession,
   resolveSecurityContext,
@@ -91,7 +92,13 @@ export function createChannelQueue({
         channelState: state,
       });
       if (outcome?.steered) {
-        await safeReply(message, '↪️ 已插入当前 Codex 任务。');
+        try {
+          await safeReply(message, '↪️ 已插入当前 Codex 任务。');
+        } catch (err) {
+          // The runner already accepted this input. A failed acknowledgement
+          // must not turn it into a second, queued execution.
+          logger.warn(`Accepted steer for ${key}; Discord confirmation failed; prompt not requeued: ${safeError(err)}`);
+        }
         return { ok: true, steered: true };
       }
       return {
