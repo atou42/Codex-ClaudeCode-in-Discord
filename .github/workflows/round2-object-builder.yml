@@ -1,0 +1,32 @@
+name: Round-two verified Git object construction
+on:
+  push:
+    branches: [review/round2-object-builder-20260905]
+permissions:
+  contents: write
+jobs:
+  objects:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Construct immutable verified objects without updating refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="https://raw.githubusercontent.com/atou42/agents-in-discord/$GITHUB_SHA/.github"
+          curl --fail --silent --show-error "$root/round2-build-objects.py" -o build-objects.py
+          curl --fail --silent --show-error "$root/round2-builder-manifest.json" -o builder-manifest.json
+          test "$(git hash-object build-objects.py)" = 2ea76f4be0c20850623c2257bd01bd9dcf0ca782
+          test "$(git hash-object builder-manifest.json)" = d0f498375dbb7b50e4ae7fd86840417e0d8f8bc3
+          python3 build-objects.py 2>&1 | tee object-build.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: round2-verified-git-objects
+          path: |
+            object-evidence/
+            object-build.log
+          if-no-files-found: error
+          retention-days: 7
