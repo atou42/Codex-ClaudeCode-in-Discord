@@ -80,3 +80,40 @@ for (const mode of ['rejected', 'throwing']) {
     assert.deepEqual(f.counts(), { executions: 0, steerCalls: 1, deliveries: 1 });
   });
 }
+
+for (const mode of ['rejected', 'throwing']) {
+  test(`${mode} steering preserves accepted queue work when its acknowledgement fails`, async () => {
+    const f = fixture({ rejected: mode === 'rejected', steeringError: mode === 'throwing' ? new Error('turn ended') : null });
+    const active = f.state.activeRun;
+    const result = await f.queue.enqueuePrompt(f.message, 'channel', 'adjust the task').catch((error) => ({ error }));
+    assert.equal(result.enqueued, true, 'delivery failure must not report an accepted queue item as rejected');
+    assert.equal(result.ok, true);
+    assert.equal(result.notificationError, 'Missing Permissions');
+    assert.equal(f.state.queue.length, 1);
+    assert.equal(f.state.queue[0].content, 'adjust the task');
+    assert.equal(f.state.activeRun, active);
+    assert.equal(f.state.running, true);
+    assert.deepEqual(f.counts(), { executions: 0, steerCalls: 1, deliveries: 1 });
+    assert.equal(f.warnings.length, 1);
+    assert.match(f.warnings[0], /queue accepted.*notification failed/i);
+  });
+}
+
+for (const accepted of [true, false]) {
+  test(`accepted ${accepted ? 'steer' : 'queue fallback'} survives failed reply and channel fallback`, async () => {
+    const f = fixture({ rejected: !accepted });
+    let replies = 0;
+    let sends = 0;
+    f.message.reply = async () => { replies += 1; throw Object.assign(new Error('Invalid Webhook Token'), { code: 50027 }); };
+    f.message.channel.send = async () => { sends += 1; throw Object.assign(new Error('Missing Permissions'), { code: 50013 }); };
+    const result = await f.queue.enqueuePrompt(f.message, 'channel', 'accepted once');
+    assert.equal(result.ok, true);
+    assert.equal(result.enqueued, !accepted);
+    assert.equal(Boolean(result.steered), accepted);
+    assert.equal(result.notificationError, 'Missing Permissions');
+    assert.equal(f.state.queue.length, accepted ? 0 : 1);
+    assert.equal(f.counts().steerCalls, 1);
+    assert.equal(f.counts().executions, 0);
+    assert.deepEqual({ replies, sends }, { replies: 1, sends: 1 });
+  });
+}

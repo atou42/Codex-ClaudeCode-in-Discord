@@ -163,18 +163,25 @@ export function createChannelQueue({
     });
     nextQueueItemId += 1;
 
+    let notificationError;
     if (queuedAhead > 0) {
       const steerFailure = steerAttempt && !steerAttempt.steered
         ? `插入当前任务失败（${formatSteerFailure(steerAttempt.fallbackReason)}），`
         : '';
-      await safeReply(
-        message,
-        `⏳ ${steerFailure}已加入队列，前面还有 ${queuedAhead} 条。可用 \`${slashRef('status')}\` 查看状态，必要时用 \`!c\` 中断当前任务。`,
-      );
+      try {
+        await safeReply(
+          message,
+          `⏳ ${steerFailure}已加入队列，前面还有 ${queuedAhead} 条。可用 \`${slashRef('status')}\` 查看状态，必要时用 \`!c\` 中断当前任务。`,
+        );
+      } catch (err) {
+        // Queue acceptance, like steering acceptance, survives notification failure.
+        notificationError = safeError(err);
+        logger.warn(`queue accepted for ${key}, but notification failed: ${notificationError}`);
+      }
     }
 
     void processPromptQueue(key);
-    return { ok: true, enqueued: true, queuedAhead };
+    return { ok: true, enqueued: true, queuedAhead, ...(notificationError ? { notificationError } : {}) };
   }
 
   function createFailedPromptRecord(job, err = null, reason = null) {
