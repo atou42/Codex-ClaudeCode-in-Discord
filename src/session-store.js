@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -134,7 +135,7 @@ export function createSessionStore({
   resolveDefaultWorkspace = () => ({ workspaceDir: null, source: 'unset', envKey: null }),
   resolveSessionWorkspace = () => null,
 } = {}) {
-  let db = loadDb(dataFile);
+  const db = loadDb(dataFile);
   const getChildThreadWorkspaceMode = (provider) => {
     if (typeof resolveChildThreadWorkspaceMode === 'function') {
       return normalizeChildThreadWorkspaceMode(resolveChildThreadWorkspaceMode(provider));
@@ -144,16 +145,6 @@ export function createSessionStore({
 
   function ensureDbShape() {
     let changed = false;
-
-    if (!db || typeof db !== 'object' || Array.isArray(db)) {
-      db = { threads: {}, workspaceFavorites: {} };
-      return true;
-    }
-
-    if (!db.threads || typeof db.threads !== 'object' || Array.isArray(db.threads)) {
-      db.threads = {};
-      changed = true;
-    }
 
     const normalizedFavorites = normalizeWorkspaceFavoritesMap(db.workspaceFavorites, normalizeProvider);
     const currentFavorites = db.workspaceFavorites && typeof db.workspaceFavorites === 'object' && !Array.isArray(db.workspaceFavorites)
@@ -177,7 +168,27 @@ export function createSessionStore({
         commitSessionProviderState(session, { normalizeProvider });
       }
     }
-    fs.writeFileSync(dataFile, JSON.stringify(db, null, 2));
+    const serialized = JSON.stringify(db, null, 2);
+    const temporaryFile = `${dataFile}.${process.pid}.${randomUUID()}.tmp`;
+    let fd = null;
+    let created = false;
+    try {
+      fd = fs.openSync(temporaryFile, 'wx', 0o600);
+      created = true;
+      fs.writeFileSync(fd, serialized, 'utf8');
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      fs.renameSync(temporaryFile, dataFile);
+    } catch (err) {
+      if (fd !== null) {
+        try { fs.closeSync(fd); } catch {}
+      }
+      if (created) {
+        try { fs.unlinkSync(temporaryFile); } catch {}
+      }
+      throw err;
+    }
   }
 
   function normalizePersistedCompactTokenLimit(value, field, provider) {
@@ -810,10 +821,19 @@ export function createSessionStore({
 }
 
 function loadDb(dataFile) {
-  if (!fs.existsSync(dataFile)) return { threads: {} };
+  let db;
   try {
-    return JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+    db = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
   } catch (err) {
-    throw new Error(`Failed to load session DB ${dataFile}: ${err?.message || err}`);
+    if (err?.code === 'ENOENT') return { threads: {} };
+    const reason = err instanceof SyntaxError ? 'invalid JSON' : (err?.code || 'read failed');
+    throw new Error(`Failed to load session DB ${dataFile}: ${reason}`);
   }
+  const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!isRecord(db) || !isRecord(db.threads)
+    || Object.values(db.threads).some((session) => !isRecord(session))
+    || (db.workspaceFavorites !== undefined && !isRecord(db.workspaceFavorites))) {
+    throw new Error(`Invalid session DB ${dataFile}; preserve the file and repair its structure before restarting`);
+  }
+  return db;
 }
