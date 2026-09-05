@@ -147,9 +147,11 @@ test('wechat revalidates a numbered resume selection after a directory becomes a
     readSessionMetaFn: () => ({ cwd: project, file: null }),
   });
   const before = { ...store.get('user-1') };
+  const diskBefore = fs.readFileSync(path.join(root, 'sessions.json'), 'utf8');
   assert.equal(store.listRecent('user-1').length, 1);
   fs.rmdirSync(project);
   fs.symlinkSync(outside, project, 'dir');
   assert.throws(() => store.bind('user-1', '1'), /WECHAT_WORKSPACE_ROOTS/);
   assert.deepEqual(store.get('user-1'), before);
+  assert.equal(fs.readFileSync(path.join(root, 'sessions.json'), 'utf8'), diskBefore);
 });
