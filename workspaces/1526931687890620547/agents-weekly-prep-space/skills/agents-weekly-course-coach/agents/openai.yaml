@@ -1,4 +1,0 @@
-interface:
-  display_name: "Agents Weekly 备课搭档"
-  short_description: "用多视角会诊和独立验收，帮嘉宾完成一次高质量分享备课。"
-  default_prompt: "使用 $agents-weekly-course-coach 帮我从主题开始备课，或校准我已有的讲稿。"
