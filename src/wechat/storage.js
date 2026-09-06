@@ -25,10 +25,14 @@ export function atomicWrite(file, data, mode = 0o600) {
 }
 
 export function readJson(file, fallback = null) {
+  if (!file) return fallback;
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
+  } catch (err) {
+    if (err?.code === 'ENOENT') return fallback;
+    // Parser messages can contain credential/state contents. Report only the class.
+    const reason = err instanceof SyntaxError ? 'invalid JSON' : (err?.code || 'read failed');
+    throw new Error(`Failed to read JSON state ${file}: ${reason}`);
   }
 }
 

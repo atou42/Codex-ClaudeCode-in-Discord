@@ -24,6 +24,7 @@ export function createChannelQueue({
   slashRef = (name) => `/${name}`,
   safeReply,
   safeError,
+  logger = console,
   getCurrentUserId,
   handlePrompt,
   steerPrompt = null,
@@ -82,29 +83,34 @@ export function createChannelQueue({
       };
     }
 
+    let outcome;
     try {
-      const outcome = await steerPrompt({
+      outcome = await steerPrompt({
         message,
         key,
         content,
         session,
         channelState: state,
       });
-      if (outcome?.steered) {
-        await safeReply(message, '↪️ 已插入当前 Codex 任务。');
-        return { ok: true, steered: true };
-      }
+    } catch (err) {
+      return { ok: false, steered: false, fallbackReason: safeError(err) };
+    }
+    if (!outcome?.steered) {
       return {
         ok: false,
         steered: false,
         fallbackReason: outcome?.error || outcome?.reason || 'steer failed',
       };
+    }
+
+    // Delivery failure does not undo a steer already accepted by the runner.
+    try {
+      await safeReply(message, '↪️ 已插入当前 Codex 任务。');
+      return { ok: true, steered: true };
     } catch (err) {
-      return {
-        ok: false,
-        steered: false,
-        fallbackReason: safeError(err),
-      };
+      const notificationError = safeError(err);
+      logger.warn(`steer accepted for ${key}, but notification failed: ${notificationError}`);
+      return { ok: true, steered: true, notificationError };
     }
   }
 
@@ -129,7 +135,10 @@ export function createChannelQueue({
       session,
     });
     if (steerAttempt?.steered) {
-      return { ok: true, enqueued: false, steered: true };
+      return {
+        ok: true, enqueued: false, steered: true,
+        ...(steerAttempt.notificationError ? { notificationError: steerAttempt.notificationError } : {}),
+      };
     }
 
     const maxQueue = security.maxQueuePerChannel;
@@ -154,18 +163,25 @@ export function createChannelQueue({
     });
     nextQueueItemId += 1;
 
+    let notificationError;
     if (queuedAhead > 0) {
       const steerFailure = steerAttempt && !steerAttempt.steered
         ? `插入当前任务失败（${formatSteerFailure(steerAttempt.fallbackReason)}），`
         : '';
-      await safeReply(
-        message,
-        `⏳ ${steerFailure}已加入队列，前面还有 ${queuedAhead} 条。可用 \`${slashRef('status')}\` 查看状态，必要时用 \`!c\` 中断当前任务。`,
-      );
+      try {
+        await safeReply(
+          message,
+          `⏳ ${steerFailure}已加入队列，前面还有 ${queuedAhead} 条。可用 \`${slashRef('status')}\` 查看状态，必要时用 \`!c\` 中断当前任务。`,
+        );
+      } catch (err) {
+        // Queue acceptance, like steering acceptance, survives notification failure.
+        notificationError = safeError(err);
+        logger.warn(`queue accepted for ${key}, but notification failed: ${notificationError}`);
+      }
     }
 
     void processPromptQueue(key);
-    return { ok: true, enqueued: true, queuedAhead };
+    return { ok: true, enqueued: true, queuedAhead, ...(notificationError ? { notificationError } : {}) };
   }
 
   function createFailedPromptRecord(job, err = null, reason = null) {
@@ -189,11 +205,15 @@ export function createChannelQueue({
       return { ok: false, enqueued: false, reason: 'missing_failed_prompt' };
     }
 
+    // Claim synchronously: another retry must not submit the same input while we await acceptance.
     clearLastFailedPrompt(key);
+    const restoreIfUnreplaced = () => {
+      if (!getLastFailedPrompt(key)) rememberFailedPrompt(key, failedPrompt);
+    };
     try {
       const result = await enqueuePrompt(failedPrompt.message, failedPrompt.key, failedPrompt.content, null);
-      if (!result?.enqueued) {
-        rememberFailedPrompt(key, failedPrompt);
+      if (!result?.enqueued && !result?.steered) {
+        restoreIfUnreplaced();
         return {
           ok: false,
           enqueued: false,
@@ -202,9 +222,15 @@ export function createChannelQueue({
         };
       }
 
-      return { ok: true, enqueued: true, queuedAhead: result.queuedAhead || 0 };
+      return {
+        ok: true,
+        ...(result.steered
+          ? { enqueued: false, steered: true }
+          : { enqueued: true, queuedAhead: result.queuedAhead || 0 }),
+        ...(result.notificationError ? { notificationError: result.notificationError } : {}),
+      };
     } catch (err) {
-      rememberFailedPrompt(key, failedPrompt);
+      restoreIfUnreplaced();
       throw err;
     }
   }
