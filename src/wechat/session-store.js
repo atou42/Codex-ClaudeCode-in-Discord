@@ -67,7 +67,7 @@ export function createWechatSessionStore({
     workspaceRoots
       .map((item) => String(item || '').trim())
       .filter(Boolean)
-      .map((item) => path.resolve(item)),
+      .map((item) => fs.realpathSync(path.resolve(item))),
   )];
   let db = readJson(dataFile, { version: 1, users: {} });
   if (!db || typeof db !== 'object' || Array.isArray(db)) db = { version: 1, users: {} };
@@ -83,10 +83,11 @@ export function createWechatSessionStore({
     if (!resolved || !fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
       throw new Error(`工作目录不存在: ${resolved}`);
     }
-    if (roots.length && !roots.some((root) => isWithinRoot(resolved, root))) {
+    const canonical = fs.realpathSync(resolved);
+    if (roots.length && !roots.some((root) => isWithinRoot(canonical, root))) {
       throw new Error(`工作目录不在 WECHAT_WORKSPACE_ROOTS 允许范围内: ${resolved}`);
     }
-    return resolved;
+    return canonical;
   }
 
   function get(userId) {
@@ -116,12 +117,14 @@ export function createWechatSessionStore({
 
   function update(userId, patch) {
     const session = get(userId);
-    Object.assign(session, patch, { updatedAt: now().toISOString() });
-    session.sessionId = normalizeOptionalString(session.sessionId);
-    session.model = normalizeOptionalString(session.model);
-    session.effort = normalizeOptionalString(session.effort);
-    session.mode = normalizeMode(session.mode);
-    session.workspaceDir = ensureWorkspaceAllowed(session.workspaceDir);
+    // Validate before changing the live binding (including cached /resume selections).
+    const next = { ...session, ...patch, updatedAt: now().toISOString() };
+    next.sessionId = normalizeOptionalString(next.sessionId);
+    next.model = normalizeOptionalString(next.model);
+    next.effort = normalizeOptionalString(next.effort);
+    next.mode = normalizeMode(next.mode);
+    next.workspaceDir = ensureWorkspaceAllowed(next.workspaceDir);
+    Object.assign(session, next);
     save();
     return session;
   }
