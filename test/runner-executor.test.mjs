@@ -1320,13 +1320,18 @@ test('createRunnerExecutor stops Codex goal continuation when Codex reports a bl
   assert.ok(result.logs.includes('Codex goal reported a blocker; waiting 1ms for final output before stopping runner.'));
 });
 
-test('createRunnerExecutor stops a regular Codex goal run when Codex reports a blocker', async () => {
+test('createRunnerExecutor stops a regular Codex goal run when Codex reports a blocker', { timeout: 2000 }, async (t) => {
+  // A real ChildProcess holds the event loop open; EventEmitter alone does not.
+  // Keep that lifetime until close so the production unref'ed grace timer can run.
+  const processLifetime = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(processLifetime));
   let killed = false;
   let goalCalls = 0;
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.killed = false;
+  child.once('close', () => clearInterval(processLifetime));
   child.kill = () => {
     killed = true;
     child.killed = true;
