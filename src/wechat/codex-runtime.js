@@ -19,6 +19,7 @@ export function createWechatCodexRuntime({
   lockRoot,
   codexBin = 'codex',
   runtimeMode = 'long',
+  allowDangerous = false,
   timeoutMs = 0,
   spawnEnv = buildSpawnEnv(process.env),
   logger = console,
@@ -74,6 +75,9 @@ export function createWechatCodexRuntime({
       return { ok: false, busy: true, error: '当前微信会话已有任务在运行' };
     }
     const saved = sessionStore.get(key);
+    if (saved.mode === 'dangerous' && !allowDangerous) {
+      throw new Error('微信 dangerous mode 已禁用；请先使用 /mode safe，或由管理员显式启用 WECHAT_ALLOW_DANGEROUS=true');
+    }
     const session = {
       provider: 'codex',
       runnerSessionId: saved.sessionId,

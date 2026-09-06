@@ -101,9 +101,11 @@ async function main() {
     workspaceRoots: configuredRoots,
   });
   sessionStore.ensureWorkspaceAllowed(defaultWorkspaceDir);
+  const allowDangerous = parseBoolean(process.env.WECHAT_ALLOW_DANGEROUS, false);
   const codexRuntime = createWechatCodexRuntime({
     sessionStore,
     lockRoot: WORKSPACE_LOCK_ROOT,
+    allowDangerous,
     codexBin,
     runtimeMode: String(process.env.WECHAT_CODEX_RUNTIME_MODE || 'long').trim().toLowerCase(),
     timeoutMs: parseTimeout(process.env.WECHAT_CODEX_TIMEOUT_MS || process.env.CODEX_TIMEOUT_MS),
@@ -118,7 +120,7 @@ async function main() {
     sessionStore,
     codexRuntime,
     allowedUserIds,
-    allowDangerous: parseBoolean(process.env.WECHAT_ALLOW_DANGEROUS, false),
+    allowDangerous,
   });
   ilink.setReloginHandler(async () => {
     const refreshed = await loginWechat({ showQrCode });
