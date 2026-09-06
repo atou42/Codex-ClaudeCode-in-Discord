@@ -871,3 +871,89 @@ test('readProviderModelCatalog routes pi and omp to the Pi-family reader', () =>
   assert.deepEqual(read('omp').models.map((m) => m.slug), ['omp/model-a']);
   assert.deepEqual(bins, ['pi-routed', 'omp-routed']);
 });
+
+const invalidCodexCatalogs = [
+  ['null root', null, /models.*array/i],
+  ['array root', [], /models.*array/i],
+  ['missing models', {}, /models.*array/i],
+  ['null models', { models: null }, /models.*array/i],
+  ['object models', { models: {} }, /models.*array/i],
+  ['missing slug', { models: [{}] }, /models\[0\].slug/i],
+  ['blank slug', { models: [{ slug: '  ' }] }, /models\[0\].slug/i],
+  ['numeric slug', { models: [{ slug: 123 }] }, /models\[0\].slug/i],
+  ['null item', { models: [null] }, /models\[0\].slug/i],
+  ['array item', { models: [[]] }, /models\[0\].slug/i],
+  ['mixed valid and bad items', { models: [{ slug: 'valid-one' }, {}] }, /models\[1\].slug/i],
+];
+for (const [label, payload, reason] of invalidCodexCatalogs) {
+  test(`readCodexModelCatalog rejects ${label} without presenting a partial directory`, () => {
+    let calls = 0;
+    const result = readCodexModelCatalog({
+      codexBin: `catalog-shape-${label}`, env: {}, ttlMs: 0,
+      execFileSyncFn(bin, args, options) {
+        calls += 1;
+        assert.equal(bin, `catalog-shape-${label}`);
+        assert.deepEqual(args, ['debug', 'models']);
+        assert.equal(options.timeout, 5000);
+        assert.deepEqual(options.env, {});
+        return JSON.stringify(payload);
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(typeof result.error, 'string');
+    assert.match(result.error, reason);
+    assert.deepEqual(result.models, []);
+  });
+}
+
+test('readCodexModelCatalog preserves a structurally valid zero-model response', () => {
+  const result = readCodexModelCatalog({ codexBin: 'catalog-valid-empty', env: {}, ttlMs: 0,
+    execFileSyncFn: () => JSON.stringify({ models: [] }) });
+  assert.deepEqual(result, { models: [], error: null });
+});
+
+test('readCodexModelCatalog retains both valid models and optional-field compatibility', () => {
+  const result = readCodexModelCatalog({ codexBin: 'catalog-valid-two', env: {}, ttlMs: 0,
+    execFileSyncFn: () => JSON.stringify({ models: [
+      { slug: ' first ', display_name: 'First', description: 'first model', visibility: 'list',
+        default_reasoning_level: 'high', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }] },
+      { slug: 'second', displayName: 'Second', supported_reasoning_levels: null },
+    ] }) });
+  assert.equal(result.error, null);
+  assert.deepEqual(result.models, [
+    { slug: 'first', displayName: 'First', description: 'first model', visibility: 'list',
+      defaultReasoningLevel: 'high', supportedReasoningLevels: ['low', 'high'] },
+    { slug: 'second', displayName: 'Second', description: '', visibility: '',
+      defaultReasoningLevel: null, supportedReasoningLevels: [] },
+  ]);
+});
+
+for (const [label, response] of [
+  ['timeout', () => { throw Object.assign(new Error('catalog command timed out'), { code: 'ETIMEDOUT' }); }],
+  ['nonzero exit', () => { throw Object.assign(new Error('catalog exited 7'), { status: 7 }); }],
+  ['invalid JSON', () => '{incomplete'],
+]) {
+  test(`readCodexModelCatalog exposes ${label} from the injected CLI executor`, () => {
+    const result = readCodexModelCatalog({ codexBin: `catalog-cli-${label}`, env: {}, ttlMs: 0, execFileSyncFn: response });
+    assert.equal(typeof result.error, 'string');
+    assert.ok(result.error.length > 0);
+    assert.deepEqual(result.models, []);
+  });
+}
+
+test('readCodexModelCatalog retains cache policy and recovers after a malformed response expires', () => {
+  let time = 0;
+  let calls = 0;
+  const options = { codexBin: 'catalog-recovery-cache', env: {}, now: () => time, ttlMs: 100,
+    execFileSyncFn: () => { calls += 1; return JSON.stringify(calls === 1 ? {} : { models: [{ slug: 'first' }, { slug: 'second' }] }); } };
+  const broken = readCodexModelCatalog(options);
+  assert.match(broken.error, /models.*array/i);
+  time = 99;
+  assert.equal(readCodexModelCatalog(options), broken);
+  assert.equal(calls, 1);
+  time = 100;
+  const healthy = readCodexModelCatalog(options);
+  assert.equal(healthy.error, null);
+  assert.deepEqual(healthy.models.map(({ slug }) => slug), ['first', 'second']);
+  assert.equal(calls, 2);
+});

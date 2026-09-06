@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createSettingsPanel } from '../src/settings-panel.js';
+import { readCodexModelCatalog } from '../src/runtime-bootstrap.js';
 
 class FakeButtonBuilder {
   constructor() {
@@ -2630,3 +2631,31 @@ test('createSettingsPanel opens the existing workspace browser in a separate rep
     flags: 64,
   }]);
 });
+
+for (const section of ['overview', 'model']) {
+  test(`settings ${section} presents the actual Codex catalog failure reason and recovers`, () => {
+    const catalog = readCodexModelCatalog({ codexBin: `panel-catalog-${section}`, env: {}, ttlMs: 0,
+      execFileSyncFn: () => JSON.stringify({ models: [{ slug: 'valid' }, {}] }) });
+    const session = { provider: 'codex', language: 'zh' };
+    const panel = createPanel({ session, modelCatalog: catalog });
+    const payload = panel.openSettingsPanel({ key: 'channel-1', userId: '123456789', activeSection: section });
+    assert.match(payload.content, /模型列表：暂不可用/);
+    assert.ok(payload.content.includes(catalog.error));
+    const healthy = readCodexModelCatalog({ codexBin: `panel-catalog-${section}`, env: {}, ttlMs: 0,
+      execFileSyncFn: () => JSON.stringify({ models: [{ slug: 'first' }, { slug: 'second' }] }) });
+    const restored = createPanel({ session, modelCatalog: healthy }).openSettingsPanel({ key: 'channel-1', userId: '123456789', activeSection: section });
+    assert.doesNotMatch(restored.content, /模型列表：暂不可用/);
+    assert.deepEqual(healthy.models.map(({ slug }) => slug), ['first', 'second']);
+  });
+}
+
+for (const section of ['overview', 'model']) {
+  test(`settings ${section} exposes CLI timeout rather than a healthy empty catalog`, () => {
+    const catalog = readCodexModelCatalog({ codexBin: `panel-timeout-${section}`, env: {}, ttlMs: 0,
+      execFileSyncFn: () => { throw Object.assign(new Error('catalog command timed out'), { code: 'ETIMEDOUT' }); } });
+    const panel = createPanel({ session: { provider: 'codex', language: 'zh' }, modelCatalog: catalog });
+    const payload = panel.openSettingsPanel({ key: 'channel-1', userId: '123456789', activeSection: section });
+    assert.match(payload.content, /模型列表：暂不可用/);
+    assert.match(payload.content, /catalog command timed out/);
+  });
+}
