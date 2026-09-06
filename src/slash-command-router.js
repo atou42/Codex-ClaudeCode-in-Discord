@@ -1211,7 +1211,7 @@ export function createSlashCommandRouter({
     }
 
     const outcome = await retryLastPrompt(key, interaction.user.id);
-    if (!outcome?.enqueued) {
+    if (!outcome?.enqueued && !outcome?.steered) {
       const content = outcome?.reason === 'queue_full' && Number.isFinite(outcome?.maxQueue)
         ? `🚧 当前频道队列已满（上限 ${outcome.maxQueue}），请稍后再试。`
         : '❌ 没有可重试的失败任务。';
@@ -1222,9 +1222,11 @@ export function createSlashCommandRouter({
       return;
     }
 
-    const content = outcome.queuedAhead > 0
-      ? `🔁 已重新加入队列，前面还有 ${outcome.queuedAhead} 条。`
-      : '🔁 已重新加入队列。';
+    const content = outcome.steered
+      ? '🔁 已插入当前 Codex 任务。'
+      : outcome.queuedAhead > 0
+        ? `🔁 已重新加入队列，前面还有 ${outcome.queuedAhead} 条。`
+        : '🔁 已重新加入队列。';
     await respond({
       content,
       flags: 64,
