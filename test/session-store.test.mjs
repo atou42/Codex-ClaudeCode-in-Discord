@@ -6,6 +6,127 @@ import path from 'node:path';
 
 import { createSessionStore, normalizeChildThreadWorkspaceMode } from '../src/session-store.js';
 import { normalizeProvider as normalizeAllProviders } from '../src/provider-metadata.js';
+import { createSessionCommandActions } from '../src/session-command-actions.js';
+import { createRunnerArgsBuilder } from '../src/runner-args.js';
+
+function createModeInheritanceFixture(t, { provider = 'cursor', mode = 'safe', threads = {} } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-mode-inheritance-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dataFile = path.join(root, 'sessions.json');
+  fs.writeFileSync(dataFile, JSON.stringify({ threads }));
+  const options = {
+    dataFile,
+    workspaceRoot: path.join(root, 'workspaces'),
+    botProvider: provider,
+    defaults: { provider, mode, language: 'zh', onboardingEnabled: true },
+    getSessionId: (session) => session?.runnerSessionId || null,
+    normalizeProvider: normalizeAllProviders,
+    normalizeUiLanguage: (value) => value || 'zh',
+    normalizeSessionSecurityProfile: (value) => value || null,
+    normalizeSessionTimeoutMs: (value) => value || null,
+    normalizeSessionCompactStrategy: (value) => value || null,
+    normalizeSessionCompactEnabled: (value) => value ?? null,
+    normalizeSessionCompactTokenLimit: (value) => value || null,
+  };
+  const store = createSessionStore(options);
+  const actions = createSessionCommandActions({ saveDb: store.saveDb });
+  return { store, actions, dataFile, reload: () => createSessionStore(options) };
+}
+
+for (const provider of ['codex', 'claude', 'cursor', 'grok', 'antigravity', 'zcode', 'pi', 'omp']) {
+  test(`${provider}: permission mode follows parent dynamically until explicitly overridden`, (t) => {
+    const { store, actions, dataFile, reload } = createModeInheritanceFixture(t, { provider });
+    const parent = store.getSession('parent');
+    actions.setMode(parent, 'dangerous');
+    const child = store.getSession('child', { parentChannelId: 'parent' });
+    assert.equal(child.mode, 'dangerous');
+    assert.equal(child.modeOverride, null);
+    assert.equal(child.modeSource, 'parent channel');
+    const { buildSessionRunnerArgs } = createRunnerArgsBuilder({
+      getSessionId: () => '00000000-0000-4000-8000-000000000001',
+    });
+    const runnerOptions = { provider, workspaceDir: '/tmp', prompt: 'test', promptFile: '/tmp/test-prompt' };
+    const assertRunnerMode = (mode) => assert.deepEqual(
+      buildSessionRunnerArgs({ ...runnerOptions, session: child }),
+      buildSessionRunnerArgs({ ...runnerOptions, session: { mode } }),
+    );
+    assertRunnerMode('dangerous');
+
+    actions.setMode(parent, 'safe');
+    assert.equal(child.mode, 'safe', 'already loaded child must not cache its inherited mode');
+    actions.setMode(child, 'safe');
+    actions.setMode(parent, 'dangerous');
+    assert.equal(child.mode, 'safe', 'explicit safe must survive a dangerous parent');
+    assert.equal(child.modeSource, 'session override');
+    assertRunnerMode('safe');
+
+    actions.setMode(child, 'default');
+    assert.equal(child.mode, 'dangerous');
+    assert.equal(child.modeOverride, null);
+    assertRunnerMode('dangerous');
+    const persisted = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+    assert.equal(persisted.threads.child.modeOverride, null);
+    assert.equal(persisted.threads.child.mode, 'dangerous');
+
+    const reopened = reload();
+    const reopenedChild = reopened.getSession('child');
+    assert.equal(reopenedChild.mode, 'dangerous', 'resolve parent before it has been hydrated');
+    reopened.getSession('parent').mode = 'safe';
+    assert.equal(reopenedChild.mode, 'safe');
+  });
+}
+
+test('missing parent falls back to global, and a newly configured parent takes effect', (t) => {
+  const { store, actions } = createModeInheritanceFixture(t, { mode: 'dangerous' });
+  const child = store.getSession('child', { parentChannelId: 'parent' });
+  assert.equal(child.mode, 'dangerous');
+  assert.equal(child.modeOverride, null);
+  const parent = store.getSession('parent');
+  actions.setMode(parent, 'safe');
+  assert.equal(child.mode, 'safe');
+  actions.setMode(parent, 'default');
+  assert.equal(child.mode, 'dangerous');
+});
+
+test('legacy modes are preserved because their override provenance was not recorded', (t) => {
+  const { store, actions, reload } = createModeInheritanceFixture(t, {
+    threads: {
+      parent: { provider: 'cursor', mode: 'dangerous' },
+      child: { provider: 'cursor', mode: 'safe', parentChannelId: 'parent' },
+    },
+  });
+  const child = store.getSession('child');
+  assert.equal(child.mode, 'safe');
+  assert.equal(child.modeOverride, 'safe');
+  assert.equal(reload().getSession('child').mode, 'safe');
+  actions.setMode(child, 'default');
+  assert.equal(child.mode, 'dangerous');
+});
+
+test('invalid persisted overrides and cyclic inheritance fail rather than granting permissions', (t) => {
+  const { store, dataFile } = createModeInheritanceFixture(t, {
+    threads: {
+      broken: { provider: 'cursor', mode: 'dangerous', modeOverride: 'yes' },
+      a: { provider: 'cursor', mode: 'safe', modeOverride: null, parentChannelId: 'b' },
+      b: { provider: 'cursor', mode: 'safe', modeOverride: null, parentChannelId: 'a' },
+    },
+  });
+  const before = fs.readFileSync(dataFile, 'utf8');
+  assert.throws(() => store.getSession('broken'), /invalid.*mode/i);
+  assert.equal(fs.readFileSync(dataFile, 'utf8'), before);
+  assert.throws(() => store.getSession('a'), /cyclic.*mode/i);
+  assert.equal(fs.readFileSync(dataFile, 'utf8'), before);
+});
+
+test('invalid mode commands do not mutate or save a session', (t) => {
+  const { store, actions, dataFile } = createModeInheritanceFixture(t);
+  const child = store.getSession('child');
+  const before = fs.readFileSync(dataFile, 'utf8');
+  assert.throws(() => actions.setMode(child, 'approve'), /invalid.*mode/i);
+  assert.equal(child.mode, 'safe');
+  assert.equal(child.modeOverride, null);
+  assert.equal(fs.readFileSync(dataFile, 'utf8'), before);
+});
 
 function normalizeProvider(value) {
   const raw = String(value || '').trim().toLowerCase();

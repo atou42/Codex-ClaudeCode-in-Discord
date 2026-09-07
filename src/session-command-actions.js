@@ -2,6 +2,7 @@ import fs from 'node:fs';
 
 import { providerRequiresWorkspaceBoundSession } from './provider-metadata.js';
 import { switchSessionProviderState } from './session-provider-state.js';
+import { normalizeSessionModeOverride } from './session-mode.js';
 
 function hasWorkspaceChanged(previousDir, nextDir) {
   return String(previousDir || '') !== String(nextDir || '');
@@ -311,7 +312,9 @@ export function createSessionCommandActions({
   }
 
   function setMode(session, mode) {
-    session.mode = mode;
+    const override = normalizeSessionModeOverride(mode);
+    session.mode = override;
+    session.modeOverride = override;
     saveDb();
     return { mode: session.mode };
   }

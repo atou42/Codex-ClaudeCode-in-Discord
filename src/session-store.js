@@ -9,6 +9,7 @@ import {
   switchSessionProviderState,
 } from './session-provider-state.js';
 import { providerRequiresWorkspaceBoundSession } from './provider-metadata.js';
+import { normalizeSessionModeOverride, resolveSessionModeSetting } from './session-mode.js';
 
 const SESSION_PROVIDER_STATE_READY = Symbol('sessionProviderStateReady');
 
@@ -136,6 +137,44 @@ export function createSessionStore({
   resolveSessionWorkspace = () => null,
 } = {}) {
   const db = loadDb(dataFile);
+  const modeOptions = {
+    defaultMode: normalizeSessionMode(defaults?.mode, 'safe'),
+    getParentSession: (session) => {
+      const parentId = normalizeChannelId(session.parentChannelId);
+      return parentId ? db.threads?.[parentId] || null : null;
+    },
+  };
+
+  function bindSessionMode(session) {
+    let migrated = false;
+    if (!Object.hasOwn(session, 'modeOverride')) {
+      session.modeOverride = session.mode == null ? null : normalizeSessionMode(session.mode, modeOptions.defaultMode);
+      migrated = true;
+    } else {
+      const override = normalizeSessionModeOverride(session.modeOverride);
+      if (session.modeOverride !== override) {
+        session.modeOverride = override;
+        migrated = true;
+      }
+    }
+    // Existing runners read session.mode directly. Resolve on access so cached child
+    // sessions and long-runtime fingerprints also observe parent changes.
+    if (!Object.getOwnPropertyDescriptor(session, 'mode')?.get) {
+      Object.defineProperties(session, {
+        mode: {
+          enumerable: true,
+          configurable: true,
+          get: () => resolveSessionModeSetting(session, modeOptions).value,
+          set: (value) => { session.modeOverride = normalizeSessionModeOverride(value); },
+        },
+        modeSource: {
+          configurable: true,
+          get: () => resolveSessionModeSetting(session, modeOptions).source,
+        },
+      });
+    }
+    return migrated;
+  }
   const getChildThreadWorkspaceMode = (provider) => {
     if (typeof resolveChildThreadWorkspaceMode === 'function') {
       return normalizeChildThreadWorkspaceMode(resolveChildThreadWorkspaceMode(provider));
@@ -230,6 +269,7 @@ export function createSessionStore({
         effort: null,
         fastMode: null,
         mode: defaults.mode,
+        modeOverride: null,
         language: defaults.language,
         onboardingEnabled: defaults.onboardingEnabled,
         parentChannelId: null,
@@ -260,7 +300,6 @@ export function createSessionStore({
     const session = db.threads[key];
     const providerStateReady = session[SESSION_PROVIDER_STATE_READY] === true;
     let migrated = !providerStateReady;
-    const defaultMode = normalizeSessionMode(defaults?.mode, 'safe');
 
     if (session.provider === undefined) {
       session.provider = defaults.provider;
@@ -294,11 +333,7 @@ export function createSessionStore({
       session.provider = normalizedProvider;
       migrated = true;
     }
-    const normalizedMode = normalizeSessionMode(session.mode, defaultMode);
-    if (session.mode !== normalizedMode) {
-      session.mode = normalizedMode;
-      migrated = true;
-    }
+    if (bindSessionMode(session)) migrated = true;
     if (session.runnerSessionId === undefined) {
       session.runnerSessionId = session.codexThreadId || null;
       migrated = true;
@@ -438,6 +473,7 @@ export function createSessionStore({
       session.parentChannelId = normalizedParentChannelId;
       migrated = true;
     }
+    resolveSessionModeSetting(session, modeOptions);
 
     const legacyWorkspaceDir = normalizeWorkspaceDir(path.join(workspaceRoot, key));
     if (session.workspaceDir && legacyWorkspaceDir && session.workspaceDir === legacyWorkspaceDir) {
