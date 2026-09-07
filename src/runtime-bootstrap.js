@@ -1097,6 +1097,7 @@ export function createDiscordClient({
   GatewayIntentBits,
   Partials,
   restProxyAgent = null,
+  buildGatewayStrategy = null,
 } = {}) {
   const bot = new Client({
     intents: [
@@ -1105,6 +1106,7 @@ export function createDiscordClient({
       GatewayIntentBits.MessageContent,
     ],
     partials: [Partials.Channel, Partials.Message],
+    ...(buildGatewayStrategy ? { ws: { buildStrategy: buildGatewayStrategy } } : {}),
   });
 
   if (restProxyAgent) {

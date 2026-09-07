@@ -577,11 +577,15 @@ if (bootCliHealth.ok) {
   ].join('\n'));
 }
 
+// Load after the existing proxy patch has run, before discord.js connects.
+const { createGatewayBudget, createGatewayStrategy } = await import('./discord-gateway-safety.js');
+const gatewayBudget = createGatewayBudget({ dataDir: DATA_DIR, token: DISCORD_TOKEN });
 const createClient = () => createDiscordClient({
   Client,
   GatewayIntentBits,
   Partials,
   restProxyAgent,
+  buildGatewayStrategy: createGatewayStrategy(gatewayBudget),
 });
 const appContext = createAppContext({
   identityOptions: {
@@ -1155,5 +1159,11 @@ try {
   projectUpgradeScheduler.start();
 } catch (err) {
   console.error(`❌ Failed to boot Discord client: ${safeError(err)}`);
-  process.exit(1);
+  if (appContext.lifecycle.getTerminalError()) {
+    // Keep launchd from immediately restarting a deliberately paused gateway.
+    console.error('Discord gateway is paused. Fix the reported cause before restarting this service.');
+    setInterval(() => {}, 60_000);
+  } else {
+    process.exit(1);
+  }
 }

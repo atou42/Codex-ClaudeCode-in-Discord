@@ -735,6 +735,7 @@ test('createDiscordClient applies Discord intents and optional REST proxy agent'
   }
 
   const restProxyAgent = { kind: 'proxy' };
+  const buildGatewayStrategy = () => {};
   const client = createDiscordClient({
     Client: FakeClient,
     GatewayIntentBits: {
@@ -747,11 +748,13 @@ test('createDiscordClient applies Discord intents and optional REST proxy agent'
       Message: 'message',
     },
     restProxyAgent,
+    buildGatewayStrategy,
   });
 
   assert.deepEqual(client.options.intents, ['guilds', 'messages', 'content']);
   assert.deepEqual(client.options.partials, ['channel', 'message']);
   assert.equal(client.agent, restProxyAgent);
+  assert.equal(client.options.ws.buildStrategy, buildGatewayStrategy);
 });
 
 test('readPiFamilyModelCatalog reads models from the CLI JSON catalog', () => {
