@@ -24,6 +24,8 @@ test('discord lifecycle helpers classify gateway and interaction errors', () => 
   assert.equal(isRecoverableGatewayCloseCode('unknown'), true);
 
   assert.equal(isInvalidTokenError(new Error('Invalid token provided')), true);
+  assert.equal(isInvalidTokenError(new Error('Authentication failed')), true);
+  assert.equal(isInvalidTokenError({ code: 'TokenInvalid' }), true);
   assert.equal(isInvalidTokenError(new Error('network error')), false);
 
   assert.equal(isIgnorableDiscordRuntimeError({ code: 10062 }), true);
@@ -38,6 +40,42 @@ test('discord lifecycle helpers classify gateway and interaction errors', () => 
   assert.equal(isTransientDiscordNetworkError(new Error('Proxy connection timed out')), true);
   assert.equal(isTransientDiscordNetworkError(Object.assign(new Error('proxy refused'), { code: 'ECONNREFUSED' })), true);
   assert.equal(isTransientDiscordNetworkError(new Error('Invalid token provided')), false);
+});
+
+test('self-heal waits for asynchronous destruction before creating a replacement', async () => {
+  let finishDestroy;
+  let creates = 0;
+  const lifecycle = createDiscordLifecycle({
+    createClient: () => {
+      creates++;
+      return { login: async () => {}, removeAllListeners() {},
+        destroy: () => new Promise(resolve => { finishDestroy = resolve; }) };
+    },
+    bindClientHandlers() {}, logger: createLogger(),
+  });
+  await lifecycle.bootClient('test');
+  const restarting = lifecycle.restartClient('test');
+  await Promise.resolve();
+  const createsBeforeDestroyFinished = creates;
+  finishDestroy();
+  await restarting;
+  assert.equal(createsBeforeDestroyFinished, 1);
+  assert.equal(creates, 2);
+});
+
+test('self-heal does not replace a client whose destruction failed', async () => {
+  let creates = 0;
+  const lifecycle = createDiscordLifecycle({
+    createClient: () => {
+      creates++;
+      return { login: async () => {}, removeAllListeners() {},
+        destroy: async () => { throw new Error('destroy failed'); } };
+    },
+    bindClientHandlers() {}, logger: createLogger(),
+  });
+  await lifecycle.bootClient('test');
+  await assert.rejects(lifecycle.restartClient('test'), /destroy failed/);
+  assert.equal(creates, 1);
 });
 
 test('createDiscordLifecycle bootClient retries transient login failures', async () => {
@@ -101,6 +139,53 @@ test('createDiscordLifecycle scheduleSelfHeal ignores invalid token errors', () 
   lifecycle.scheduleSelfHeal('client_error', new Error('Invalid token'));
 
   assert.equal(timerCount, 0);
+});
+
+test('exhausted transient startup login failures remain restartable by the supervisor', async () => {
+  const error = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7890'), { code: 'ECONNREFUSED' });
+  let attempts = 0;
+  const lifecycle = createDiscordLifecycle({
+    maxLoginAttempts: 2,
+    createClient: () => ({ async login() { attempts++; throw error; } }),
+    bindClientHandlers() {},
+    sleep: async () => {},
+    logger: createLogger(),
+  });
+
+  await assert.rejects(lifecycle.bootClient('startup'), err => err === error);
+  assert.equal(attempts, 2);
+  assert.equal(lifecycle.getTerminalError(), null);
+});
+
+test('terminal startup failures stay paused without retrying or bypassing gateway safety', async () => {
+  for (const code of ['TokenInvalid', 'DISCORD_GATEWAY_BLOCKED', 'ENOSPC', 'EDQUOT', 'EROFS', 4014]) {
+    const error = Object.assign(new Error(`terminal failure: ${code}`), { code });
+    let attempts = 0;
+    const lifecycle = createDiscordLifecycle({
+      createClient: () => ({ async login() { attempts++; throw error; } }),
+      bindClientHandlers() {},
+      sleep: async () => { assert.fail('terminal failures must not retry'); },
+      logger: createLogger(),
+    });
+
+    await assert.rejects(lifecycle.bootClient('startup'), err => err === error);
+    assert.equal(lifecycle.getTerminalError(), error);
+    await assert.rejects(lifecycle.bootClient('startup'), err => err === error);
+    assert.equal(attempts, 1);
+  }
+});
+
+test('unclassified login failures still pause after the retry limit', async () => {
+  const lifecycle = createDiscordLifecycle({
+    maxLoginAttempts: 2,
+    createClient: () => ({ async login() { throw new Error('unexpected failure'); } }),
+    bindClientHandlers() {},
+    sleep: async () => {},
+    logger: createLogger(),
+  });
+
+  await assert.rejects(lifecycle.bootClient('startup'), { code: 'DISCORD_GATEWAY_BLOCKED' });
+  assert.equal(lifecycle.getTerminalError().code, 'DISCORD_GATEWAY_BLOCKED');
 });
 
 test('createDiscordLifecycle process self-heal ignores transient network errors', () => {
@@ -239,4 +324,61 @@ test('createDiscordLifecycle stops scheduling self-heal after the restart rate l
 
   assert.equal(scheduled, null);
   assert.equal(clients.length, 3);
+});
+
+for (const selfHealEnabled of [true, false]) {
+  test(`disk-full runtime failure stops the gateway without replacement (selfHeal=${selfHealEnabled})`, async () => {
+    const processRef = new EventEmitter();
+    let creates = 0;
+    let destroys = 0;
+    const lifecycle = createDiscordLifecycle({
+      selfHealEnabled, processRef, logger: createLogger(), bindClientHandlers() {},
+      createClient: () => {
+        creates++;
+        return { login: async () => {}, destroy: async () => { destroys++; } };
+      },
+    });
+    await lifecycle.bootClient('test');
+    lifecycle.setupProcessSelfHeal();
+    const error = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    processRef.emit('uncaughtException', error);
+    await Promise.resolve();
+    assert.equal(destroys, 1);
+    assert.equal(creates, 1);
+    assert.equal(lifecycle.getTerminalError(), error);
+    await assert.rejects(lifecycle.restartClient('test'), { code: 'ENOSPC' });
+  });
+}
+
+test('a terminal failure during login backoff prevents another login attempt', async () => {
+  let attempts = 0;
+  let lifecycle;
+  lifecycle = createDiscordLifecycle({
+    logger: createLogger(), bindClientHandlers() {},
+    createClient: () => ({ login: async () => { attempts++; throw new Error('temporary failure'); }, destroy: async () => {} }),
+    sleep: async () => lifecycle.scheduleSelfHeal('disk_error', Object.assign(new Error('disk full'), { code: 'ENOSPC' })),
+  });
+  await assert.rejects(lifecycle.bootClient('test'), { code: 'ENOSPC' });
+  assert.equal(attempts, 1);
+});
+
+test('a terminal error cancels an already scheduled self-heal', async () => {
+  let scheduled;
+  let cleared;
+  let creates = 0;
+  const timer = { unref() {} };
+  const lifecycle = createDiscordLifecycle({
+    logger: createLogger(), bindClientHandlers() {},
+    createClient: () => { creates++; return { login: async () => {}, destroy: async () => {} }; },
+    setTimeoutFn: fn => { scheduled = fn; return timer; },
+    clearTimeoutFn: handle => { cleared = handle; scheduled = null; },
+  });
+  await lifecycle.bootClient('test');
+  lifecycle.scheduleSelfHeal('nonterminal');
+  assert.equal(typeof scheduled, 'function');
+  lifecycle.scheduleSelfHeal('authentication', new Error('Authentication failed'));
+  assert.equal(cleared, timer);
+  assert.equal(scheduled, null);
+  await assert.rejects(lifecycle.restartClient('test'), /Authentication failed/);
+  assert.equal(creates, 1);
 });

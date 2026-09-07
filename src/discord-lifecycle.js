@@ -7,7 +7,15 @@ export function isRecoverableGatewayCloseCode(code) {
 
 export function isInvalidTokenError(err) {
   const msg = String(err?.message || err || '').toLowerCase();
-  return msg.includes('invalid token');
+  return err?.code === 'TokenInvalid' || Number(err?.code) === 4004
+    || msg.includes('invalid token') || msg.includes('authentication failed');
+}
+
+export function isTerminalDiscordError(err) {
+  return isInvalidTokenError(err)
+    || ['DISCORD_GATEWAY_BLOCKED', 'ENOSPC', 'EDQUOT', 'EROFS'].includes(err?.code)
+    || [4010, 4011, 4012, 4013, 4014].includes(Number(err?.code))
+    || /^(Invalid shard|Sharding is required|Used an invalid API version|Used invalid intents|Used disallowed intents)$/.test(err?.message || '');
 }
 
 export function isIgnorableDiscordRuntimeError(err) {
@@ -49,6 +57,7 @@ export function createDiscordLifecycle({
   selfHealEnabled = true,
   restartDelayMs = 5000,
   maxLoginBackoffMs = 60000,
+  maxLoginAttempts = 6,
   maxSelfHealRestartsPerWindow = 10,
   selfHealWindowMs = 15 * 60_000,
   discordToken,
@@ -60,11 +69,14 @@ export function createDiscordLifecycle({
   processRef = process,
   sleep = defaultSleep,
   setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
   nowFn = Date.now,
 } = {}) {
   let client = null;
   let selfHealTimer = null;
   let selfHealInFlight = false;
+  let loginInFlight = false;
+  let terminalError = null;
   const selfHealRestartTimestamps = [];
 
   function pruneSelfHealRestartTimestamps(now = nowFn()) {
@@ -80,32 +92,43 @@ export function createDiscordLifecycle({
   }
 
   async function loginClientWithRetry(bot, reason) {
-    if (!selfHealEnabled) {
-      await bot.login(discordToken);
-      return;
-    }
+    if (terminalError) throw terminalError;
+    loginInFlight = true;
+    try {
+      let attempt = 0;
+      const baseDelay = Math.max(1000, restartDelayMs);
+      const maxDelay = Math.max(baseDelay, maxLoginBackoffMs);
 
-    let attempt = 0;
-    const baseDelay = Math.max(1000, restartDelayMs);
-    const maxDelay = Math.max(baseDelay, maxLoginBackoffMs);
-
-    while (true) {
-      attempt += 1;
-      try {
-        await bot.login(discordToken);
-        if (attempt > 1) {
-          logger.log(`✅ Discord reconnect success after ${attempt} attempts (reason=${reason}).`);
+      while (true) {
+        if (terminalError) throw terminalError;
+        attempt += 1;
+        try {
+          await bot.login(discordToken);
+          if (terminalError) throw terminalError;
+          if (attempt > 1) {
+            logger.log(`✅ Discord reconnect success after ${attempt} attempts (reason=${reason}).`);
+          }
+          return;
+        } catch (err) {
+          if (terminalError) throw terminalError;
+          if (isTerminalDiscordError(err)) {
+            terminalError = err;
+            throw err;
+          }
+          if (!selfHealEnabled) throw err;
+          if (attempt >= maxLoginAttempts) {
+            // Let the supervisor retry a network outage without clearing safety blocks.
+            if (isTransientDiscordNetworkError(err)) throw err;
+            terminalError = Object.assign(new Error(`Discord login paused after ${attempt} failures: ${safeError(err)}`, { cause: err }), { code: 'DISCORD_GATEWAY_BLOCKED' });
+            throw terminalError;
+          }
+          const delay = Math.min(maxDelay, baseDelay * (2 ** Math.min(10, attempt - 1)));
+          logger.error(`Discord login failed (reason=${reason}, attempt=${attempt}): ${safeError(err)}; retrying in ${delay}ms`);
+          await sleep(delay);
         }
-        return;
-      } catch (err) {
-        if (isInvalidTokenError(err)) {
-          throw err;
-        }
-
-        const delay = Math.min(maxDelay, baseDelay * (2 ** Math.min(10, attempt - 1)));
-        logger.error(`Discord login failed (reason=${reason}, attempt=${attempt}): ${safeError(err)}; retrying in ${delay}ms`);
-        await sleep(delay);
       }
+    } finally {
+      loginInFlight = false;
     }
   }
 
@@ -119,16 +142,24 @@ export function createDiscordLifecycle({
   }
 
   function scheduleSelfHeal(reason, err = null) {
-    if (!selfHealEnabled) return;
-    if (err && isInvalidTokenError(err)) {
-      logger.error('❌ Discord token invalid. Self-heal skipped; please fix DISCORD_TOKEN.');
+    if (terminalError) return;
+    if (err && isTerminalDiscordError(err)) {
+      terminalError = err;
+      if (selfHealTimer) clearTimeoutFn(selfHealTimer);
+      selfHealTimer = null;
+      // Stop the gateway but leave ongoing agent/channel work alone.
+      Promise.resolve().then(() => client?.destroy()).catch(destroyErr => {
+        logger.error('Failed to stop paused Discord client:', safeError(destroyErr));
+      });
+      logger.error(`[${new Date(nowFn()).toISOString()}] Discord paused (${reason}); manual intervention required: ${safeError(err)}`);
       return;
     }
+    if (!selfHealEnabled) return;
     if (err && isTransientDiscordNetworkError(err)) {
       logger.warn(`🌐 Transient Discord network error (${reason}). Self-heal skipped: ${safeError(err)}`);
       return;
     }
-    if (selfHealInFlight || selfHealTimer) return;
+    if (selfHealInFlight || selfHealTimer || loginInFlight) return;
     if (!hasSelfHealCapacity()) {
       logger.error(`🛑 Self-heal paused after ${selfHealRestartTimestamps.length} restarts within ${Math.round(selfHealWindowMs / 60000)} minutes. Fix network/proxy first, then restart manually.`);
       return;
@@ -152,26 +183,27 @@ export function createDiscordLifecycle({
   }
 
   async function restartClient(reason) {
+    if (terminalError) throw terminalError;
     if (!selfHealEnabled) return;
-    if (selfHealInFlight) return;
+    if (selfHealInFlight || loginInFlight || !hasSelfHealCapacity()) return;
 
     selfHealInFlight = true;
     pruneSelfHealRestartTimestamps();
     selfHealRestartTimestamps.push(nowFn());
 
     try {
-      if (client) {
-        client.removeAllListeners();
-        client.destroy();
+      try {
+        if (client) {
+          await client.destroy();
+          client.removeAllListeners();
+        }
+      } catch (err) {
+        terminalError = Object.assign(new Error(`Failed to destroy previous Discord client: ${safeError(err)}`, { cause: err }), { code: 'DISCORD_GATEWAY_BLOCKED' });
+        throw terminalError;
       }
-    } catch (err) {
-      logger.error('Failed to destroy previous Discord client:', safeError(err));
-    }
-
-    client = createClient();
-    bindClientHandlers(client, lifecycleApi);
-
-    try {
+      if (terminalError) throw terminalError;
+      client = createClient();
+      bindClientHandlers(client, lifecycleApi);
       await loginClientWithRetry(client, `self_heal:${reason}`);
       logger.log(`✅ Self-heal recovered (reason=${reason}).`);
     } finally {
@@ -180,10 +212,12 @@ export function createDiscordLifecycle({
   }
 
   function setupProcessSelfHeal() {
-    if (!selfHealEnabled) return;
-
     processRef.on('unhandledRejection', (reason) => {
       const err = reason instanceof Error ? reason : new Error(String(reason));
+      if (isTerminalDiscordError(err)) {
+        scheduleSelfHeal('unhandled_rejection', err);
+        return;
+      }
       if (isIgnorableDiscordRuntimeError(err)) {
         logger.warn(`Ignoring non-fatal unhandled rejection: ${safeError(err)}`);
         return;
@@ -198,6 +232,10 @@ export function createDiscordLifecycle({
     });
 
     processRef.on('uncaughtException', (err) => {
+      if (isTerminalDiscordError(err)) {
+        scheduleSelfHeal('uncaught_exception', err);
+        return;
+      }
       if (isIgnorableDiscordRuntimeError(err)) {
         logger.warn(`Ignoring non-fatal uncaught exception: ${safeError(err)}`);
         return;
@@ -219,6 +257,7 @@ export function createDiscordLifecycle({
     restartClient,
     setupProcessSelfHeal,
     getClient: () => client,
+    getTerminalError: () => terminalError,
   };
 
   return lifecycleApi;
