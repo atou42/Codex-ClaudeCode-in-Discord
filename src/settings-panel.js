@@ -843,11 +843,17 @@ export function createSettingsPanel({
             new ButtonBuilder()
               .setCustomId(buildSettingsComponentId('set', 'mode', 'safe', userId))
               .setLabel('safe')
-              .setStyle(session?.mode === 'safe' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+              .setStyle(session?.modeOverride !== null && session?.mode === 'safe' ? ButtonStyle.Primary : ButtonStyle.Secondary),
             new ButtonBuilder()
               .setCustomId(buildSettingsComponentId('set', 'mode', 'dangerous', userId))
               .setLabel('dangerous')
-              .setStyle(session?.mode === 'dangerous' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+              .setStyle(session?.modeOverride !== null && session?.mode === 'dangerous' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+            new ButtonBuilder()
+              .setCustomId(buildSettingsComponentId('set', 'mode', 'default', userId))
+              .setLabel(snapshot.isThread
+                ? (snapshot.language === 'en' ? 'Follow parent/default' : '跟随父频道/默认')
+                : (snapshot.language === 'en' ? 'Follow default' : '跟随默认'))
+              .setStyle(session?.modeOverride === null ? ButtonStyle.Primary : ButtonStyle.Secondary),
           ),
         ];
 
@@ -1114,8 +1120,8 @@ function formatOverviewSection(snapshot) {
           : '这里只会切换当前频道的 bot 提示语言。';
       case 'mode':
         return snapshot.language === 'en'
-          ? 'Execution mode is channel-scoped. `dangerous` removes sandbox/approval safeguards.'
-          : '执行模式按频道生效。`dangerous` 会去掉 sandbox 与审批保护。';
+          ? 'Threads follow the parent channel unless overridden. Default clears the override. `dangerous` removes sandbox/approval safeguards.'
+          : '线程默认跟随父频道；单独选择模式后不再跟随，恢复默认会清除覆盖。`dangerous` 会去掉 sandbox 与审批保护。';
       case 'workspace':
         return snapshot.language === 'en'
           ? 'Browsing opens the existing workspace picker in a separate ephemeral panel. "Follow provider default" clears the thread override only.'
@@ -1216,8 +1222,8 @@ function formatOverviewSection(snapshot) {
             ? `• default reply delivery: ${formatReplyDeliveryModeLabel(snapshot.replyDefault.mode, snapshot.language)} (${formatSettingSourceLabel(snapshot.replyDefault.source, snapshot.language)})`
             : `• 默认回复方式：${formatReplyDeliveryModeLabel(snapshot.replyDefault.mode, snapshot.language)}（${formatSettingSourceLabel(snapshot.replyDefault.source, snapshot.language)}）`,
           snapshot.language === 'en'
-            ? `• mode: \`${session?.mode || 'safe'}\``
-            : `• mode：\`${session?.mode || 'safe'}\``,
+            ? `• mode: \`${session?.mode || 'safe'}\` (${formatSettingSourceLabel(session?.modeSource || 'session override', snapshot.language)})`
+            : `• mode：\`${session?.mode || 'safe'}\`（${formatSettingSourceLabel(session?.modeSource || 'session override', snapshot.language)}）`,
           snapshot.language === 'en'
             ? `• language: ${snapshot.language === 'en' ? 'English' : '中文'}`
             : `• language：${snapshot.language === 'en' ? 'English' : '中文'}`,

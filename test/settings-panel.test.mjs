@@ -506,6 +506,48 @@ test('createSettingsPanel switches active section through the section picker', a
   assert.match(updates[0].content, /当前项：上下文压缩/);
 });
 
+test('createSettingsPanel shows inherited mode and restores inheritance through its button', async () => {
+  const session = {
+    provider: 'cursor', language: 'zh', parentChannelId: 'parent',
+    mode: 'dangerous', modeOverride: null, modeSource: 'parent channel',
+  };
+  const selected = [];
+  const panel = createPanel({
+    session,
+    commandActions: {
+      setMode(currentSession, value) {
+        selected.push(value);
+        currentSession.modeOverride = value === 'default' ? null : value;
+        currentSession.mode = value === 'default' ? 'dangerous' : value;
+        currentSession.modeSource = value === 'default' ? 'parent channel' : 'session override';
+      },
+    },
+  });
+  const open = () => panel.openSettingsPanel({
+    key: 'thread-1', session, userId: '12345', activeSection: 'mode',
+  });
+  const modeButtons = (payload) => payload.components.flatMap((row) => row.components)
+    .filter((button) => button.data.customId?.startsWith('stg:set:mode:'));
+  const inherited = open();
+  assert.match(inherited.content, /mode：`dangerous`（父频道默认）/);
+  assert.equal(modeButtons(inherited).length, 3);
+  assert.deepEqual(modeButtons(inherited).filter((button) => button.data.style === 'primary').map((button) => button.data.label), ['跟随父频道/默认']);
+
+  let updated;
+  for (const value of ['safe', 'default']) {
+    await panel.handleSettingsPanelInteraction({
+      customId: `stg:set:mode:${value}:12345`,
+      channelId: 'thread-1', user: { id: '12345' },
+      async update(payload) { updated = payload; },
+      async reply() { assert.fail('unexpected reply'); },
+    });
+    const expected = value === 'safe' ? 'safe' : '跟随父频道/默认';
+    assert.deepEqual(modeButtons(updated).filter((button) => button.data.style === 'primary').map((button) => button.data.label), [expected]);
+  }
+  assert.deepEqual(selected, ['safe', 'default']);
+  assert.match(updated.content, /mode：`dangerous`（父频道默认）/);
+});
+
 test('createSettingsPanel updates fast mode through button interaction', async () => {
   const session = {
     provider: 'codex',

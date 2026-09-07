@@ -1263,7 +1263,7 @@ export function createReportFormatters({
               ? `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — context compaction config (native available; current provider keeps the provider-default native limit)`
               : `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — context compaction config (hard only on current provider)`,
         `• \`${slashRef('extra_info')} key:<...> value:<...>\` / \`!extra_info <...>\` — configure extra context and token cost`,
-        '• `!mode <safe|dangerous>` — execution mode',
+        '• `!mode <safe|dangerous|default>` — execution mode',
         providerSupportsRawConfigOverrides(provider)
           ? '• `!config <key=value>` — append raw provider config override'
           : `• raw config passthrough — not exposed by current provider CLI (${getProviderDisplayName(provider)})`,
@@ -1324,7 +1324,7 @@ export function createReportFormatters({
             ? `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — 上下文压缩配置（当前 provider 支持 native，但 native_limit 走 provider 默认行为）`
             : `• \`${slashRef('compact')} key:<...> value:<...>\` / \`!compact <...>\` — 上下文压缩配置（当前 provider 仅支持 hard）`,
       `• \`${slashRef('extra_info')} key:<...> value:<...>\` / \`!extra_info <...>\` — 配置额外信息和 token 占用`,
-      '• `!mode <safe|dangerous>` — 执行模式',
+      '• `!mode <safe|dangerous|default>` — 执行模式',
       providerSupportsRawConfigOverrides(provider)
         ? '• `!config <key=value>` — 添加 provider 原生配置透传'
         : `• raw config passthrough — 当前 provider CLI (${getProviderDisplayName(provider)}) 未暴露`,

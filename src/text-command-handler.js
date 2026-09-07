@@ -920,13 +920,13 @@ export function createTextCommandHandler({
       }
 
       case 'mode': {
-        if (!arg || !['safe', 'dangerous'].includes(arg.toLowerCase())) {
-          await safeReply(message, '用法：`!mode <safe|dangerous>`');
+        if (!arg || !['safe', 'dangerous', 'default'].includes(arg.toLowerCase())) {
+          await safeReply(message, '用法：`!mode <safe|dangerous|default>`');
           return;
         }
         const { mode } = commandActions.setMode(session, arg.toLowerCase());
         closeRuntimeForKey(key);
-        await safeReply(message, `✅ mode = ${mode}`);
+        await safeReply(message, `✅ mode = ${mode}${arg.toLowerCase() === 'default' ? '（继承父频道/默认）' : ''}`);
         break;
       }
 

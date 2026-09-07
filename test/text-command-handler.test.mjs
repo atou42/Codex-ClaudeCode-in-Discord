@@ -53,6 +53,26 @@ test('createTextCommandHandler updates mode through shared command actions', asy
   assert.deepEqual(replies, ['✅ mode = dangerous']);
 });
 
+test('createTextCommandHandler accepts mode default and reports the resolved mode', async () => {
+  const replies = [];
+  const calls = [];
+  const session = { provider: 'cursor', mode: 'safe' };
+  const handleCommand = createTextCommandHandler({
+    getSession: () => session,
+    commandActions: {
+      setMode(currentSession, mode) {
+        assert.equal(currentSession, session);
+        calls.push(mode);
+        return { mode: 'dangerous' };
+      },
+    },
+    safeReply: async (_message, payload) => { replies.push(payload); },
+  });
+  await handleCommand(createMessage(), 'thread-1', '!mode default');
+  assert.deepEqual(calls, ['default']);
+  assert.match(replies[0], /mode = dangerous.*继承父频道/);
+});
+
 test('createTextCommandHandler awaits async status reports', async () => {
   const replies = [];
   const session = { provider: 'codex' };

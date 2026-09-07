@@ -27,6 +27,25 @@ test('getActionButtonCommandNames exposes canonical button-safe commands', () =>
   assert.deepEqual(getActionButtonCommandNames(), ['status', 'sessions', 'queue', 'progress', 'new', 'cancel', 'retry']);
 });
 
+test('every provider exposes mode inheritance without adding a third permission mode', () => {
+  for (const provider of ['codex', 'claude', 'cursor', 'grok', 'antigravity', 'zcode', 'pi', 'omp']) {
+    const entry = buildSlashCommandEntries({ botProvider: provider }).find((entry) => entry.name === 'mode');
+    const choices = [];
+    entry.configure({
+      addStringOption(configure) {
+        configure({
+          setName() { return this; },
+          setDescription() { return this; },
+          setRequired() { return this; },
+          addChoices(...values) { choices.push(...values); return this; },
+        });
+        return this;
+      },
+    });
+    assert.deepEqual(choices.map((choice) => choice.value), ['safe', 'dangerous', 'default'], provider);
+  }
+});
+
 test('buildSlashCommandEntries includes aliases and provider toggle only in shared mode', () => {
   const sharedEntries = buildSlashCommandEntries({ botProvider: null });
   const lockedEntries = buildSlashCommandEntries({ botProvider: 'antigravity' });

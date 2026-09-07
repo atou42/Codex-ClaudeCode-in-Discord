@@ -735,7 +735,7 @@ export function createSlashCommandRouter({
     const type = interaction.options.getString('type');
     const { mode } = commandActions.setMode(session, type);
     closeRuntimeForKey(key);
-    await respond(`✅ mode = ${mode}`);
+    await respond(`✅ mode = ${mode}${type === 'default' ? '（继承父频道/默认）' : ''}`);
   });
 
   registerSlashHandlers(handlers, ['resume'], async ({ interaction, key, session, respond }) => {

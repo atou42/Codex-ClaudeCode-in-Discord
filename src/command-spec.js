@@ -348,6 +348,7 @@ export function buildSlashCommandEntries({ botProvider = null } = {}) {
           .addChoices(
             { name: 'safe (sandbox + auto-approve)', value: 'safe' },
             { name: 'dangerous (无 sandbox 无审批)', value: 'dangerous' },
+            { name: 'default (继承父频道/默认)', value: 'default' },
           ));
       },
     },
